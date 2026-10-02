@@ -571,6 +571,11 @@ impl MemStateMachine {
     pub async fn state(&self) -> StateMachine {
         self.inner.lock().await.state.clone()
     }
+
+    pub async fn state_with_applied_index(&self) -> (StateMachine, Option<LogId>) {
+        let inner = self.inner.lock().await;
+        (inner.state.clone(), inner.last_applied)
+    }
 }
 
 pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheResult<Frame> {
@@ -3328,27 +3333,41 @@ mod tests {
 
         timeout(
             Duration::from_secs(15),
-            restarted
-                .wait(None)
-                .applied_index_at_least(Some(final_log_index), "snapshot follower should catch up"),
+            restarted.wait(None).metrics(
+                |metrics| {
+                    metrics
+                        .last_applied
+                        .is_some_and(|log_id| log_id.index >= final_log_index)
+                },
+                "snapshot follower should apply final log",
+            ),
         )
         .await
-        .expect("snapshot follower should catch up")
+        .expect("snapshot follower should apply final log")
         .expect("snapshot follower apply wait should succeed");
-        let state = restarted
-            .with_state_machine(|state_machine| {
-                Box::pin(async move { state_machine.state().await })
-            })
-            .await
-            .expect("snapshot follower state should be readable");
-        assert_eq!(
-            state
-                .snapshot()
-                .get(&Bytes::from_static(b"post-snapshot-key")),
-            Some(&crate::state_machine::Value::String(Bytes::from_static(
-                b"post-snapshot-value"
-            )))
-        );
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let (state, applied) = restarted
+                    .with_state_machine(|state_machine| {
+                        Box::pin(async move { state_machine.state_with_applied_index().await })
+                    })
+                    .await
+                    .expect("snapshot follower state should be readable");
+                if applied.is_some_and(|log_id| log_id.index >= final_log_index)
+                    && state
+                        .snapshot()
+                        .get(&Bytes::from_static(b"post-snapshot-key"))
+                        == Some(&crate::state_machine::Value::String(Bytes::from_static(
+                            b"post-snapshot-value",
+                        )))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("snapshot follower state should contain final write");
 
         restarted
             .shutdown()
