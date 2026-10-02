@@ -807,6 +807,37 @@ pub async fn new_mem_raft(
     Ok(raft)
 }
 
+pub async fn new_file_raft(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    peers: PeerMap,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    let config = openraft::Config {
+        cluster_name: "alias-cache".to_string(),
+        heartbeat_interval: 50,
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        enable_tick: true,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let data_dir = data_dir.as_ref();
+    std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
+    let log_store = FileLogStore::open(data_dir.join("raft.log"))
+        .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let raft = openraft::Raft::new(
+        node_id,
+        Arc::new(config),
+        MemNetworkFactory::new(Arc::clone(&peers)),
+        log_store,
+        MemStateMachine::default(),
+    )
+    .await?;
+    peers.lock().await.insert(node_id, raft.clone());
+    Ok(raft)
+}
+
 #[cfg(test)]
 mod storage_suite {
     use super::*;
@@ -1148,5 +1179,92 @@ mod tests {
                 .expect("shutdown should finish")
                 .expect("shutdown should succeed");
         }
+    }
+
+    #[tokio::test]
+    async fn file_raft_recovers_committed_state_after_restart() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-file-raft-restart-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let node = timeout(
+            Duration::from_secs(3),
+            new_file_raft(1, &data_dir, Arc::clone(&peers)),
+        )
+        .await
+        .expect("initial startup should finish")
+        .expect("initial node should start");
+        timeout(
+            Duration::from_secs(3),
+            node.initialize(BTreeMap::from([(
+                1,
+                Node {
+                    addr: "file://1".into(),
+                },
+            )])),
+        )
+        .await
+        .expect("initialization should finish")
+        .expect("initialization should succeed");
+        timeout(
+            Duration::from_secs(3),
+            node.wait(None)
+                .current_leader(1, "node should become leader"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        timeout(
+            Duration::from_secs(3),
+            node.client_write(RaftRequest::Apply(Operation::Set {
+                key: Bytes::from_static(b"restart-key"),
+                value: Bytes::from_static(b"restart-value"),
+            })),
+        )
+        .await
+        .expect("write should finish")
+        .expect("write should succeed");
+        timeout(Duration::from_secs(3), node.shutdown())
+            .await
+            .expect("initial shutdown should finish")
+            .expect("initial shutdown should succeed");
+
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let restarted = timeout(
+            Duration::from_secs(3),
+            new_file_raft(1, &data_dir, Arc::clone(&peers)),
+        )
+        .await
+        .expect("restart should finish")
+        .expect("restarted node should start");
+        let metrics = timeout(
+            Duration::from_secs(3),
+            restarted
+                .wait(None)
+                .applied_index_at_least(Some(2), "state should recover"),
+        )
+        .await
+        .expect("recovery should finish")
+        .expect("recovery should succeed");
+        assert!(metrics.last_applied.is_some());
+        let state = restarted
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("state machine should be readable");
+        assert_eq!(
+            state.snapshot().get(&Bytes::from_static(b"restart-key")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"restart-value"
+            )))
+        );
+        timeout(Duration::from_secs(3), restarted.shutdown())
+            .await
+            .expect("restart shutdown should finish")
+            .expect("restart shutdown should succeed");
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
