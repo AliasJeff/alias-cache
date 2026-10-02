@@ -25,6 +25,7 @@ use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -576,7 +577,7 @@ pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheR
         .await
         .map_err(|error| Error::server(format!("raft read barrier failed: {error}")))?;
     let (operation, response) = raft
-        .with_state_machine(|state_machine| {
+        .with_state_machine(move |state_machine| {
             Box::pin(async move { state_machine.state().await.prepare_request(request) })
         })
         .await
@@ -606,7 +607,7 @@ pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheR
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ClientRequestOutcome {
     Applied(Frame),
     Redirect(String),
@@ -616,9 +617,13 @@ pub async fn execute_client_request(
     raft: &RaftHandle,
     request: Request,
 ) -> Result<ClientRequestOutcome, String> {
+    let write_time = current_time_millis();
     let (operation, response) = raft
-        .with_state_machine(|state_machine| {
-            Box::pin(async move { state_machine.state().await.prepare_request(request) })
+        .with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                let state = state_machine.state().await;
+                state.prepare_request_at(request, write_time)
+            })
         })
         .await
         .map_err(|error| format!("read raft state machine: {error}"))?
@@ -647,6 +652,31 @@ pub async fn execute_client_request(
     }
 }
 
+pub async fn advance_raft_time(raft: &RaftHandle) -> Result<(), String> {
+    let write_time = current_time_millis();
+    let operation = raft
+        .with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                let state = state_machine.state().await;
+                state.prepare_time_advance(write_time)
+            })
+        })
+        .await
+        .map_err(|error| format!("read raft state machine: {error}"))?;
+    raft.client_write(RaftRequest::Apply(operation))
+        .await
+        .map_err(|error| format!("advance raft logical time: {error}"))?;
+    Ok(())
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 impl RaftStateMachine<TypeConfig> for MemStateMachine {
     type SnapshotData = std::io::Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
@@ -665,15 +695,16 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         while let Some((entry, responder)) = tokio_stream::StreamExt::try_next(&mut entries).await?
         {
             let mut inner = self.inner.lock().await;
+            if let EntryPayload::Normal(RaftRequest::Apply(operation)) = &entry.payload {
+                inner.state.advance_logical_time(operation.write_time());
+            }
             inner.last_applied = Some(entry.log_id);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftResponse::Noop,
                 EntryPayload::Normal(RaftRequest::Apply(operation)) => {
                     let response = match inner.state.apply(operation) {
                         crate::state_machine::ApplyResult::Response(response) => response,
-                        crate::state_machine::ApplyResult::NoResponse => {
-                            return Err(io::Error::other("state machine produced no response"));
-                        }
+                        crate::state_machine::ApplyResult::NoResponse => Frame::Null,
                     };
                     RaftResponse::Applied(response)
                 }
@@ -1977,6 +2008,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_cluster_replicates_ttl_expiration() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-ttl-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), nodes.clone()).await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        let request = Request::Command(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"ttl-key"),
+            Bytes::from_static(b"ttl-value"),
+            Bytes::from_static(b"PX"),
+            Bytes::from_static(b"50"),
+        ]);
+        let response = timeout(Duration::from_secs(5), async {
+            loop {
+                match execute_client_request(&rafts[0], request.clone()).await {
+                    Ok(response) => break response,
+                    Err(error) if error.contains("leader is not known") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("ttl write should be handled: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("ttl write should finish");
+        assert_eq!(
+            response,
+            ClientRequestOutcome::Applied(Frame::simple_string("OK"))
+        );
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(2), "ttl write should apply"),
+            )
+            .await
+            .expect("ttl write should replicate")
+            .expect("ttl write apply wait should succeed");
+        }
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        advance_raft_time(&rafts[0])
+            .await
+            .expect("logical time advance should be committed");
+        for raft in &rafts[1..] {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(3), "time advance should apply"),
+            )
+            .await
+            .expect("time advance should replicate")
+            .expect("time advance apply wait should succeed");
+        }
+        for raft in &rafts {
+            let response = raft
+                .with_state_machine(|state_machine| {
+                    Box::pin(async move {
+                        state_machine
+                            .state()
+                            .await
+                            .prepare_request(Request::Command(vec![
+                                Bytes::from_static(b"GET"),
+                                Bytes::from_static(b"ttl-key"),
+                            ]))
+                    })
+                })
+                .await
+                .expect("ttl state should be readable")
+                .expect("ttl read should be valid")
+                .1;
+            assert_eq!(response, Frame::Null);
+        }
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should stop");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn tcp_cluster_adds_promotes_and_removes_learner() {
         let root = std::env::temp_dir().join(format!(
             "alias-cache-tcp-membership-{}-{}",
@@ -2742,6 +2915,7 @@ mod tests {
         })
         .await
         .expect("post-snapshot write should finish");
+        let final_log_index = final_response.log_id.index;
         assert!(matches!(
             final_response.data,
             RaftResponse::Applied(Frame::SimpleString(_))
@@ -2766,7 +2940,7 @@ mod tests {
             Duration::from_secs(15),
             restarted
                 .wait(None)
-                .applied_index_at_least(Some(82), "snapshot follower should catch up"),
+                .applied_index_at_least(Some(final_log_index), "snapshot follower should catch up"),
         )
         .await
         .expect("snapshot follower should catch up")

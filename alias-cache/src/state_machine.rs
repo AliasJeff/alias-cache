@@ -13,16 +13,56 @@ pub enum Value {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
-    Set { key: Bytes, value: Bytes },
-    MultiSet { pairs: Vec<(Bytes, Bytes)> },
-    Delete { keys: Vec<Bytes> },
+    Set {
+        key: Bytes,
+        value: Bytes,
+    },
+    SetWithExpiration {
+        key: Bytes,
+        value: Bytes,
+        expire_at: Option<u64>,
+        write_time: u64,
+    },
+    MultiSet {
+        pairs: Vec<(Bytes, Bytes)>,
+    },
+    Delete {
+        keys: Vec<Bytes>,
+    },
+    Expire {
+        key: Bytes,
+        expire_at: u64,
+        write_time: u64,
+    },
+    Persist {
+        key: Bytes,
+        write_time: u64,
+    },
+    AdvanceTime {
+        write_time: u64,
+    },
 }
 
 impl Operation {
+    pub fn write_time(&self) -> u64 {
+        match self {
+            Self::SetWithExpiration { write_time, .. }
+            | Self::Expire { write_time, .. }
+            | Self::Persist { write_time, .. } => *write_time,
+            Self::Set { .. } | Self::MultiSet { .. } | Self::Delete { .. } => 0,
+            Self::AdvanceTime { write_time } => *write_time,
+        }
+    }
+
     fn keys(&self) -> &[Bytes] {
         match self {
             Self::Delete { keys } => keys,
-            Self::Set { .. } | Self::MultiSet { .. } => &[],
+            Self::Set { .. }
+            | Self::SetWithExpiration { .. }
+            | Self::MultiSet { .. }
+            | Self::Expire { .. }
+            | Self::Persist { .. }
+            | Self::AdvanceTime { .. } => &[],
         }
     }
 }
@@ -35,29 +75,128 @@ pub enum ApplyResult {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateMachine {
-    values: BTreeMap<Bytes, Value>,
+    values: BTreeMap<Bytes, Entry>,
+    logical_time: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct Entry {
+    value: Value,
+    expire_at: Option<u64>,
 }
 
 impl StateMachine {
     pub fn apply(&mut self, operation: Operation) -> ApplyResult {
+        let write_time = match &operation {
+            Operation::SetWithExpiration { write_time, .. }
+            | Operation::Expire { write_time, .. }
+            | Operation::Persist { write_time, .. } => Some(*write_time),
+            Operation::Set { .. } | Operation::MultiSet { .. } | Operation::Delete { .. } => None,
+            Operation::AdvanceTime { write_time } => Some(*write_time),
+        };
+        if let Some(write_time) = write_time {
+            self.advance_logical_time(write_time);
+        }
         match operation {
             Operation::Set { key, value } => {
-                self.values.insert(key, Value::String(value));
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::String(value),
+                        expire_at: None,
+                    },
+                );
+                ApplyResult::Response(Frame::simple_string("OK"))
+            }
+            Operation::SetWithExpiration {
+                key,
+                value,
+                expire_at,
+                ..
+            } => {
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::String(value),
+                        expire_at,
+                    },
+                );
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::MultiSet { pairs } => {
                 for (key, value) in pairs {
-                    self.values.insert(key, Value::String(value));
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::String(value),
+                            expire_at: None,
+                        },
+                    );
                 }
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::Delete { keys } => {
-                let removed = keys
-                    .into_iter()
-                    .filter(|key| self.values.remove(key).is_some())
-                    .count();
+                let mut removed = 0;
+                for key in keys {
+                    let should_remove = self
+                        .values
+                        .get(&key)
+                        .is_some_and(|entry| !self.is_expired(entry));
+                    if should_remove && self.values.remove(&key).is_some() {
+                        removed += 1;
+                    }
+                }
                 ApplyResult::Response(Frame::Integer(removed as i64))
             }
+            Operation::Expire { key, expire_at, .. } => {
+                let response = if self
+                    .values
+                    .get(&key)
+                    .is_some_and(|entry| !self.is_expired(entry))
+                {
+                    self.values
+                        .get_mut(&key)
+                        .expect("entry existence checked")
+                        .expire_at = Some(expire_at);
+                    1
+                } else {
+                    0
+                };
+                ApplyResult::Response(Frame::Integer(response))
+            }
+            Operation::Persist { key, .. } => {
+                let response = if self
+                    .values
+                    .get(&key)
+                    .is_some_and(|entry| !self.is_expired(entry) && entry.expire_at.is_some())
+                {
+                    self.values
+                        .get_mut(&key)
+                        .expect("entry existence checked")
+                        .expire_at = None;
+                    1
+                } else {
+                    0
+                };
+                ApplyResult::Response(Frame::Integer(response))
+            }
+            Operation::AdvanceTime { .. } => ApplyResult::NoResponse,
+        }
+    }
+
+    pub fn prepare_request_at(
+        &self,
+        request: Request,
+        write_time: u64,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let mut state = self.clone();
+        state.advance_logical_time(write_time);
+        state.prepare_request(request)
+    }
+
+    pub fn prepare_time_advance(&self, write_time: u64) -> Operation {
+        Operation::AdvanceTime {
+            write_time: self.logical_time.max(write_time),
         }
     }
 
@@ -90,6 +229,15 @@ impl StateMachine {
         if command.eq_ignore_ascii_case(b"DBSIZE") {
             return self.execute_dbsize(arguments);
         }
+        if command.eq_ignore_ascii_case(b"PEXPIRE") {
+            return self.execute_pexpire(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"PTTL") {
+            return self.execute_pttl(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"PERSIST") {
+            return self.execute_persist(arguments);
+        }
         Err(Error::protocol(format!(
             "unknown command '{}'",
             String::from_utf8_lossy(command)
@@ -109,21 +257,60 @@ impl StateMachine {
         Ok((operation, response))
     }
 
-    pub fn snapshot(&self) -> &BTreeMap<Bytes, Value> {
-        &self.values
+    pub fn snapshot(&self) -> BTreeMap<Bytes, Value> {
+        self.values
+            .iter()
+            .filter(|(_, entry)| !self.is_expired(entry))
+            .map(|(key, entry)| (key.clone(), entry.value.clone()))
+            .collect()
+    }
+
+    pub fn logical_time(&self) -> u64 {
+        self.logical_time
+    }
+
+    pub fn advance_logical_time(&mut self, logical_time: u64) {
+        self.logical_time = self.logical_time.max(logical_time);
+    }
+
+    fn is_expired(&self, entry: &Entry) -> bool {
+        entry
+            .expire_at
+            .is_some_and(|expire_at| self.logical_time >= expire_at)
     }
 
     fn execute_get(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("GET", &arguments, 2)?;
-        let value = self.values.get(&arguments[1]);
+        let value = self
+            .values
+            .get(&arguments[1])
+            .filter(|entry| !self.is_expired(entry))
+            .map(|entry| &entry.value);
         Ok((None, value_to_frame(value)))
     }
 
     fn execute_set(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
-        expect_arity("SET", &arguments, 3)?;
-        let operation = Operation::Set {
+        if arguments.len() != 3 && arguments.len() != 5 {
+            return Err(Error::protocol("wrong number of arguments for 'SET'"));
+        }
+        let expire_at = if arguments.len() == 5 {
+            if !arguments[3].eq_ignore_ascii_case(b"PX") {
+                return Err(Error::protocol("unsupported SET option"));
+            }
+            let ttl = parse_non_negative_u64(&arguments[4], "SET PX")?;
+            Some(
+                self.logical_time
+                    .checked_add(ttl)
+                    .ok_or_else(|| Error::protocol("SET PX expiration overflows"))?,
+            )
+        } else {
+            None
+        };
+        let operation = Operation::SetWithExpiration {
             key: arguments[1].clone(),
             value: arguments[2].clone(),
+            expire_at,
+            write_time: self.logical_time,
         };
         Ok((Some(operation), Frame::simple_string("OK")))
     }
@@ -136,8 +323,15 @@ impl StateMachine {
         let removed = operation
             .keys()
             .iter()
-            .filter(|key| self.values.contains_key(*key))
+            .filter(|key| {
+                self.values
+                    .get(*key)
+                    .is_some_and(|entry| !self.is_expired(entry))
+            })
             .count();
+        if removed == 0 {
+            return Ok((None, Frame::Integer(0)));
+        }
         Ok((Some(operation), Frame::Integer(removed as i64)))
     }
 
@@ -145,7 +339,11 @@ impl StateMachine {
         expect_min_arity("EXISTS", &arguments, 2)?;
         let count = unique_keys(&arguments[1..])
             .iter()
-            .filter(|key| self.values.contains_key(*key))
+            .filter(|key| {
+                self.values
+                    .get(*key)
+                    .is_some_and(|entry| !self.is_expired(entry))
+            })
             .count();
         Ok((None, Frame::Integer(count as i64)))
     }
@@ -154,7 +352,14 @@ impl StateMachine {
         expect_min_arity("MGET", &arguments, 2)?;
         let values = arguments[1..]
             .iter()
-            .map(|key| value_to_frame(self.values.get(key)))
+            .map(|key| {
+                value_to_frame(
+                    self.values
+                        .get(key)
+                        .filter(|entry| !self.is_expired(entry))
+                        .map(|entry| &entry.value),
+                )
+            })
             .collect();
         Ok((None, Frame::Array(values)))
     }
@@ -175,15 +380,81 @@ impl StateMachine {
     fn execute_type(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("TYPE", &arguments, 2)?;
         let value = match self.values.get(&arguments[1]) {
-            Some(Value::String(_)) => "string",
+            Some(entry) if !self.is_expired(entry) => "string",
             None => "none",
+            Some(_) => "none",
         };
         Ok((None, Frame::simple_string(value)))
     }
 
     fn execute_dbsize(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("DBSIZE", &arguments, 1)?;
-        Ok((None, Frame::Integer(self.values.len() as i64)))
+        Ok((
+            None,
+            Frame::Integer(
+                self.values
+                    .values()
+                    .filter(|entry| !self.is_expired(entry))
+                    .count() as i64,
+            ),
+        ))
+    }
+
+    fn execute_pexpire(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("PEXPIRE", &arguments, 3)?;
+        let ttl = parse_non_negative_u64(&arguments[2], "PEXPIRE")?;
+        let Some(entry) = self.values.get(&arguments[1]) else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        if self.is_expired(entry) {
+            return Ok((None, Frame::Integer(0)));
+        }
+        let expire_at = self
+            .logical_time
+            .checked_add(ttl)
+            .ok_or_else(|| Error::protocol("PEXPIRE expiration overflows"))?;
+        Ok((
+            Some(Operation::Expire {
+                key: arguments[1].clone(),
+                expire_at,
+                write_time: self.logical_time,
+            }),
+            Frame::Integer(1),
+        ))
+    }
+
+    fn execute_pttl(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("PTTL", &arguments, 2)?;
+        let Some(entry) = self.values.get(&arguments[1]) else {
+            return Ok((None, Frame::Integer(-2)));
+        };
+        let Some(expire_at) = entry.expire_at else {
+            return Ok((None, Frame::Integer(-1)));
+        };
+        if self.logical_time >= expire_at {
+            return Ok((None, Frame::Integer(-2)));
+        }
+        Ok((
+            None,
+            Frame::Integer(expire_at.saturating_sub(self.logical_time) as i64),
+        ))
+    }
+
+    fn execute_persist(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("PERSIST", &arguments, 2)?;
+        let Some(entry) = self.values.get(&arguments[1]) else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        if self.is_expired(entry) || entry.expire_at.is_none() {
+            return Ok((None, Frame::Integer(0)));
+        }
+        Ok((
+            Some(Operation::Persist {
+                key: arguments[1].clone(),
+                write_time: self.logical_time,
+            }),
+            Frame::Integer(1),
+        ))
     }
 }
 
@@ -220,6 +491,14 @@ fn expect_min_arity(command: &str, arguments: &[Bytes], minimum: usize) -> Resul
         )));
     }
     Ok(())
+}
+
+fn parse_non_negative_u64(value: &Bytes, command: &str) -> Result<u64> {
+    let value = std::str::from_utf8(value)
+        .map_err(|_| Error::protocol(format!("{command} ttl is not valid UTF-8")))?;
+    value
+        .parse::<u64>()
+        .map_err(|_| Error::protocol(format!("{command} ttl is invalid")))
 }
 
 #[cfg(test)]
@@ -345,5 +624,92 @@ mod tests {
         first.apply(operation.clone());
         second.apply(decoded);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn pexpire_and_pttl_use_replicated_logical_time() {
+        let mut state = StateMachine::default();
+        state.advance_logical_time(1_000);
+        state
+            .execute_request(command(&[b"SET", b"key", b"value", b"PX", b"500"]))
+            .unwrap();
+
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(500)
+        );
+        state.advance_logical_time(1_500);
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::Null
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(-2)
+        );
+    }
+
+    #[test]
+    fn persist_and_expire_return_redis_compatible_existence_results() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PEXPIRE", b"missing", b"10"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PEXPIRE", b"key", b"100"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PERSIST", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn expired_keys_are_not_counted_or_deleted() {
+        let mut state = StateMachine::default();
+        state.advance_logical_time(10);
+        state
+            .execute_request(command(&[b"SET", b"key", b"value", b"PX", b"1"]))
+            .unwrap();
+        state.advance_logical_time(11);
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXISTS", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"DEL", b"key"])).unwrap().1,
+            Frame::Integer(0)
+        );
+        assert_eq!(state.snapshot().len(), 0);
     }
 }
