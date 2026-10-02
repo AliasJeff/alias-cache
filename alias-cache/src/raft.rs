@@ -1305,6 +1305,7 @@ async fn new_tcp_raft_inner(
         heartbeat_interval: 50,
         election_timeout_min: 150,
         election_timeout_max: 300,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(64),
         enable_tick: bootstrap,
         ..Default::default()
     }
@@ -1417,6 +1418,22 @@ pub async fn wait_for_raft_replication(raft: &RaftHandle, node_id: NodeId) -> Ca
         )
         .await
         .map_err(|error| Error::server(format!("wait for raft learner {node_id}: {error}")))?;
+    Ok(())
+}
+
+pub async fn trigger_raft_snapshot(raft: &RaftHandle) -> CacheResult<()> {
+    raft.trigger()
+        .snapshot()
+        .await
+        .map_err(|error| Error::server(format!("trigger raft snapshot: {error}")))?;
+    Ok(())
+}
+
+pub async fn purge_raft_log(raft: &RaftHandle, upto: u64) -> CacheResult<()> {
+    raft.trigger()
+        .purge_log(upto)
+        .await
+        .map_err(|error| Error::server(format!("purge raft log through {upto}: {error}")))?;
     Ok(())
 }
 
@@ -2578,6 +2595,206 @@ mod tests {
             .expect("restart rpc shutdown should send");
         restart_task.await.expect("restart rpc task should join");
         for raft in rafts {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tcp_network_installs_snapshot_on_lagging_node() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-snapshot-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), nodes.clone()).await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        let (node3_shutdown, node3_task) = rpc_tasks.pop().unwrap();
+        rafts[2].shutdown().await.expect("lagging node should stop");
+        node3_shutdown
+            .send(true)
+            .expect("lagging rpc shutdown should send");
+        node3_task.await.expect("lagging rpc task should stop");
+
+        for index in 0..80_u8 {
+            let key = format!("snapshot-key-{index:03}");
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    match rafts[0]
+                        .client_write(RaftRequest::Apply(Operation::Set {
+                            key: Bytes::from(key.as_bytes().to_vec()),
+                            value: Bytes::from_static(b"snapshot-value"),
+                        }))
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(openraft::error::RaftError::APIError(
+                            openraft::error::ClientWriteError::ForwardToLeader(_),
+                        )) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(error) => panic!("snapshot workload write failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("snapshot workload write should finish");
+        }
+
+        timeout(
+            Duration::from_secs(10),
+            rafts[0].wait(None).metrics(
+                |metrics| metrics.snapshot.is_some(),
+                "leader should build a snapshot",
+            ),
+        )
+        .await
+        .expect("snapshot should be built")
+        .expect("snapshot metrics should become available");
+        let snapshot_index = rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| metrics.snapshot.is_some(),
+                "leader snapshot index should exist",
+            )
+            .await
+            .expect("leader snapshot metrics should be available")
+            .snapshot
+            .expect("leader snapshot index should exist")
+            .index;
+        purge_raft_log(&rafts[0], snapshot_index)
+            .await
+            .expect("leader log purge should be triggered");
+
+        let final_response = timeout(Duration::from_secs(5), async {
+            loop {
+                match rafts[0]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"post-snapshot-key"),
+                        value: Bytes::from_static(b"post-snapshot-value"),
+                    }))
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("post-snapshot write failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("post-snapshot write should finish");
+        assert!(matches!(
+            final_response.data,
+            RaftResponse::Applied(Frame::SimpleString(_))
+        ));
+
+        let restarted = restart_tcp_raft(3, root.join("node-3"), nodes.clone())
+            .await
+            .expect("lagging node should restart");
+        let listener = TcpListener::bind(nodes.get(&3).unwrap().addr.clone())
+            .await
+            .expect("lagging listener should rebind");
+        let (restart_shutdown_tx, restart_shutdown_rx) = tokio::sync::watch::channel(false);
+        let rpc_raft = restarted.clone();
+        let restart_task = tokio::spawn(async move {
+            serve_raft_rpc(listener, rpc_raft, restart_shutdown_rx)
+                .await
+                .expect("restart rpc server should stop");
+        });
+        enable_raft_runtime(&restarted);
+
+        timeout(
+            Duration::from_secs(15),
+            restarted
+                .wait(None)
+                .applied_index_at_least(Some(82), "snapshot follower should catch up"),
+        )
+        .await
+        .expect("snapshot follower should catch up")
+        .expect("snapshot follower apply wait should succeed");
+        let state = restarted
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("snapshot follower state should be readable");
+        assert_eq!(
+            state
+                .snapshot()
+                .get(&Bytes::from_static(b"post-snapshot-key")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"post-snapshot-value"
+            )))
+        );
+
+        restarted
+            .shutdown()
+            .await
+            .expect("restarted node should stop");
+        restart_shutdown_tx
+            .send(true)
+            .expect("restart rpc shutdown should send");
+        restart_task.await.expect("restart rpc task should join");
+        for raft in rafts.into_iter().take(2) {
             raft.shutdown().await.expect("raft node should stop");
         }
         for (shutdown_tx, task) in rpc_tasks {
