@@ -1,0 +1,12 @@
+# Documentation stays in the workspace but is intentionally not committed.
+*.md
+docs/
+plans/
+
+/target/
+.DS_Store
+
+# Local runtime data and test artifacts.
+/data/
+/tmp/
+/coverage/
