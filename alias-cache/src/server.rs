@@ -12,8 +12,8 @@ use crate::error::{Error, Result};
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
 use crate::raft::{
-    RaftHandle, execute_raft_request, new_tcp_raft_for_server, open_single_node, serve_raft_rpc,
-    wait_for_leader,
+    ClientRequestOutcome, RaftHandle, execute_client_request, new_tcp_raft_for_server,
+    open_single_node, send_client_request, serve_raft_rpc, wait_for_leader,
 };
 
 pub struct Server {
@@ -175,10 +175,7 @@ async fn handle_raft_connection(
                 };
                 for frame in frames {
                     let response = match command_from_frame(frame) {
-                        Ok(request) => match execute_raft_request(&raft, request).await {
-                            Ok(response) => response,
-                            Err(error) => Frame::error(format!("ERR {error}")),
-                        },
+                        Ok(request) => execute_client_command(&raft, request).await,
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
                     write_frame(&mut stream, response).await?;
@@ -191,6 +188,25 @@ async fn handle_raft_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+async fn execute_client_command(raft: &RaftHandle, request: crate::protocol::Request) -> Frame {
+    match execute_client_request(raft, request.clone()).await {
+        Ok(ClientRequestOutcome::Applied(response)) => response,
+        Ok(ClientRequestOutcome::Redirect(address)) => {
+            match send_client_request(
+                &address,
+                request,
+                &openraft::network::RPCOption::new(std::time::Duration::from_secs(1)),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => Frame::error(format!("ERR {error}")),
+            }
+        }
+        Err(error) => Frame::error(format!("ERR {error}")),
     }
 }
 

@@ -274,7 +274,7 @@ impl fmt::Display for Frame {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Request {
     Command(Vec<Bytes>),
 }

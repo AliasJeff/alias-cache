@@ -80,6 +80,7 @@ enum NetworkRequest {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<TypeConfig>),
     PreVote(VoteRequest<TypeConfig>),
+    Client(Request),
     Snapshot {
         vote: Vote,
         snapshot: Vec<u8>,
@@ -92,6 +93,7 @@ enum NetworkResponse {
     Append(Result<AppendEntriesResponse<TypeConfig>, String>),
     Vote(Result<VoteResponse<TypeConfig>, String>),
     Snapshot(Result<SnapshotResponse<TypeConfig>, String>),
+    Client(Result<Frame, String>),
 }
 
 const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -604,6 +606,47 @@ pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheR
     }
 }
 
+#[derive(Debug)]
+pub enum ClientRequestOutcome {
+    Applied(Frame),
+    Redirect(String),
+}
+
+pub async fn execute_client_request(
+    raft: &RaftHandle,
+    request: Request,
+) -> Result<ClientRequestOutcome, String> {
+    let (operation, response) = raft
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.state().await.prepare_request(request) })
+        })
+        .await
+        .map_err(|error| format!("read raft state machine: {error}"))?
+        .map_err(|error| error.to_string())?;
+    let Some(operation) = operation else {
+        raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+            .await
+            .map_err(|error| format!("raft read barrier failed: {error}"))?;
+        return Ok(ClientRequestOutcome::Applied(response));
+    };
+    let result = raft.client_write(RaftRequest::Apply(operation)).await;
+    match result {
+        Ok(response) => match response.data {
+            RaftResponse::Applied(response) => Ok(ClientRequestOutcome::Applied(response)),
+            RaftResponse::Noop => Err("raft write produced no response".to_string()),
+        },
+        Err(error) => {
+            if let Some(forward) = error.forward_to_leader() {
+                if let Some(node) = &forward.leader_node {
+                    return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
+                }
+                return Err("raft leader is not known".to_string());
+            }
+            Err(format!("raft write failed: {error}"))
+        }
+    }
+}
+
 impl RaftStateMachine<TypeConfig> for MemStateMachine {
     type SnapshotData = std::io::Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
@@ -857,6 +900,21 @@ async fn send_rpc(
     })
 }
 
+pub async fn send_client_request(
+    address: &str,
+    request: Request,
+    option: &RPCOption,
+) -> CacheResult<Frame> {
+    let response = send_rpc(address, NetworkRequest::Client(request), option)
+        .await
+        .map_err(|error| Error::server(format!("send client request: {error}")))?;
+    match response {
+        NetworkResponse::Client(Ok(frame)) => Ok(frame),
+        NetworkResponse::Client(Err(error)) => Err(Error::server(error)),
+        _ => Err(Error::server("unexpected client rpc response")),
+    }
+}
+
 fn rpc_response_error(error: String) -> RPCError<TypeConfig> {
     RPCError::Network(openraft::error::NetworkError::from_string(error))
 }
@@ -1010,6 +1068,20 @@ async fn handle_raft_rpc(
                 .await
                 .map_err(|error| error.to_string()),
         ),
+        NetworkRequest::Client(request) => {
+            let response =
+                execute_client_request(&raft, request)
+                    .await
+                    .map(|outcome| match outcome {
+                        ClientRequestOutcome::Applied(frame) => frame,
+                        ClientRequestOutcome::Redirect(address) => {
+                            // Client forwarding is intentionally one hop. The edge server
+                            // resolves the next leader and owns the retry boundary.
+                            Frame::error(format!("MOVED {address}"))
+                        }
+                    });
+            NetworkResponse::Client(response)
+        }
         NetworkRequest::Snapshot {
             vote,
             snapshot,
@@ -1809,6 +1881,168 @@ mod tests {
 
         for raft in rafts {
             raft.shutdown().await.expect("raft should shut down");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tcp_client_request_returns_applied_response() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("rpc listener should bind");
+        let address = listener.local_addr().expect("rpc address should resolve");
+        let raft = new_mem_raft(1, Arc::new(Mutex::new(BTreeMap::new())))
+            .await
+            .expect("raft should start");
+        raft.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: address.to_string(),
+            },
+        )]))
+        .await
+        .expect("raft should initialize");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let rpc_raft = raft.clone();
+        let task = tokio::spawn(async move {
+            serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                .await
+                .expect("rpc server should stop");
+        });
+        timeout(
+            Duration::from_secs(3),
+            raft.wait(None).current_leader(1, "node should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        let response = send_client_request(
+            &address.to_string(),
+            Request::Command(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"rpc-key"),
+                Bytes::from_static(b"rpc-value"),
+            ]),
+            &RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .expect("client rpc should succeed");
+        assert_eq!(response, Frame::simple_string("OK"));
+
+        raft.shutdown().await.expect("raft should stop");
+        shutdown_tx.send(true).expect("rpc shutdown should send");
+        task.await.expect("rpc task should join");
+    }
+
+    #[tokio::test]
+    async fn follower_client_rpc_returns_redirect_to_leader() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-follower-rpc-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), nodes.clone()).await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        timeout(
+            Duration::from_secs(5),
+            rafts[0]
+                .wait(None)
+                .current_leader(1, "leader should be elected"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if rafts[1].current_leader().await == Some(1) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("follower should observe leader");
+
+        let outcome = execute_client_request(
+            &rafts[1],
+            Request::Command(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"follower-key"),
+                Bytes::from_static(b"follower-value"),
+            ]),
+        )
+        .await
+        .expect("follower request should be handled");
+        let address = match outcome {
+            ClientRequestOutcome::Redirect(address) => address,
+            ClientRequestOutcome::Applied(_) => {
+                panic!("follower should not apply a write locally")
+            }
+        };
+        assert_eq!(address, nodes.get(&1).unwrap().addr);
+        let response = send_client_request(
+            &address,
+            Request::Command(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"follower-key"),
+                Bytes::from_static(b"follower-value"),
+            ]),
+            &RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .expect("leader forwarding should succeed");
+        assert_eq!(response, Frame::simple_string("OK"));
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft should stop");
         }
         for (shutdown_tx, task) in rpc_tasks {
             shutdown_tx.send(true).expect("rpc shutdown should send");
