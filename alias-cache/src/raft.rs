@@ -2848,6 +2848,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_expired_key_does_not_reappear_after_leader_failover() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-ttl-failover-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), nodes.clone()).await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("raft node should start");
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        let request = Request::Command(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"failover-key"),
+            Bytes::from_static(b"value"),
+            Bytes::from_static(b"PX"),
+            Bytes::from_static(b"25"),
+        ]);
+        let response = timeout(Duration::from_secs(5), async {
+            loop {
+                match execute_client_request(&rafts[0], request.clone()).await {
+                    Ok(response) => break response,
+                    Err(error) if error.contains("leader is not known") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("ttl write should succeed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("ttl write should finish");
+        assert_eq!(
+            response,
+            ClientRequestOutcome::Applied(Frame::simple_string("OK"))
+        );
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(2), "ttl write should replicate"),
+            )
+            .await
+            .expect("ttl write should replicate")
+            .expect("ttl write apply wait should succeed");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        advance_raft_time(&rafts[0])
+            .await
+            .expect("time advance should succeed");
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(3), "time advance should replicate"),
+            )
+            .await
+            .expect("time advance should replicate")
+            .expect("time advance apply wait should succeed");
+        }
+
+        rafts[0].shutdown().await.expect("old leader should stop");
+        let (leader_shutdown, leader_task) = rpc_tasks.remove(0);
+        leader_shutdown
+            .send(true)
+            .expect("leader rpc shutdown should send");
+        leader_task.await.expect("leader rpc task should stop");
+        timeout(Duration::from_secs(8), async {
+            loop {
+                if rafts[1].current_leader().await == Some(2)
+                    || rafts[2].current_leader().await == Some(2)
+                {
+                    break;
+                }
+                if rafts[1].current_leader().await == Some(3)
+                    || rafts[2].current_leader().await == Some(3)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("new leader should be elected");
+        let new_leader = if rafts[1].current_leader().await == Some(2) {
+            &rafts[1]
+        } else if rafts[1].current_leader().await == Some(3) {
+            &rafts[2]
+        } else if rafts[2].current_leader().await == Some(2) {
+            &rafts[1]
+        } else {
+            &rafts[2]
+        };
+        let response = execute_client_request(
+            new_leader,
+            Request::Command(vec![
+                Bytes::from_static(b"GET"),
+                Bytes::from_static(b"failover-key"),
+            ]),
+        )
+        .await
+        .expect("read after failover should succeed");
+        assert_eq!(response, ClientRequestOutcome::Applied(Frame::Null));
+
+        for raft in rafts.into_iter().skip(1) {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should stop");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn tcp_network_recovers_state_after_node_restart() {
         let root = std::env::temp_dir().join(format!(
             "alias-cache-tcp-restart-{}-{}",
@@ -3287,6 +3452,90 @@ mod tests {
             .await
             .expect("restart shutdown should finish")
             .expect("restart shutdown should succeed");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn file_raft_preserves_ttl_across_restart() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-file-raft-ttl-restart-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let node = new_file_raft(1, &data_dir, Arc::clone(&peers))
+            .await
+            .expect("initial node should start");
+        node.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "file://1".into(),
+            },
+        )]))
+        .await
+        .expect("single node should initialize");
+        timeout(
+            Duration::from_secs(3),
+            node.wait(None)
+                .current_leader(1, "node should become leader"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        node.client_write(RaftRequest::Apply(Operation::SetWithExpiration {
+            key: Bytes::from_static(b"restart-ttl-key"),
+            value: Bytes::from_static(b"restart-ttl-value"),
+            expire_at: Some(2_000),
+            write_time: 1_000,
+            only_if_exists: false,
+            only_if_missing: false,
+            keep_ttl: false,
+            return_previous: false,
+        }))
+        .await
+        .expect("ttl write should succeed");
+        node.client_write(RaftRequest::Apply(Operation::AdvanceTime {
+            write_time: 1_500,
+        }))
+        .await
+        .expect("time advance should succeed");
+        node.shutdown().await.expect("initial node should stop");
+
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let restarted = new_file_raft(1, &data_dir, Arc::clone(&peers))
+            .await
+            .expect("restarted node should start");
+        timeout(
+            Duration::from_secs(3),
+            restarted
+                .wait(None)
+                .applied_index_at_least(Some(3), "ttl state should recover"),
+        )
+        .await
+        .expect("ttl state recovery should finish")
+        .expect("ttl state recovery should succeed");
+        let state = restarted
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("state should be readable");
+        assert_eq!(state.logical_time(), 1_500);
+        assert_eq!(
+            state
+                .prepare_request(Request::Command(vec![
+                    Bytes::from_static(b"PTTL"),
+                    Bytes::from_static(b"restart-ttl-key"),
+                ]))
+                .unwrap()
+                .1,
+            Frame::Integer(500)
+        );
+        restarted
+            .shutdown()
+            .await
+            .expect("restarted node should stop");
         let _ = std::fs::remove_dir_all(data_dir);
     }
 }

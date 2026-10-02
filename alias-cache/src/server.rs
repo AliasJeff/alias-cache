@@ -302,6 +302,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foundation_server_preserves_ttl_pipeline_responses() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: std::env::temp_dir().join(format!(
+                "alias-cache-server-ttl-pipeline-{}",
+                std::process::id()
+            )),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        config.ensure_data_dir().unwrap();
+        let data_dir = config.data_dir.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let limits = config.protocol_limits();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let state = Arc::new(tokio::sync::Mutex::new(
+                NodeState::open(&config.data_dir).unwrap(),
+            ));
+            handle_connection(stream, shutdown, state, limits).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n500\r\n\
+*2\r\n$4\r\nPTTL\r\n$3\r\nkey\r\n\
+*2\r\n$6\r\nEXISTS\r\n$3\r\nkey\r\n",
+            )
+            .await
+            .unwrap();
+        let expected_prefix = b"+OK\r\n:500\r\n:1\r\n";
+        let mut output = Vec::with_capacity(expected_prefix.len());
+        let mut buffer = [0_u8; 96];
+        while output.len() < expected_prefix.len() {
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            output.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(&output[..expected_prefix.len()], expected_prefix);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn single_node_server_serves_raft_backed_commands() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let data_dir = std::env::temp_dir().join(format!(
