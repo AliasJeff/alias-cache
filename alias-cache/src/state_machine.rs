@@ -22,6 +22,9 @@ pub enum Operation {
         value: Bytes,
         expire_at: Option<u64>,
         write_time: u64,
+        only_if_exists: bool,
+        only_if_missing: bool,
+        keep_ttl: bool,
     },
     MultiSet {
         pairs: Vec<(Bytes, Bytes)>,
@@ -30,6 +33,11 @@ pub enum Operation {
         keys: Vec<Bytes>,
     },
     Expire {
+        key: Bytes,
+        expire_at: u64,
+        write_time: u64,
+    },
+    ExpireSeconds {
         key: Bytes,
         expire_at: u64,
         write_time: u64,
@@ -48,6 +56,7 @@ impl Operation {
         match self {
             Self::SetWithExpiration { write_time, .. }
             | Self::Expire { write_time, .. }
+            | Self::ExpireSeconds { write_time, .. }
             | Self::Persist { write_time, .. } => *write_time,
             Self::Set { .. } | Self::MultiSet { .. } | Self::Delete { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -61,6 +70,7 @@ impl Operation {
             | Self::SetWithExpiration { .. }
             | Self::MultiSet { .. }
             | Self::Expire { .. }
+            | Self::ExpireSeconds { .. }
             | Self::Persist { .. }
             | Self::AdvanceTime { .. } => &[],
         }
@@ -90,6 +100,7 @@ impl StateMachine {
         let write_time = match &operation {
             Operation::SetWithExpiration { write_time, .. }
             | Operation::Expire { write_time, .. }
+            | Operation::ExpireSeconds { write_time, .. }
             | Operation::Persist { write_time, .. } => Some(*write_time),
             Operation::Set { .. } | Operation::MultiSet { .. } | Operation::Delete { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -112,8 +123,24 @@ impl StateMachine {
                 key,
                 value,
                 expire_at,
+                only_if_exists,
+                only_if_missing,
+                keep_ttl,
                 ..
             } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry));
+                if (only_if_exists && existing.is_none()) || (only_if_missing && existing.is_some())
+                {
+                    return ApplyResult::Response(Frame::Null);
+                }
+                let expire_at = if keep_ttl {
+                    existing.and_then(|entry| entry.expire_at)
+                } else {
+                    expire_at
+                };
                 self.values.insert(
                     key,
                     Entry {
@@ -149,6 +176,22 @@ impl StateMachine {
                 ApplyResult::Response(Frame::Integer(removed as i64))
             }
             Operation::Expire { key, expire_at, .. } => {
+                let response = if self
+                    .values
+                    .get(&key)
+                    .is_some_and(|entry| !self.is_expired(entry))
+                {
+                    self.values
+                        .get_mut(&key)
+                        .expect("entry existence checked")
+                        .expire_at = Some(expire_at);
+                    1
+                } else {
+                    0
+                };
+                ApplyResult::Response(Frame::Integer(response))
+            }
+            Operation::ExpireSeconds { key, expire_at, .. } => {
                 let response = if self
                     .values
                     .get(&key)
@@ -232,6 +275,12 @@ impl StateMachine {
         if command.eq_ignore_ascii_case(b"PEXPIRE") {
             return self.execute_pexpire(arguments);
         }
+        if command.eq_ignore_ascii_case(b"EXPIRE") {
+            return self.execute_expire(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"TTL") {
+            return self.execute_ttl(arguments);
+        }
         if command.eq_ignore_ascii_case(b"PTTL") {
             return self.execute_pttl(arguments);
         }
@@ -290,27 +339,74 @@ impl StateMachine {
     }
 
     fn execute_set(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
-        if arguments.len() != 3 && arguments.len() != 5 {
-            return Err(Error::protocol("wrong number of arguments for 'SET'"));
-        }
-        let expire_at = if arguments.len() == 5 {
-            if !arguments[3].eq_ignore_ascii_case(b"PX") {
+        let mut only_if_exists = false;
+        let mut only_if_missing = false;
+        let mut keep_ttl = false;
+        let mut expire_at = None;
+        let mut index = 3;
+        while index < arguments.len() {
+            if arguments[index].eq_ignore_ascii_case(b"NX") {
+                if only_if_exists {
+                    return Err(Error::protocol("SET NX and XX are mutually exclusive"));
+                }
+                only_if_missing = true;
+                index += 1;
+            } else if arguments[index].eq_ignore_ascii_case(b"XX") {
+                if only_if_missing {
+                    return Err(Error::protocol("SET NX and XX are mutually exclusive"));
+                }
+                only_if_exists = true;
+                index += 1;
+            } else if arguments[index].eq_ignore_ascii_case(b"KEEPTTL") {
+                if keep_ttl || expire_at.is_some() {
+                    return Err(Error::protocol("SET expiration options are duplicated"));
+                }
+                keep_ttl = true;
+                index += 1;
+            } else if arguments[index].eq_ignore_ascii_case(b"PX")
+                || arguments[index].eq_ignore_ascii_case(b"EX")
+            {
+                if keep_ttl || expire_at.is_some() || index + 1 >= arguments.len() {
+                    return Err(Error::protocol("SET expiration options are invalid"));
+                }
+                let ttl = parse_positive_u64(&arguments[index + 1], "SET")?;
+                let ttl = if arguments[index].eq_ignore_ascii_case(b"EX") {
+                    ttl.checked_mul(1_000)
+                        .ok_or_else(|| Error::protocol("SET EX expiration overflows"))?
+                } else {
+                    ttl
+                };
+                expire_at = Some(
+                    self.logical_time
+                        .checked_add(ttl)
+                        .ok_or_else(|| Error::protocol("SET expiration overflows"))?,
+                );
+                index += 2;
+            } else {
                 return Err(Error::protocol("unsupported SET option"));
             }
-            let ttl = parse_non_negative_u64(&arguments[4], "SET PX")?;
-            Some(
-                self.logical_time
-                    .checked_add(ttl)
-                    .ok_or_else(|| Error::protocol("SET PX expiration overflows"))?,
-            )
-        } else {
-            None
-        };
+        }
+        let blocked_by_condition = (only_if_missing
+            && self
+                .values
+                .get(&arguments[1])
+                .is_some_and(|entry| !self.is_expired(entry)))
+            || (only_if_exists
+                && self
+                    .values
+                    .get(&arguments[1])
+                    .is_none_or(|entry| self.is_expired(entry)));
+        if blocked_by_condition {
+            return Ok((None, Frame::Null));
+        }
         let operation = Operation::SetWithExpiration {
             key: arguments[1].clone(),
             value: arguments[2].clone(),
             expire_at,
             write_time: self.logical_time,
+            only_if_exists,
+            only_if_missing,
+            keep_ttl,
         };
         Ok((Some(operation), Frame::simple_string("OK")))
     }
@@ -423,6 +519,32 @@ impl StateMachine {
         ))
     }
 
+    fn execute_expire(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("EXPIRE", &arguments, 3)?;
+        let seconds = parse_non_negative_u64(&arguments[2], "EXPIRE")?;
+        let milliseconds = seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| Error::protocol("EXPIRE expiration overflows"))?;
+        let expire_at = self
+            .logical_time
+            .checked_add(milliseconds)
+            .ok_or_else(|| Error::protocol("EXPIRE expiration overflows"))?;
+        let Some(entry) = self.values.get(&arguments[1]) else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        if self.is_expired(entry) {
+            return Ok((None, Frame::Integer(0)));
+        }
+        Ok((
+            Some(Operation::ExpireSeconds {
+                key: arguments[1].clone(),
+                expire_at,
+                write_time: self.logical_time,
+            }),
+            Frame::Integer(1),
+        ))
+    }
+
     fn execute_pttl(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("PTTL", &arguments, 2)?;
         let Some(entry) = self.values.get(&arguments[1]) else {
@@ -438,6 +560,22 @@ impl StateMachine {
             None,
             Frame::Integer(expire_at.saturating_sub(self.logical_time) as i64),
         ))
+    }
+
+    fn execute_ttl(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("TTL", &arguments, 2)?;
+        let Some(entry) = self.values.get(&arguments[1]) else {
+            return Ok((None, Frame::Integer(-2)));
+        };
+        let Some(expire_at) = entry.expire_at else {
+            return Ok((None, Frame::Integer(-1)));
+        };
+        if self.logical_time >= expire_at {
+            return Ok((None, Frame::Integer(-2)));
+        }
+        let milliseconds = expire_at.saturating_sub(self.logical_time);
+        let seconds = milliseconds.saturating_add(500) / 1_000;
+        Ok((None, Frame::Integer(seconds.min(i64::MAX as u64) as i64)))
     }
 
     fn execute_persist(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -499,6 +637,16 @@ fn parse_non_negative_u64(value: &Bytes, command: &str) -> Result<u64> {
     value
         .parse::<u64>()
         .map_err(|_| Error::protocol(format!("{command} ttl is invalid")))
+}
+
+fn parse_positive_u64(value: &Bytes, command: &str) -> Result<u64> {
+    let value = parse_non_negative_u64(value, command)?;
+    if value == 0 {
+        return Err(Error::protocol(format!(
+            "{command} expiration must be positive"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -711,5 +859,79 @@ mod tests {
             Frame::Integer(0)
         );
         assert_eq!(state.snapshot().len(), 0);
+    }
+
+    #[test]
+    fn expire_and_ttl_follow_second_rounding_rules() {
+        let mut state = StateMachine::default();
+        state.advance_logical_time(1_000);
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXPIRE", b"key", b"2"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        state.advance_logical_time(1_501);
+        assert_eq!(
+            state.execute_request(command(&[b"TTL", b"key"])).unwrap().1,
+            Frame::Integer(1)
+        );
+        state.advance_logical_time(2_501);
+        assert_eq!(
+            state.execute_request(command(&[b"TTL", b"key"])).unwrap().1,
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn set_conditions_and_keep_ttl_are_deterministic() {
+        let mut state = StateMachine::default();
+        state.advance_logical_time(1_000);
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SET", b"key", b"one", b"NX"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SET", b"key", b"two", b"NX"]))
+                .unwrap()
+                .1,
+            Frame::Null
+        );
+        state
+            .execute_request(command(&[b"SET", b"key", b"two", b"PX", b"1000"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"SET", b"key", b"three", b"KEEPTTL"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1_000)
+        );
+    }
+
+    #[test]
+    fn set_rejects_zero_and_conflicting_options() {
+        let mut state = StateMachine::default();
+        assert!(
+            state
+                .execute_request(command(&[b"SET", b"key", b"value", b"PX", b"0"]))
+                .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"SET", b"key", b"value", b"NX", b"XX"]))
+                .is_err()
+        );
     }
 }
