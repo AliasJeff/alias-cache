@@ -13,7 +13,8 @@ use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
 use crate::raft::{
     ClientRequestOutcome, RaftHandle, execute_client_request, new_tcp_raft_for_server,
-    open_single_node, send_client_request, serve_raft_rpc, wait_for_leader,
+    open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request,
+    serve_raft_rpc, wait_for_leader,
 };
 
 pub struct Server {
@@ -62,6 +63,30 @@ impl Server {
             {
                 warn!(%error, "raft rpc listener failed");
             }
+        });
+        let time_worker_raft = raft.clone();
+        let time_worker_shutdown = shutdown.as_ref().clone();
+        let node_id = self.config.node_id;
+        tokio::spawn(async move {
+            run_leader_time_worker(
+                time_worker_raft,
+                node_id,
+                time_worker_shutdown,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        });
+        let expiration_worker_raft = raft.clone();
+        let expiration_worker_shutdown = shutdown.as_ref().clone();
+        let node_id = self.config.node_id;
+        tokio::spawn(async move {
+            run_expiration_worker(
+                expiration_worker_raft,
+                node_id,
+                expiration_worker_shutdown,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
         });
         if !self.config.cluster_nodes.is_empty() && self.config.bootstrap {
             wait_for_leader(&raft, self.config.node_id).await?;

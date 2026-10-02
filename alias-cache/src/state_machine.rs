@@ -32,6 +32,10 @@ pub enum Operation {
     Delete {
         keys: Vec<Bytes>,
     },
+    DeleteIfExpired {
+        key: Bytes,
+        expire_at: u64,
+    },
     Expire {
         key: Bytes,
         expire_at: u64,
@@ -58,7 +62,10 @@ impl Operation {
             | Self::Expire { write_time, .. }
             | Self::ExpireSeconds { write_time, .. }
             | Self::Persist { write_time, .. } => *write_time,
-            Self::Set { .. } | Self::MultiSet { .. } | Self::Delete { .. } => 0,
+            Self::Set { .. }
+            | Self::MultiSet { .. }
+            | Self::Delete { .. }
+            | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
         }
     }
@@ -69,6 +76,7 @@ impl Operation {
             Self::Set { .. }
             | Self::SetWithExpiration { .. }
             | Self::MultiSet { .. }
+            | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
             | Self::Persist { .. }
@@ -102,7 +110,10 @@ impl StateMachine {
             | Operation::Expire { write_time, .. }
             | Operation::ExpireSeconds { write_time, .. }
             | Operation::Persist { write_time, .. } => Some(*write_time),
-            Operation::Set { .. } | Operation::MultiSet { .. } | Operation::Delete { .. } => None,
+            Operation::Set { .. }
+            | Operation::MultiSet { .. }
+            | Operation::Delete { .. }
+            | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
         };
         if let Some(write_time) = write_time {
@@ -174,6 +185,15 @@ impl StateMachine {
                     }
                 }
                 ApplyResult::Response(Frame::Integer(removed as i64))
+            }
+            Operation::DeleteIfExpired { key, expire_at } => {
+                let should_remove = self.values.get(&key).is_some_and(|entry| {
+                    entry.expire_at == Some(expire_at) && self.is_expired(entry)
+                });
+                if should_remove {
+                    self.values.remove(&key);
+                }
+                ApplyResult::NoResponse
             }
             Operation::Expire { key, expire_at, .. } => {
                 let response = if self
@@ -320,6 +340,18 @@ impl StateMachine {
 
     pub fn advance_logical_time(&mut self, logical_time: u64) {
         self.logical_time = self.logical_time.max(logical_time);
+    }
+
+    pub fn expired_entries(&self) -> Vec<(Bytes, u64)> {
+        self.values
+            .iter()
+            .filter_map(|(key, entry)| {
+                entry
+                    .expire_at
+                    .filter(|_| self.is_expired(entry))
+                    .map(|expire_at| (key.clone(), expire_at))
+            })
+            .collect()
     }
 
     fn is_expired(&self, entry: &Entry) -> bool {
@@ -928,6 +960,59 @@ mod tests {
         assert_eq!(
             state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
             Frame::Null
+        );
+    }
+
+    #[test]
+    fn stale_expiration_cleanup_cannot_delete_replaced_or_persisted_value() {
+        let mut state = StateMachine::default();
+        state.apply(Operation::SetWithExpiration {
+            key: Bytes::from_static(b"key"),
+            value: Bytes::from_static(b"old"),
+            expire_at: Some(10),
+            write_time: 0,
+            only_if_exists: false,
+            only_if_missing: false,
+            keep_ttl: false,
+        });
+        state.advance_logical_time(10);
+        state.apply(Operation::Set {
+            key: Bytes::from_static(b"key"),
+            value: Bytes::from_static(b"new"),
+        });
+        assert_eq!(
+            state.apply(Operation::DeleteIfExpired {
+                key: Bytes::from_static(b"key"),
+                expire_at: 10,
+            }),
+            ApplyResult::NoResponse
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::BulkString(Bytes::from_static(b"new"))
+        );
+
+        state.apply(Operation::SetWithExpiration {
+            key: Bytes::from_static(b"key"),
+            value: Bytes::from_static(b"persistent"),
+            expire_at: Some(20),
+            write_time: 10,
+            only_if_exists: false,
+            only_if_missing: false,
+            keep_ttl: false,
+        });
+        state.apply(Operation::Persist {
+            key: Bytes::from_static(b"key"),
+            write_time: 10,
+        });
+        state.advance_logical_time(20);
+        state.apply(Operation::DeleteIfExpired {
+            key: Bytes::from_static(b"key"),
+            expire_at: 20,
+        });
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::BulkString(Bytes::from_static(b"persistent"))
         );
     }
 

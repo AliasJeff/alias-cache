@@ -28,7 +28,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::time::interval;
 use tokio::time::timeout;
 
 pub type NodeId = u64;
@@ -667,6 +668,76 @@ pub async fn advance_raft_time(raft: &RaftHandle) -> Result<(), String> {
         .await
         .map_err(|error| format!("advance raft logical time: {error}"))?;
     Ok(())
+}
+
+pub async fn run_leader_time_worker(
+    raft: Arc<RaftHandle>,
+    node_id: NodeId,
+    shutdown: watch::Receiver<bool>,
+    period: Duration,
+) {
+    let mut ticker = interval(period);
+    let mut shutdown = shutdown;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if raft.current_leader().await != Some(node_id) {
+                    continue;
+                }
+                if let Err(error) = advance_raft_time(&raft).await {
+                    tracing::debug!(node_id, %error, "leader time advancement skipped");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub async fn run_expiration_worker(
+    raft: Arc<RaftHandle>,
+    node_id: NodeId,
+    shutdown: watch::Receiver<bool>,
+    period: Duration,
+) {
+    let mut ticker = interval(period);
+    let mut shutdown = shutdown;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if raft.current_leader().await != Some(node_id) {
+                    continue;
+                }
+                let candidates = match raft
+                    .with_state_machine(|state_machine| {
+                        Box::pin(async move { state_machine.state().await.expired_entries() })
+                    })
+                    .await
+                {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        tracing::debug!(node_id, %error, "expiration scan skipped");
+                        continue;
+                    }
+                };
+                for (key, expire_at) in candidates {
+                    let operation = Operation::DeleteIfExpired { key, expire_at };
+                    if let Err(error) = raft.client_write(RaftRequest::Apply(operation)).await {
+                        tracing::debug!(node_id, %error, "expiration cleanup skipped");
+                        break;
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn current_time_millis() -> u64 {
@@ -2165,6 +2236,141 @@ mod tests {
             task.await.expect("rpc task should stop");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn leader_time_worker_advances_only_on_leader_and_stops() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-leader-time-worker-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let raft = new_mem_raft(1, Arc::clone(&peers))
+            .await
+            .expect("raft node should start");
+        raft.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "mem://1".into(),
+            },
+        )]))
+        .await
+        .expect("single node should initialize");
+        timeout(
+            Duration::from_secs(3),
+            raft.wait(None).current_leader(1, "single node should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_leader_time_worker(
+            Arc::new(raft.clone()),
+            1,
+            shutdown_rx,
+            Duration::from_millis(5),
+        ));
+        timeout(
+            Duration::from_secs(3),
+            raft.wait(None).metrics(
+                |metrics| metrics.last_log_index.is_some_and(|index| index >= 2),
+                "time worker should append",
+            ),
+        )
+        .await
+        .expect("time worker should append")
+        .expect("time worker metrics wait should succeed");
+
+        shutdown_tx.send(true).expect("worker shutdown should send");
+        timeout(Duration::from_secs(3), worker)
+            .await
+            .expect("worker should stop")
+            .expect("worker task should join");
+        raft.shutdown().await.expect("raft should shut down");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn expiration_worker_removes_expired_key_after_replicated_time_advance() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let raft = new_mem_raft(1, Arc::clone(&peers))
+            .await
+            .expect("raft node should start");
+        raft.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "mem://1".into(),
+            },
+        )]))
+        .await
+        .expect("single node should initialize");
+        timeout(
+            Duration::from_secs(3),
+            raft.wait(None).current_leader(1, "single node should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        let request = Request::Command(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"cleanup-key"),
+            Bytes::from_static(b"value"),
+            Bytes::from_static(b"PX"),
+            Bytes::from_static(b"10"),
+        ]);
+        execute_client_request(&raft, request)
+            .await
+            .expect("ttl write should succeed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let time_worker = tokio::spawn(run_leader_time_worker(
+            Arc::new(raft.clone()),
+            1,
+            shutdown_rx.clone(),
+            Duration::from_millis(5),
+        ));
+        let worker = tokio::spawn(run_expiration_worker(
+            Arc::new(raft.clone()),
+            1,
+            shutdown_rx,
+            Duration::from_millis(5),
+        ));
+        timeout(
+            Duration::from_secs(3),
+            raft.wait(None).metrics(
+                |metrics| metrics.last_log_index.is_some_and(|index| index >= 4),
+                "expiration worker should advance and clean",
+            ),
+        )
+        .await
+        .expect("expiration worker should append cleanup")
+        .expect("expiration worker metrics wait should succeed");
+        let state = raft
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("state should be readable");
+        assert!(
+            !state
+                .snapshot()
+                .contains_key(&Bytes::from_static(b"cleanup-key"))
+        );
+
+        shutdown_tx.send(true).expect("worker shutdown should send");
+        timeout(Duration::from_secs(3), time_worker)
+            .await
+            .expect("time worker should stop")
+            .expect("time worker task should join");
+        timeout(Duration::from_secs(3), worker)
+            .await
+            .expect("worker should stop")
+            .expect("worker task should join");
+        raft.shutdown().await.expect("raft should shut down");
     }
 
     #[tokio::test]
