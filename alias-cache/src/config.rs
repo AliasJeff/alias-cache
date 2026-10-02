@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::protocol::ProtocolLimits;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -84,6 +85,15 @@ impl Config {
     pub fn ensure_data_dir(&self) -> Result<()> {
         std::fs::create_dir_all(Path::new(&self.data_dir))
             .map_err(|source| Error::io("create data directory", source))
+    }
+
+    pub fn protocol_limits(&self) -> ProtocolLimits {
+        ProtocolLimits {
+            max_frame_size: self.max_frame_size,
+            max_array_len: self.max_array_len,
+            max_nesting_depth: self.max_nesting_depth,
+            max_pipeline_len: self.max_pipeline_len,
+        }
     }
 }
 

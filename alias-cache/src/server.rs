@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use tokio::io::AsyncWriteExt;
+use bytes::BytesMut;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::protocol::{Decoder, Frame};
 
 pub struct Server {
     config: Config,
@@ -33,8 +35,9 @@ impl Server {
                     let (stream, peer) = result
                         .map_err(|source| Error::io("accept client connection", source))?;
                     let child_shutdown = shutdown.clone();
+                    let limits = self.config.protocol_limits();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_connection(stream, child_shutdown).await {
+                        if let Err(error) = handle_connection(stream, child_shutdown, limits).await {
                             warn!(%peer, %error, "client connection failed");
                         }
                     });
@@ -61,15 +64,101 @@ async fn wait_for_shutdown(shutdown: Arc<watch::Receiver<bool>>) -> Result<()> {
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: Arc<watch::Receiver<bool>>,
+    limits: crate::protocol::ProtocolLimits,
 ) -> Result<()> {
+    let mut decoder = Decoder::new(limits);
+    let mut input = [0_u8; 8 * 1024];
+    loop {
+        tokio::select! {
+            result = stream.read(&mut input) => {
+                let read = result.map_err(|source| Error::io("read client request", source))?;
+                if read == 0 {
+                    return Ok(());
+                }
+                let frames = match decoder.push(&input[..read]) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        write_frame(&mut stream, Frame::error(format!("ERR {error}"))).await?;
+                        return Err(error);
+                    }
+                };
+                for _frame in frames {
+                    write_frame(
+                        &mut stream,
+                        Frame::error("ERR alias-cache foundation server is not ready"),
+                    )
+                    .await?;
+                }
+            }
+            result = wait_for_shutdown(shutdown.clone()) => {
+                result?;
+                stream.shutdown().await
+                    .map_err(|source| Error::io("close client connection", source))?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn write_frame(stream: &mut TcpStream, frame: Frame) -> Result<()> {
+    let mut output = BytesMut::new();
+    frame.encode(&mut output)?;
     stream
-        .write_all(b"-ERR alias-cache foundation server is not ready\r\n")
+        .write_all(&output)
         .await
-        .map_err(|source| Error::io("write foundation response", source))?;
-    let _ = shutdown;
-    stream
-        .shutdown()
-        .await
-        .map_err(|source| Error::io("close client connection", source))?;
+        .map_err(|source| Error::io("write client response", source))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn foundation_server_preserves_pipeline_response_order() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: std::env::temp_dir()
+                .join(format!("alias-cache-server-test-{}", std::process::id())),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        config.ensure_data_dir().unwrap();
+        let shutdown = Arc::new(shutdown_rx);
+        let limits = config.protocol_limits();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, shutdown, limits).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nECHO\r\n")
+            .await
+            .unwrap();
+        let expected =
+            b"-ERR alias-cache foundation server is not ready\r\n-ERR alias-cache foundation server is not ready\r\n";
+        let mut output = Vec::with_capacity(expected.len());
+        let mut buffer = [0_u8; 96];
+        while output.len() < expected.len() {
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            output.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(&output[..expected.len()], expected);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+    }
 }
