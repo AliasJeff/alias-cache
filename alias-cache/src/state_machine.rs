@@ -54,6 +54,10 @@ pub enum Operation {
     AdvanceTime {
         write_time: u64,
     },
+    Transaction {
+        operations: Vec<Operation>,
+        write_time: u64,
+    },
 }
 
 impl Operation {
@@ -68,6 +72,7 @@ impl Operation {
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
+            Self::Transaction { write_time, .. } => *write_time,
         }
     }
 
@@ -81,7 +86,8 @@ impl Operation {
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
             | Self::Persist { .. }
-            | Self::AdvanceTime { .. } => &[],
+            | Self::AdvanceTime { .. }
+            | Self::Transaction { .. } => &[],
         }
     }
 }
@@ -116,6 +122,7 @@ impl StateMachine {
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
+            Operation::Transaction { write_time, .. } => Some(*write_time),
         };
         if let Some(write_time) = write_time {
             self.advance_logical_time(write_time);
@@ -251,6 +258,21 @@ impl StateMachine {
                 ApplyResult::Response(Frame::Integer(response))
             }
             Operation::AdvanceTime { .. } => ApplyResult::NoResponse,
+            Operation::Transaction {
+                operations,
+                write_time,
+            } => {
+                self.advance_logical_time(write_time);
+                let mut responses = Vec::with_capacity(operations.len());
+                for operation in operations {
+                    let result = self.apply(operation);
+                    match result {
+                        ApplyResult::Response(response) => responses.push(response),
+                        ApplyResult::NoResponse => responses.push(Frame::Null),
+                    }
+                }
+                ApplyResult::Response(Frame::Array(responses))
+            }
         }
     }
 
@@ -318,6 +340,54 @@ impl StateMachine {
             "unknown command '{}'",
             String::from_utf8_lossy(command)
         )))
+    }
+
+    pub fn prepare_transaction(
+        &self,
+        requests: &[Request],
+        write_time: u64,
+    ) -> Result<(Operation, Frame)> {
+        let mut state = self.clone();
+        state.advance_logical_time(write_time);
+        let mut operations = Vec::with_capacity(requests.len());
+        let mut responses = Vec::with_capacity(requests.len());
+        for request in requests {
+            let Request::Command(arguments) = request;
+            if arguments
+                .first()
+                .is_some_and(|command| command.eq_ignore_ascii_case(b"EXEC"))
+            {
+                return Err(Error::protocol("EXEC is not allowed inside a transaction"));
+            }
+            if arguments
+                .first()
+                .is_some_and(|command| command.eq_ignore_ascii_case(b"MULTI"))
+            {
+                return Err(Error::protocol("MULTI is not allowed inside a transaction"));
+            }
+            let request = Request::Command(arguments.clone());
+            let (operation, response) = state.prepare_request(request.clone())?;
+            let Some(operation) = operation else {
+                return Err(Error::protocol(
+                    "transaction command must be a replicated write",
+                ));
+            };
+            let applied = state.apply(operation.clone());
+            if applied != ApplyResult::Response(response.clone()) {
+                return Err(Error::server(
+                    "prepared transaction response differs from applied response",
+                ));
+            }
+            operations.push(operation);
+            responses.push(response);
+        }
+        Ok((
+            Operation::Transaction {
+                operations,
+                write_time: state.logical_time,
+            },
+            Frame::Array(responses),
+        ))
     }
 
     pub fn execute_request(&mut self, request: Request) -> Result<(Option<Operation>, Frame)> {
@@ -1114,6 +1184,59 @@ mod tests {
                 ]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transaction_prepares_ordered_ttl_writes_as_one_operation() {
+        let state = StateMachine::default();
+        let requests = vec![
+            command(&[b"SET", b"key", b"value", b"PX", b"1000"]),
+            command(&[b"PERSIST", b"key"]),
+        ];
+        let (operation, response) = state.prepare_transaction(&requests, 1_000).unwrap();
+        assert_eq!(
+            response,
+            Frame::Array(vec![Frame::simple_string("OK"), Frame::Integer(1),])
+        );
+        assert!(matches!(
+            operation,
+            Operation::Transaction {
+                operations,
+                write_time: 1_000,
+            } if operations.len() == 2
+        ));
+        assert_eq!(state.logical_time(), 0);
+    }
+
+    #[test]
+    fn transaction_rejects_reads_without_mutating_state() {
+        let state = StateMachine::default();
+        let before = state.clone();
+        let error = state
+            .prepare_transaction(&[command(&[b"GET", b"missing"])], 1_000)
+            .unwrap_err();
+        assert!(error.to_string().contains("replicated write"));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn transaction_operation_round_trips_through_serialization() {
+        let operation = Operation::Transaction {
+            operations: vec![
+                Operation::Set {
+                    key: Bytes::from_static(b"key"),
+                    value: Bytes::from_static(b"value"),
+                },
+                Operation::Persist {
+                    key: Bytes::from_static(b"key"),
+                    write_time: 1_000,
+                },
+            ],
+            write_time: 1_000,
+        };
+        let encoded = bincode::serialize(&operation).unwrap();
+        let decoded: Operation = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded, operation);
     }
 
     #[test]

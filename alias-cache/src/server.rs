@@ -12,9 +12,9 @@ use crate::error::{Error, Result};
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
 use crate::raft::{
-    ClientRequestOutcome, RaftHandle, execute_client_request, new_tcp_raft_for_server,
-    open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request,
-    serve_raft_rpc, wait_for_leader,
+    ClientRequestOutcome, RaftHandle, execute_client_request, execute_transaction_request,
+    new_tcp_raft_for_server, open_single_node, run_expiration_worker, run_leader_time_worker,
+    send_client_request, send_transaction_request, serve_raft_rpc, wait_for_leader,
 };
 
 pub struct Server {
@@ -184,6 +184,7 @@ async fn handle_raft_connection(
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
+    let mut transaction = None;
     loop {
         tokio::select! {
             result = stream.read(&mut input) => {
@@ -200,7 +201,9 @@ async fn handle_raft_connection(
                 };
                 for frame in frames {
                     let response = match command_from_frame(frame) {
-                        Ok(request) => execute_client_command(&raft, request).await,
+                        Ok(request) => {
+                            handle_transaction_command(&raft, &mut transaction, request).await
+                        }
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
                     write_frame(&mut stream, response).await?;
@@ -213,6 +216,66 @@ async fn handle_raft_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+async fn handle_transaction_command(
+    raft: &RaftHandle,
+    transaction: &mut Option<Vec<crate::protocol::Request>>,
+    request: crate::protocol::Request,
+) -> Frame {
+    let crate::protocol::Request::Command(arguments) = &request;
+    let command = arguments.first().map(|argument| argument.as_ref());
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"MULTI")) {
+        if transaction.is_some() {
+            return Frame::error("ERR MULTI calls can not be nested");
+        }
+        *transaction = Some(Vec::new());
+        return Frame::simple_string("OK");
+    }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"DISCARD")) {
+        if transaction.take().is_none() {
+            return Frame::error("ERR DISCARD without MULTI");
+        }
+        return Frame::simple_string("OK");
+    }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"EXEC")) {
+        let Some(requests) = transaction.take() else {
+            return Frame::error("ERR EXEC without MULTI");
+        };
+        return execute_transaction(raft, requests).await;
+    }
+    if let Some(requests) = transaction {
+        if command.is_some_and(|command| {
+            command.eq_ignore_ascii_case(b"DISCARD")
+                || command.eq_ignore_ascii_case(b"MULTI")
+                || command.eq_ignore_ascii_case(b"EXEC")
+        }) {
+            return Frame::error("ERR transaction control command is invalid here");
+        }
+        if requests.len() >= 1_024 {
+            return Frame::error("ERR transaction command limit exceeded");
+        }
+        requests.push(request);
+        return Frame::simple_string("QUEUED");
+    }
+    execute_client_command(raft, request).await
+}
+
+async fn execute_transaction(raft: &RaftHandle, requests: Vec<crate::protocol::Request>) -> Frame {
+    match execute_transaction_request(raft, requests.clone()).await {
+        Ok(ClientRequestOutcome::Applied(response)) => response,
+        Ok(ClientRequestOutcome::Redirect(address)) => match send_transaction_request(
+            &address,
+            requests,
+            &openraft::network::RPCOption::new(std::time::Duration::from_secs(1)),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => Frame::error(format!("ERR {error}")),
+        },
+        Err(error) => Frame::error(format!("ERR {error}")),
     }
 }
 
@@ -347,6 +410,93 @@ mod tests {
             output.extend_from_slice(&buffer[..read]);
         }
         assert_eq!(&output[..expected_prefix.len()], expected_prefix);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn single_connection_executes_ttl_transaction_atomically() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: std::env::temp_dir().join(format!(
+                "alias-cache-server-transaction-{}",
+                std::process::id()
+            )),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_dir = config.data_dir.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(stream, shutdown, raft, config.protocol_limits()).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"*1\r\n$5\r\nMULTI\r\n\
+*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n500\r\n\
+*3\r\n$7\r\nPEXPIRE\r\n$3\r\nkey\r\n$3\r\n250\r\n\
+*2\r\n$7\r\nPERSIST\r\n$3\r\nkey\r\n\
+*1\r\n$4\r\nEXEC\r\n",
+            )
+            .await
+            .unwrap();
+        let mut decoder = crate::protocol::Decoder::new(crate::protocol::ProtocolLimits::default());
+        let mut frames = Vec::new();
+        let mut buffer = [0_u8; 128];
+        while frames.len() < 5 {
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            frames.extend(decoder.push(&buffer[..read]).unwrap());
+        }
+        assert_eq!(
+            frames,
+            vec![
+                Frame::simple_string("OK"),
+                Frame::simple_string("QUEUED"),
+                Frame::simple_string("QUEUED"),
+                Frame::simple_string("QUEUED"),
+                Frame::Array(vec![
+                    Frame::simple_string("OK"),
+                    Frame::Integer(1),
+                    Frame::Integer(1),
+                ]),
+            ]
+        );
+
+        client
+            .write_all(b"*2\r\n$4\r\nPTTL\r\n$3\r\nkey\r\n")
+            .await
+            .unwrap();
+        let mut frames = Vec::new();
+        while frames.is_empty() {
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            frames.extend(decoder.push(&buffer[..read]).unwrap());
+        }
+        assert_eq!(frames, vec![Frame::Integer(-1)]);
 
         shutdown_tx.send(true).unwrap();
         let _ = task.await;

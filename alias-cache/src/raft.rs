@@ -83,6 +83,7 @@ enum NetworkRequest {
     Vote(VoteRequest<TypeConfig>),
     PreVote(VoteRequest<TypeConfig>),
     Client(Request),
+    Transaction(Vec<Request>),
     Snapshot {
         vote: Vote,
         snapshot: Vec<u8>,
@@ -658,6 +659,40 @@ pub async fn execute_client_request(
     }
 }
 
+pub async fn execute_transaction_request(
+    raft: &RaftHandle,
+    requests: Vec<Request>,
+) -> Result<ClientRequestOutcome, String> {
+    let write_time = current_time_millis();
+    let operation = raft
+        .with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                let state = state_machine.state().await;
+                state
+                    .prepare_transaction(&requests, write_time)
+                    .map(|(operation, _)| operation)
+            })
+        })
+        .await
+        .map_err(|error| format!("read raft state machine: {error}"))?
+        .map_err(|error| error.to_string())?;
+    match raft.client_write(RaftRequest::Apply(operation)).await {
+        Ok(result) => match result.data {
+            RaftResponse::Applied(response) => Ok(ClientRequestOutcome::Applied(response)),
+            RaftResponse::Noop => Err("transaction produced no response".to_string()),
+        },
+        Err(error) => {
+            if let Some(forward) = error.forward_to_leader() {
+                if let Some(node) = &forward.leader_node {
+                    return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
+                }
+                return Err("raft leader is not known".to_string());
+            }
+            Err(format!("transaction failed: {error}"))
+        }
+    }
+}
+
 pub async fn advance_raft_time(raft: &RaftHandle) -> Result<(), String> {
     let write_time = current_time_millis();
     let operation = raft
@@ -1022,6 +1057,21 @@ pub async fn send_client_request(
     }
 }
 
+pub async fn send_transaction_request(
+    address: &str,
+    requests: Vec<Request>,
+    option: &RPCOption,
+) -> CacheResult<Frame> {
+    let response = send_rpc(address, NetworkRequest::Transaction(requests), option)
+        .await
+        .map_err(|error| Error::server(format!("send transaction request: {error}")))?;
+    match response {
+        NetworkResponse::Client(Ok(frame)) => Ok(frame),
+        NetworkResponse::Client(Err(error)) => Err(Error::server(error)),
+        _ => Err(Error::server("unexpected transaction rpc response")),
+    }
+}
+
 fn rpc_response_error(error: String) -> RPCError<TypeConfig> {
     RPCError::Network(openraft::error::NetworkError::from_string(error))
 }
@@ -1187,6 +1237,17 @@ async fn handle_raft_rpc(
                             Frame::error(format!("MOVED {address}"))
                         }
                     });
+            NetworkResponse::Client(response)
+        }
+        NetworkRequest::Transaction(requests) => {
+            let response = execute_transaction_request(&raft, requests)
+                .await
+                .map(|outcome| match outcome {
+                    ClientRequestOutcome::Applied(frame) => frame,
+                    ClientRequestOutcome::Redirect(address) => {
+                        Frame::error(format!("MOVED {address}"))
+                    }
+                });
             NetworkResponse::Client(response)
         }
         NetworkRequest::Snapshot {
