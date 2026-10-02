@@ -1384,6 +1384,71 @@ pub fn enable_raft_runtime(raft: &RaftHandle) {
     raft.runtime_config().elect(true);
 }
 
+pub async fn add_raft_learner(raft: &RaftHandle, node_id: NodeId, node: Node) -> CacheResult<()> {
+    raft.add_learner(node_id, node, false)
+        .await
+        .map_err(|error| Error::server(format!("add raft learner {node_id}: {error}")))?;
+    Ok(())
+}
+
+pub async fn wait_for_raft_replication(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    raft.wait(None)
+        .metrics(
+            |metrics| {
+                let Some(target) = metrics.last_log_index else {
+                    return false;
+                };
+                if metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&node_id)
+                    .is_none()
+                {
+                    return false;
+                }
+                metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|replication| replication.get(&node_id))
+                    .and_then(|matched| matched.as_ref())
+                    .is_some_and(|matched| matched.index >= target)
+            },
+            format!("wait for raft learner {node_id} replication"),
+        )
+        .await
+        .map_err(|error| Error::server(format!("wait for raft learner {node_id}: {error}")))?;
+    Ok(())
+}
+
+pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    let mut voters = raft.voter_ids().collect::<Vec<_>>();
+    if !voters.contains(&node_id) {
+        voters.push(node_id);
+    }
+    voters.sort_unstable();
+    raft.change_membership(voters, false)
+        .await
+        .map_err(|error| Error::server(format!("promote raft learner {node_id}: {error}")))?;
+    Ok(())
+}
+
+pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    let mut voters = raft
+        .voter_ids()
+        .filter(|voter_id| *voter_id != node_id)
+        .collect::<Vec<_>>();
+    voters.sort_unstable();
+    if voters.is_empty() {
+        return Err(Error::invalid_config(
+            "refuse to remove the last raft voter",
+        ));
+    }
+    raft.change_membership(voters, false)
+        .await
+        .map_err(|error| Error::server(format!("remove raft voter {node_id}: {error}")))?;
+    Ok(())
+}
+
 pub async fn wait_for_leader(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
     raft.wait(None)
         .current_leader(node_id, "tcp raft leader election")
@@ -1892,6 +1957,160 @@ mod tests {
             task.await.expect("rpc task should join");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tcp_cluster_adds_promotes_and_removes_learner() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-membership-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+        let initial_nodes = nodes
+            .iter()
+            .take(3)
+            .map(|(id, node)| (*id, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), initial_nodes.clone()).await
+            } else if index < 3 {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    initial_nodes.clone(),
+                )
+                .await
+            } else {
+                new_tcp_raft_joiner(4, root.join("node-4"), BTreeMap::new()).await
+            }
+            .expect("tcp raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop cleanly");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        for raft in &rafts[1..3] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match rafts[0]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"membership-key"),
+                        value: Bytes::from_static(b"membership-value"),
+                    }))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    Err(error) => panic!("initial write failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("initial write should finish");
+
+        add_raft_learner(&rafts[0], 4, nodes[&4].clone())
+            .await
+            .expect("learner should be added");
+        wait_for_raft_replication(&rafts[0], 4)
+            .await
+            .expect("learner should catch up");
+        promote_raft_learner(&rafts[0], 4)
+            .await
+            .expect("learner should be promoted");
+        rafts[3]
+            .wait(None)
+            .metrics(
+                |metrics| metrics.membership_config.voter_ids().any(|id| id == 4),
+                "node 4 should become voter",
+            )
+            .await
+            .expect("promotion should reach node 4");
+
+        remove_raft_voter(&rafts[0], 3)
+            .await
+            .expect("node 3 should be removed");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| metrics.membership_config.voter_ids().eq([1, 2, 4]),
+                "node 3 should be removed from voters",
+            )
+            .await
+            .expect("removal should commit");
+
+        for raft in &rafts {
+            raft.shutdown().await.expect("raft should shut down");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn raft_membership_refuses_to_remove_last_voter() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let raft = new_mem_raft(1, Arc::clone(&peers))
+            .await
+            .expect("raft node should start");
+        raft.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "mem://1".into(),
+            },
+        )]))
+        .await
+        .expect("single-node cluster should initialize");
+        raft.wait(None)
+            .current_leader(1, "single node should lead")
+            .await
+            .expect("single node should elect itself");
+
+        let error = remove_raft_voter(&raft, 1)
+            .await
+            .expect_err("last voter removal should fail");
+        assert!(error.to_string().contains("last raft voter"));
+        raft.shutdown().await.expect("raft should shut down");
     }
 
     #[tokio::test]
