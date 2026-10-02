@@ -25,6 +25,7 @@ pub enum Operation {
         only_if_exists: bool,
         only_if_missing: bool,
         keep_ttl: bool,
+        return_previous: bool,
     },
     MultiSet {
         pairs: Vec<(Bytes, Bytes)>,
@@ -137,6 +138,7 @@ impl StateMachine {
                 only_if_exists,
                 only_if_missing,
                 keep_ttl,
+                return_previous,
                 ..
             } => {
                 let existing = self
@@ -147,6 +149,7 @@ impl StateMachine {
                 {
                     return ApplyResult::Response(Frame::Null);
                 }
+                let previous = existing.map(|entry| value_to_frame(Some(&entry.value)));
                 let expire_at = if keep_ttl {
                     existing.and_then(|entry| entry.expire_at)
                 } else {
@@ -159,7 +162,11 @@ impl StateMachine {
                         expire_at,
                     },
                 );
-                ApplyResult::Response(Frame::simple_string("OK"))
+                if return_previous {
+                    ApplyResult::Response(previous.unwrap_or(Frame::Null))
+                } else {
+                    ApplyResult::Response(Frame::simple_string("OK"))
+                }
             }
             Operation::MultiSet { pairs } => {
                 for (key, value) in pairs {
@@ -374,6 +381,7 @@ impl StateMachine {
         let mut only_if_exists = false;
         let mut only_if_missing = false;
         let mut keep_ttl = false;
+        let mut return_previous = false;
         let mut expire_at = None;
         let mut index = 3;
         while index < arguments.len() {
@@ -395,24 +403,54 @@ impl StateMachine {
                 }
                 keep_ttl = true;
                 index += 1;
+            } else if arguments[index].eq_ignore_ascii_case(b"GET") {
+                if return_previous {
+                    return Err(Error::protocol("SET GET option is duplicated"));
+                }
+                return_previous = true;
+                index += 1;
             } else if arguments[index].eq_ignore_ascii_case(b"PX")
                 || arguments[index].eq_ignore_ascii_case(b"EX")
+                || arguments[index].eq_ignore_ascii_case(b"PXAT")
+                || arguments[index].eq_ignore_ascii_case(b"EXAT")
             {
                 if keep_ttl || expire_at.is_some() || index + 1 >= arguments.len() {
                     return Err(Error::protocol("SET expiration options are invalid"));
                 }
-                let ttl = parse_positive_u64(&arguments[index + 1], "SET")?;
-                let ttl = if arguments[index].eq_ignore_ascii_case(b"EX") {
-                    ttl.checked_mul(1_000)
-                        .ok_or_else(|| Error::protocol("SET EX expiration overflows"))?
-                } else {
-                    ttl
-                };
-                expire_at = Some(
+                let option = &arguments[index];
+                let value = parse_non_negative_u64(&arguments[index + 1], "SET")?;
+                let absolute =
+                    option.eq_ignore_ascii_case(b"EXAT") || option.eq_ignore_ascii_case(b"PXAT");
+                let absolute_expire_at = if option.eq_ignore_ascii_case(b"EX") {
+                    if value == 0 {
+                        return Err(Error::protocol("SET expiration must be positive"));
+                    }
+                    let milliseconds = value
+                        .checked_mul(1_000)
+                        .ok_or_else(|| Error::protocol("SET EX expiration overflows"))?;
                     self.logical_time
-                        .checked_add(ttl)
-                        .ok_or_else(|| Error::protocol("SET expiration overflows"))?,
-                );
+                        .checked_add(milliseconds)
+                        .ok_or_else(|| Error::protocol("SET expiration overflows"))?
+                } else if option.eq_ignore_ascii_case(b"PX") {
+                    if value == 0 {
+                        return Err(Error::protocol("SET expiration must be positive"));
+                    }
+                    self.logical_time
+                        .checked_add(value)
+                        .ok_or_else(|| Error::protocol("SET expiration overflows"))?
+                } else if option.eq_ignore_ascii_case(b"EXAT") {
+                    value
+                        .checked_mul(1_000)
+                        .ok_or_else(|| Error::protocol("SET EXAT expiration overflows"))?
+                } else {
+                    value
+                };
+                if absolute && absolute_expire_at <= self.logical_time {
+                    return Err(Error::protocol(
+                        "SET absolute expiration must be in the future",
+                    ));
+                }
+                expire_at = Some(absolute_expire_at);
                 index += 2;
             } else {
                 return Err(Error::protocol("unsupported SET option"));
@@ -439,8 +477,18 @@ impl StateMachine {
             only_if_exists,
             only_if_missing,
             keep_ttl,
+            return_previous,
         };
-        Ok((Some(operation), Frame::simple_string("OK")))
+        let response = if return_previous {
+            self.values
+                .get(&arguments[1])
+                .filter(|entry| !self.is_expired(entry))
+                .map(|entry| value_to_frame(Some(&entry.value)))
+                .unwrap_or(Frame::Null)
+        } else {
+            Frame::simple_string("OK")
+        };
+        Ok((Some(operation), response))
     }
 
     fn execute_del(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -683,16 +731,6 @@ fn parse_signed_i64(value: &Bytes, command: &str) -> Result<i64> {
     value
         .parse::<i64>()
         .map_err(|_| Error::protocol(format!("{command} ttl is invalid")))
-}
-
-fn parse_positive_u64(value: &Bytes, command: &str) -> Result<u64> {
-    let value = parse_non_negative_u64(value, command)?;
-    if value == 0 {
-        return Err(Error::protocol(format!(
-            "{command} expiration must be positive"
-        )));
-    }
-    Ok(value)
 }
 
 #[cfg(test)]
@@ -974,6 +1012,7 @@ mod tests {
             only_if_exists: false,
             only_if_missing: false,
             keep_ttl: false,
+            return_previous: false,
         });
         state.advance_logical_time(10);
         state.apply(Operation::Set {
@@ -1000,6 +1039,7 @@ mod tests {
             only_if_exists: false,
             only_if_missing: false,
             keep_ttl: false,
+            return_previous: false,
         });
         state.apply(Operation::Persist {
             key: Bytes::from_static(b"key"),
@@ -1061,6 +1101,58 @@ mod tests {
             state
                 .execute_request(command(&[b"SET", b"key", b"value", b"NX", b"XX"]))
                 .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"SET", b"key", b"value", b"EX", b"0"]))
+                .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[
+                    b"SET", b"key", b"value", b"PX", b"100", b"EXAT", b"200"
+                ]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn set_get_returns_previous_value_and_absolute_expiration_is_deterministic() {
+        let mut state = StateMachine::default();
+        state.advance_logical_time(1_000_000);
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SET", b"key", b"one", b"PXAT", b"1000500"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+        let (operation, response) = state
+            .execute_request(command(&[b"SET", b"key", b"two", b"GET"]))
+            .unwrap();
+        assert_eq!(response, Frame::BulkString(Bytes::from_static(b"one")));
+        state.apply(operation.expect("SET GET should produce an operation"));
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::BulkString(Bytes::from_static(b"two"))
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(-1)
+        );
+
+        state
+            .execute_request(command(&[b"SET", b"key", b"three", b"EXAT", b"1002"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(2_000)
         );
     }
 }

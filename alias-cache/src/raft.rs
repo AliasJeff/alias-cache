@@ -1868,6 +1868,7 @@ mod tests {
             only_if_exists: false,
             only_if_missing: false,
             keep_ttl: false,
+            return_previous: false,
         });
         let RaftRequest::Apply(operation) = request;
         state_machine.inner.lock().await.state.apply(operation);

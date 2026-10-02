@@ -258,6 +258,7 @@ mod tests {
             only_if_exists: false,
             only_if_missing: false,
             keep_ttl: false,
+            return_previous: false,
         })
         .unwrap();
         wal.append(&Operation::AdvanceTime { write_time: 1_500 })
