@@ -498,17 +498,20 @@ impl StateMachine {
 
     fn execute_pexpire(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("PEXPIRE", &arguments, 3)?;
-        let ttl = parse_non_negative_u64(&arguments[2], "PEXPIRE")?;
+        let ttl = parse_signed_i64(&arguments[2], "PEXPIRE")?;
         let Some(entry) = self.values.get(&arguments[1]) else {
             return Ok((None, Frame::Integer(0)));
         };
         if self.is_expired(entry) {
             return Ok((None, Frame::Integer(0)));
         }
-        let expire_at = self
-            .logical_time
-            .checked_add(ttl)
-            .ok_or_else(|| Error::protocol("PEXPIRE expiration overflows"))?;
+        let expire_at = if ttl <= 0 {
+            self.logical_time
+        } else {
+            self.logical_time
+                .checked_add(ttl as u64)
+                .ok_or_else(|| Error::protocol("PEXPIRE expiration overflows"))?
+        };
         Ok((
             Some(Operation::Expire {
                 key: arguments[1].clone(),
@@ -521,20 +524,23 @@ impl StateMachine {
 
     fn execute_expire(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("EXPIRE", &arguments, 3)?;
-        let seconds = parse_non_negative_u64(&arguments[2], "EXPIRE")?;
-        let milliseconds = seconds
-            .checked_mul(1_000)
-            .ok_or_else(|| Error::protocol("EXPIRE expiration overflows"))?;
-        let expire_at = self
-            .logical_time
-            .checked_add(milliseconds)
-            .ok_or_else(|| Error::protocol("EXPIRE expiration overflows"))?;
+        let seconds = parse_signed_i64(&arguments[2], "EXPIRE")?;
         let Some(entry) = self.values.get(&arguments[1]) else {
             return Ok((None, Frame::Integer(0)));
         };
         if self.is_expired(entry) {
             return Ok((None, Frame::Integer(0)));
         }
+        let expire_at = if seconds <= 0 {
+            self.logical_time
+        } else {
+            let milliseconds = (seconds as u64)
+                .checked_mul(1_000)
+                .ok_or_else(|| Error::protocol("EXPIRE expiration overflows"))?;
+            self.logical_time
+                .checked_add(milliseconds)
+                .ok_or_else(|| Error::protocol("EXPIRE expiration overflows"))?
+        };
         Ok((
             Some(Operation::ExpireSeconds {
                 key: arguments[1].clone(),
@@ -636,6 +642,14 @@ fn parse_non_negative_u64(value: &Bytes, command: &str) -> Result<u64> {
         .map_err(|_| Error::protocol(format!("{command} ttl is not valid UTF-8")))?;
     value
         .parse::<u64>()
+        .map_err(|_| Error::protocol(format!("{command} ttl is invalid")))
+}
+
+fn parse_signed_i64(value: &Bytes, command: &str) -> Result<i64> {
+    let value = std::str::from_utf8(value)
+        .map_err(|_| Error::protocol(format!("{command} ttl is not valid UTF-8")))?;
+    value
+        .parse::<i64>()
         .map_err(|_| Error::protocol(format!("{command} ttl is invalid")))
 }
 
@@ -884,6 +898,36 @@ mod tests {
         assert_eq!(
             state.execute_request(command(&[b"TTL", b"key"])).unwrap().1,
             Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn non_positive_expire_ttl_expires_existing_key_immediately() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        let (operation, response) = state
+            .execute_request(command(&[b"PEXPIRE", b"key", b"-1"]))
+            .unwrap();
+        assert_eq!(response, Frame::Integer(1));
+        state.apply(operation.expect("PEXPIRE should produce an operation"));
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::Null
+        );
+
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        let (operation, response) = state
+            .execute_request(command(&[b"EXPIRE", b"key", b"0"]))
+            .unwrap();
+        assert_eq!(response, Frame::Integer(1));
+        state.apply(operation.expect("EXPIRE should produce an operation"));
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::Null
         );
     }
 

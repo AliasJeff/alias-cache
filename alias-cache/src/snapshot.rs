@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::state_machine::StateMachine;
 
 const MAGIC: [u8; 4] = *b"ASNP";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LEN: usize = 4 + 2 + 8;
 const CHECKSUM_LEN: usize = 4;
 
@@ -150,6 +150,38 @@ mod tests {
     }
 
     #[test]
+    fn preserves_ttl_metadata_and_logical_time() {
+        let directory = temp_dir("snapshot-ttl");
+        let _ = fs::remove_dir_all(&directory);
+        let store = SnapshotStore::new(&directory).unwrap();
+        let mut state = StateMachine::default();
+        state.apply(Operation::SetWithExpiration {
+            key: Bytes::from_static(b"key"),
+            value: Bytes::from_static(b"value"),
+            expire_at: Some(2_000),
+            write_time: 1_000,
+            only_if_exists: false,
+            only_if_missing: false,
+            keep_ttl: false,
+        });
+        store.save(&state).unwrap();
+
+        let mut restored = store.load().unwrap().unwrap();
+        assert_eq!(restored.logical_time(), 1_000);
+        assert_eq!(
+            restored
+                .execute_request(crate::protocol::Request::Command(vec![
+                    Bytes::from_static(b"PTTL"),
+                    Bytes::from_static(b"key"),
+                ]))
+                .unwrap()
+                .1,
+            crate::protocol::Frame::Integer(1_000)
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn rejects_corrupt_snapshot() {
         let directory = temp_dir("snapshot-corrupt");
         let _ = fs::remove_dir_all(&directory);
@@ -157,6 +189,19 @@ mod tests {
         store.save(&populated_state()).unwrap();
         let mut bytes = fs::read(store.path()).unwrap();
         bytes[HEADER_LEN] ^= 1;
+        fs::write(store.path(), bytes).unwrap();
+        assert!(store.load().is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rejects_snapshot_from_older_format_version() {
+        let directory = temp_dir("snapshot-version");
+        let _ = fs::remove_dir_all(&directory);
+        let store = SnapshotStore::new(&directory).unwrap();
+        store.save(&populated_state()).unwrap();
+        let mut bytes = fs::read(store.path()).unwrap();
+        bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
         fs::write(store.path(), bytes).unwrap();
         assert!(store.load().is_err());
         let _ = fs::remove_dir_all(directory);

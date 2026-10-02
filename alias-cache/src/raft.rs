@@ -1789,9 +1789,14 @@ mod tests {
     #[tokio::test]
     async fn memory_state_machine_applies_operations_and_snapshots() {
         let mut state_machine = MemStateMachine::default();
-        let request = RaftRequest::Apply(Operation::Set {
+        let request = RaftRequest::Apply(Operation::SetWithExpiration {
             key: Bytes::from_static(b"key"),
             value: Bytes::from_static(b"value"),
+            expire_at: Some(2_000),
+            write_time: 1_000,
+            only_if_exists: false,
+            only_if_missing: false,
+            keep_ttl: false,
         });
         let RaftRequest::Apply(operation) = request;
         state_machine.inner.lock().await.state.apply(operation);
@@ -1806,6 +1811,19 @@ mod tests {
             .await
             .expect("snapshot install should succeed");
         assert_eq!(restored.state().await, state_machine.state().await);
+        assert_eq!(restored.state().await.logical_time(), 1_000);
+        assert_eq!(
+            restored
+                .state()
+                .await
+                .execute_request(crate::protocol::Request::Command(vec![
+                    Bytes::from_static(b"PTTL"),
+                    Bytes::from_static(b"key"),
+                ]))
+                .unwrap()
+                .1,
+            crate::protocol::Frame::Integer(1_000)
+        );
     }
 
     #[tokio::test]

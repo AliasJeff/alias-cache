@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::state_machine::{ApplyResult, Operation, StateMachine};
 
 const MAGIC: [u8; 4] = *b"ALOG";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LEN: usize = 4 + 2 + 8 + 4;
 const CHECKSUM_LEN: usize = 4;
 
@@ -246,6 +246,40 @@ mod tests {
     }
 
     #[test]
+    fn replays_ttl_metadata_and_logical_time() {
+        let path = temp_path("wal-ttl-replay");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = Wal::open(&path).unwrap();
+        wal.append(&Operation::SetWithExpiration {
+            key: Bytes::from_static(b"key"),
+            value: Bytes::from_static(b"value"),
+            expire_at: Some(2_000),
+            write_time: 1_000,
+            only_if_exists: false,
+            only_if_missing: false,
+            keep_ttl: false,
+        })
+        .unwrap();
+        wal.append(&Operation::AdvanceTime { write_time: 1_500 })
+            .unwrap();
+
+        let mut restored = StateMachine::default();
+        assert_eq!(wal.replay(&mut restored).unwrap(), 2);
+        assert_eq!(restored.logical_time(), 1_500);
+        assert_eq!(
+            restored
+                .execute_request(crate::protocol::Request::Command(vec![
+                    Bytes::from_static(b"PTTL"),
+                    Bytes::from_static(b"key"),
+                ]))
+                .unwrap()
+                .1,
+            crate::protocol::Frame::Integer(500)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn truncates_partial_tail_on_open() {
         let path = temp_path("wal-tail");
         let _ = std::fs::remove_file(&path);
@@ -282,6 +316,25 @@ mod tests {
         }
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[HEADER_LEN] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(Wal::open(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_wal_from_older_format_version() {
+        let path = temp_path("wal-version");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&Operation::Set {
+                key: Bytes::from_static(b"key"),
+                value: Bytes::from_static(b"value"),
+            })
+            .unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         assert!(Wal::open(&path).is_err());
         let _ = std::fs::remove_file(path);
