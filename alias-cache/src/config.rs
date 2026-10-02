@@ -1,14 +1,18 @@
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::protocol::ProtocolLimits;
+use crate::raft::{Node, NodeId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub client_addr: SocketAddr,
     pub raft_addr: SocketAddr,
     pub node_id: u64,
+    pub bootstrap: bool,
+    pub cluster_nodes: BTreeMap<NodeId, Node>,
     pub data_dir: PathBuf,
     pub max_frame_size: usize,
     pub max_array_len: usize,
@@ -22,6 +26,8 @@ impl Default for Config {
             client_addr: SocketAddr::from(([127, 0, 0, 1], 6379)),
             raft_addr: SocketAddr::from(([127, 0, 0, 1], 16379)),
             node_id: 1,
+            bootstrap: false,
+            cluster_nodes: BTreeMap::new(),
             data_dir: PathBuf::from("data/node-1"),
             max_frame_size: 512 * 1024 * 1024,
             max_array_len: 1_024,
@@ -35,6 +41,11 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.node_id == 0 {
             return Err(Error::invalid_config("node_id must be greater than zero"));
+        }
+        if !self.cluster_nodes.is_empty() && !self.cluster_nodes.contains_key(&self.node_id) {
+            return Err(Error::invalid_config(
+                "cluster_nodes must contain the local node_id",
+            ));
         }
         if self.client_addr.ip().is_unspecified() {
             return Err(Error::invalid_config(
@@ -79,6 +90,11 @@ impl Config {
 
     pub fn with_client_addr(mut self, ip: IpAddr, port: u16) -> Self {
         self.client_addr = SocketAddr::new(ip, port);
+        self
+    }
+
+    pub fn with_cluster_nodes(mut self, nodes: BTreeMap<NodeId, Node>) -> Self {
+        self.cluster_nodes = nodes;
         self
     }
 

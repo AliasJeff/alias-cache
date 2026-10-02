@@ -11,7 +11,10 @@ use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
-use crate::raft::{RaftHandle, execute_raft_request, open_single_node};
+use crate::raft::{
+    RaftHandle, execute_raft_request, new_tcp_raft_for_server, open_single_node, serve_raft_rpc,
+    wait_for_leader,
+};
 
 pub struct Server {
     config: Config,
@@ -32,14 +35,37 @@ impl Server {
         info!(addr = %self.config.client_addr, node_id = self.config.node_id, "client listener started");
 
         let shutdown = Arc::new(self.shutdown);
-        let raft = Arc::new(
+        let raft_listener = TcpListener::bind(self.config.raft_addr)
+            .await
+            .map_err(|source| Error::io("bind raft listener", source))?;
+        let raft = Arc::new(if self.config.cluster_nodes.is_empty() {
             open_single_node(
                 self.config.node_id,
                 &self.config.data_dir,
                 self.config.raft_addr.to_string(),
             )
-            .await?,
-        );
+            .await?
+        } else {
+            new_tcp_raft_for_server(
+                self.config.node_id,
+                &self.config.data_dir,
+                self.config.cluster_nodes.clone(),
+                self.config.bootstrap,
+            )
+            .await?
+        });
+        let raft_shutdown = shutdown.as_ref().clone();
+        let rpc_raft = raft.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                serve_raft_rpc(raft_listener, (*rpc_raft).clone(), raft_shutdown).await
+            {
+                warn!(%error, "raft rpc listener failed");
+            }
+        });
+        if !self.config.cluster_nodes.is_empty() && self.config.bootstrap {
+            wait_for_leader(&raft, self.config.node_id).await?;
+        }
         loop {
             tokio::select! {
                 result = listener.accept() => {

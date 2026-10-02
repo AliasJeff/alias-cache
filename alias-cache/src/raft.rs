@@ -25,7 +25,10 @@ use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 pub type NodeId = u64;
 
@@ -71,6 +74,27 @@ pub type Entry = <TypeConfig as RaftTypeConfig>::Entry;
 pub type LogId = openraft::alias::LogIdOf<TypeConfig>;
 pub type Vote = openraft::alias::VoteOf<TypeConfig>;
 pub type StoredMembership = openraft::alias::StoredMembershipOf<TypeConfig>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum NetworkRequest {
+    Append(AppendEntriesRequest<TypeConfig>),
+    Vote(VoteRequest<TypeConfig>),
+    PreVote(VoteRequest<TypeConfig>),
+    Snapshot {
+        vote: Vote,
+        snapshot: Vec<u8>,
+        meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum NetworkResponse {
+    Append(Result<AppendEntriesResponse<TypeConfig>, String>),
+    Vote(Result<VoteResponse<TypeConfig>, String>),
+    Snapshot(Result<SnapshotResponse<TypeConfig>, String>),
+}
+
+const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
 
 const RAFT_LOG_MAGIC: [u8; 4] = *b"ARLG";
 const RAFT_LOG_VERSION: u16 = 1;
@@ -562,7 +586,18 @@ pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheR
     let result = raft
         .client_write(RaftRequest::Apply(operation))
         .await
-        .map_err(|error| Error::server(format!("raft write failed: {error}")))?;
+        .map_err(|error| {
+            if let Some(forward) = error.forward_to_leader() {
+                if let Some(node) = &forward.leader_node {
+                    return Error::server(format!(
+                        "not leader; retry at raft leader {}",
+                        node.addr
+                    ));
+                }
+                return Error::server("not leader; raft leader is not known");
+            }
+            Error::server(format!("raft write failed: {error}"))
+        })?;
     match result.data {
         RaftResponse::Applied(response) => Ok(response),
         RaftResponse::Noop => Err(Error::server("raft write produced no response")),
@@ -625,10 +660,8 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         meta: &openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
         mut snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
-        use std::io::Read;
-
         let mut data = Vec::new();
-        snapshot.read_to_end(&mut data)?;
+        std::io::Read::read_to_end(&mut snapshot, &mut data)?;
         let state = bincode::deserialize(&data).map_err(io::Error::other)?;
         let mut inner = self.inner.lock().await;
         inner.state = state;
@@ -738,6 +771,312 @@ impl MemNetwork {
     }
 }
 
+#[derive(Clone)]
+pub struct TcpNetworkFactory;
+
+#[derive(Clone)]
+pub struct TcpNetwork {
+    address: String,
+}
+
+impl RaftNetworkFactory<TypeConfig> for TcpNetworkFactory {
+    type Network = TcpNetwork;
+
+    async fn new_client(&mut self, _target: NodeId, node: &Node) -> Self::Network {
+        TcpNetwork {
+            address: node.addr.clone(),
+        }
+    }
+}
+
+async fn connect(address: &str, option: &RPCOption) -> Result<TcpStream, RPCError<TypeConfig>> {
+    timeout(option.soft_ttl(), TcpStream::connect(address))
+        .await
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))
+}
+
+async fn send_rpc(
+    address: &str,
+    request: NetworkRequest,
+    option: &RPCOption,
+) -> Result<NetworkResponse, RPCError<TypeConfig>> {
+    let mut stream = connect(address, option).await?;
+    let payload = bincode::serialize(&request).map_err(|error| {
+        RPCError::Network(openraft::error::NetworkError::from_string(
+            error.to_string(),
+        ))
+    })?;
+    if payload.len() > NETWORK_MAX_FRAME {
+        return Err(RPCError::Network(
+            openraft::error::NetworkError::from_string(
+                "raft rpc request exceeds maximum frame size",
+            ),
+        ));
+    }
+    let length = u32::try_from(payload.len()).map_err(|_| {
+        RPCError::Network(openraft::error::NetworkError::from_string(
+            "raft rpc request length overflows u32",
+        ))
+    })?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?;
+
+    let mut header = [0_u8; 4];
+    timeout(option.soft_ttl(), stream.read_exact(&mut header))
+        .await
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length > NETWORK_MAX_FRAME {
+        return Err(RPCError::Network(
+            openraft::error::NetworkError::from_string(
+                "raft rpc response exceeds maximum frame size",
+            ),
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    timeout(option.soft_ttl(), stream.read_exact(&mut payload))
+        .await
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?;
+    bincode::deserialize(&payload).map_err(|error| {
+        RPCError::Network(openraft::error::NetworkError::from_string(
+            error.to_string(),
+        ))
+    })
+}
+
+fn rpc_response_error(error: String) -> RPCError<TypeConfig> {
+    RPCError::Network(openraft::error::NetworkError::from_string(error))
+}
+
+impl RaftNetworkV2<TypeConfig> for TcpNetwork {
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+        match send_rpc(&self.address, NetworkRequest::Append(rpc), &option).await? {
+            NetworkResponse::Append(response) => response.map_err(rpc_response_error),
+            _ => Err(rpc_response_error(
+                "unexpected raft rpc response".to_string(),
+            )),
+        }
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        match send_rpc(&self.address, NetworkRequest::Vote(rpc), &option).await? {
+            NetworkResponse::Vote(response) => response.map_err(rpc_response_error),
+            _ => Err(rpc_response_error(
+                "unexpected raft rpc response".to_string(),
+            )),
+        }
+    }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        match send_rpc(&self.address, NetworkRequest::PreVote(rpc), &option).await? {
+            NetworkResponse::Vote(response) => response.map_err(rpc_response_error),
+            _ => Err(rpc_response_error(
+                "unexpected raft rpc response".to_string(),
+            )),
+        }
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        vote: Vote,
+        mut snapshot: openraft::alias::SnapshotOf<TypeConfig, Self::SnapshotData>,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        option: RPCOption,
+    ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        let mut data = Vec::new();
+        tokio::select! {
+            closed = cancel => return Err(StreamingError::Closed(closed)),
+            result = async {
+                std::io::Read::read_to_end(&mut snapshot.snapshot, &mut data)
+            } => {
+                result.map_err(|error| StreamingError::Network(
+                    openraft::error::NetworkError::from_string(error.to_string())
+                ))?;
+            }
+        }
+        let response = send_rpc(
+            &self.address,
+            NetworkRequest::Snapshot {
+                vote,
+                snapshot: data,
+                meta: snapshot.meta,
+            },
+            &option,
+        )
+        .await
+        .map_err(StreamingError::from)?;
+        match response {
+            NetworkResponse::Snapshot(response) => response.map_err(|error| {
+                StreamingError::Network(openraft::error::NetworkError::from_string(error))
+            }),
+            _ => Err(StreamingError::Network(
+                openraft::error::NetworkError::from_string("unexpected raft rpc response"),
+            )),
+        }
+    }
+
+    fn backoff(&self) -> Option<Backoff> {
+        Some(Backoff::new(std::iter::repeat(Duration::from_millis(25))))
+    }
+}
+
+pub async fn serve_raft_rpc(
+    listener: TcpListener,
+    raft: RaftHandle,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> CacheResult<()> {
+    let shutdown = Arc::new(shutdown);
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result.map_err(|error| Error::io("accept raft rpc connection", error))?;
+                let raft = raft.clone();
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_raft_rpc(stream, raft, shutdown).await {
+                        tracing::debug!(%error, "raft rpc connection failed");
+                    }
+                });
+            }
+            result = wait_for_raft_shutdown(shutdown.clone()) => {
+                result?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn wait_for_raft_shutdown(
+    shutdown: Arc<tokio::sync::watch::Receiver<bool>>,
+) -> CacheResult<()> {
+    let mut receiver = shutdown.as_ref().clone();
+    receiver
+        .wait_for(|value| *value)
+        .await
+        .map(|_| ())
+        .map_err(|_| Error::server("raft shutdown signal was closed"))
+}
+
+async fn handle_raft_rpc(
+    mut stream: TcpStream,
+    raft: RaftHandle,
+    shutdown: Arc<tokio::sync::watch::Receiver<bool>>,
+) -> CacheResult<()> {
+    let request = tokio::select! {
+        result = read_network_message(&mut stream) => result?,
+        result = wait_for_raft_shutdown(shutdown) => {
+            result?;
+            return Ok(());
+        }
+    };
+    let response = match request {
+        NetworkRequest::Append(request) => NetworkResponse::Append(
+            raft.append_entries(request)
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        NetworkRequest::Vote(request) => {
+            NetworkResponse::Vote(raft.vote(request).await.map_err(|error| error.to_string()))
+        }
+        NetworkRequest::PreVote(request) => NetworkResponse::Vote(
+            raft.pre_vote(request)
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        NetworkRequest::Snapshot {
+            vote,
+            snapshot,
+            meta,
+        } => {
+            let response = raft
+                .install_full_snapshot(
+                    vote,
+                    openraft::Snapshot {
+                        meta,
+                        snapshot: std::io::Cursor::new(snapshot),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string());
+            NetworkResponse::Snapshot(response)
+        }
+    };
+    write_network_message(&mut stream, &response).await
+}
+
+async fn read_network_message<T: for<'de> Deserialize<'de>>(
+    stream: &mut TcpStream,
+) -> CacheResult<T> {
+    let mut header = [0_u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|error| Error::io("read raft rpc frame header", error))?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length > NETWORK_MAX_FRAME {
+        return Err(Error::protocol("raft rpc frame exceeds maximum size"));
+    }
+    let mut payload = vec![0_u8; length];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|error| Error::io("read raft rpc frame", error))?;
+    bincode::deserialize(&payload)
+        .map_err(|error| Error::server(format!("decode raft rpc frame: {error}")))
+}
+
+async fn write_network_message<T: Serialize>(
+    stream: &mut TcpStream,
+    message: &T,
+) -> CacheResult<()> {
+    let payload = bincode::serialize(message)
+        .map_err(|error| Error::server(format!("encode raft rpc frame: {error}")))?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| Error::server("raft rpc frame length overflows u32"))?;
+    if payload.len() > NETWORK_MAX_FRAME {
+        return Err(Error::protocol("raft rpc frame exceeds maximum size"));
+    }
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| Error::io("write raft rpc frame header", error))?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|error| Error::io("write raft rpc frame", error))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| Error::io("flush raft rpc frame", error))
+}
+
 impl RaftNetworkV2<TypeConfig> for MemNetwork {
     type SnapshotData = std::io::Cursor<Vec<u8>>;
 
@@ -781,8 +1120,7 @@ impl RaftNetworkV2<TypeConfig> for MemNetwork {
         tokio::select! {
             closed = cancel => return Err(StreamingError::Closed(closed)),
             result = async {
-                use std::io::Read;
-                snapshot.snapshot.read_to_end(&mut data)
+                std::io::Read::read_to_end(&mut snapshot.snapshot, &mut data)
             } => {
                 result.map_err(|error| StreamingError::Network(
                     openraft::error::NetworkError::from_string(error.to_string())
@@ -866,6 +1204,125 @@ pub async fn new_file_raft(
     .await?;
     peers.lock().await.insert(node_id, raft.clone());
     Ok(raft)
+}
+
+pub async fn new_tcp_raft(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner(node_id, data_dir, nodes, true).await
+}
+
+pub async fn new_tcp_raft_joiner(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner(node_id, data_dir, nodes, false).await
+}
+
+async fn new_tcp_raft_inner(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    bootstrap: bool,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    let config = openraft::Config {
+        cluster_name: "alias-cache".to_string(),
+        heartbeat_interval: 50,
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        enable_tick: bootstrap,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let data_dir = data_dir.as_ref();
+    std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
+    let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
+        .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let raft = openraft::Raft::new(
+        node_id,
+        Arc::new(config),
+        TcpNetworkFactory,
+        log_store,
+        MemStateMachine::default(),
+    )
+    .await?;
+    if bootstrap
+        && !raft
+            .is_initialized()
+            .await
+            .map_err(|_| openraft::error::Fatal::Panicked)?
+    {
+        initialize_if_pristine(&raft, nodes).await?;
+    }
+    Ok(raft)
+}
+
+async fn initialize_if_pristine(
+    raft: &RaftHandle,
+    nodes: BTreeMap<NodeId, Node>,
+) -> Result<(), openraft::error::Fatal<TypeConfig>> {
+    match raft.initialize(nodes).await {
+        Ok(())
+        | Err(openraft::error::RaftError::APIError(
+            openraft::error::InitializeError::NotAllowed(_),
+        )) => Ok(()),
+        Err(_) => Err(openraft::error::Fatal::Panicked),
+    }
+}
+
+pub async fn new_tcp_raft_with_bootstrap(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+) -> CacheResult<RaftHandle> {
+    let raft = new_tcp_raft(node_id, data_dir, nodes)
+        .await
+        .map_err(|error| Error::server(format!("open tcp raft node: {error}")))?;
+    raft.wait(None)
+        .current_leader(node_id, "tcp raft leader election")
+        .await
+        .map_err(|error| Error::server(format!("wait for tcp raft leader: {error}")))?;
+    Ok(raft)
+}
+
+pub async fn new_tcp_raft_for_server(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    bootstrap: bool,
+) -> CacheResult<RaftHandle> {
+    let raft = if bootstrap {
+        new_tcp_raft(node_id, data_dir, nodes)
+            .await
+            .map_err(|error| Error::server(format!("open bootstrap raft node: {error}")))?
+    } else {
+        new_tcp_raft_joiner(node_id, data_dir, nodes)
+            .await
+            .map_err(|error| Error::server(format!("open raft joiner: {error}")))?
+    };
+    Ok(raft)
+}
+
+pub async fn wait_for_leader(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    raft.wait(None)
+        .current_leader(node_id, "tcp raft leader election")
+        .await
+        .map_err(|error| Error::server(format!("wait for tcp raft leader: {error}")))?;
+    Ok(())
+}
+
+pub async fn restart_tcp_raft(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+) -> CacheResult<RaftHandle> {
+    new_tcp_raft_joiner(node_id, data_dir, nodes)
+        .await
+        .map_err(|error| Error::server(format!("restart tcp raft node: {error}")))
 }
 
 pub async fn open_single_node(
@@ -1239,6 +1696,280 @@ mod tests {
                 .expect("shutdown should finish")
                 .expect("shutdown should succeed");
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_network_replicates_three_node_cluster() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-cluster-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let addresses: [std::net::SocketAddr; 3] = [
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ];
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for (index, address) in addresses.iter().enumerate() {
+            let listener = TcpListener::bind(address)
+                .await
+                .expect("rpc listener should bind");
+            let actual = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: actual.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("tcp raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop cleanly");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        if !rafts[0]
+            .is_initialized()
+            .await
+            .expect("state should be readable")
+        {
+            rafts[0]
+                .initialize(nodes)
+                .await
+                .expect("tcp cluster should initialize");
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match rafts[0]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"tcp-key"),
+                        value: Bytes::from_static(b"tcp-value"),
+                    }))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    Err(error) => panic!("tcp write failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("tcp write should finish");
+
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(2), "tcp write should apply"),
+            )
+            .await
+            .expect("tcp replication should finish")
+            .expect("tcp apply wait should succeed");
+        }
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft should shut down");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tcp_network_recovers_state_after_node_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-restart-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), nodes.clone()).await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize or already be running");
+        timeout(
+            Duration::from_secs(5),
+            rafts[0]
+                .wait(None)
+                .current_leader(1, "leader should be elected"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match rafts[0]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"restart-key"),
+                        value: Bytes::from_static(b"restart-value"),
+                    }))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    Err(error) => panic!("write should succeed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("write should finish");
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(2), "write should replicate"),
+            )
+            .await
+            .expect("replication should finish")
+            .expect("replication should succeed");
+        }
+
+        let restarted_data_dir = root.join("node-3");
+        rafts
+            .pop()
+            .unwrap()
+            .shutdown()
+            .await
+            .expect("node should stop");
+        let (shutdown_tx, shutdown_task) = rpc_tasks.pop().unwrap();
+        shutdown_tx.send(true).expect("rpc shutdown should send");
+        shutdown_task.await.expect("rpc task should stop");
+        let restarted = restart_tcp_raft(3, &restarted_data_dir, nodes.clone())
+            .await
+            .expect("node should restart");
+        let listener = TcpListener::bind(nodes.get(&3).unwrap().addr.clone())
+            .await
+            .expect("restart listener should bind");
+        let (restart_shutdown_tx, restart_shutdown_rx) = tokio::sync::watch::channel(false);
+        let rpc_raft = restarted.clone();
+        let restart_task = tokio::spawn(async move {
+            serve_raft_rpc(listener, rpc_raft, restart_shutdown_rx)
+                .await
+                .expect("restart rpc server should stop");
+        });
+        timeout(
+            Duration::from_secs(5),
+            restarted
+                .wait(None)
+                .applied_index_at_least(Some(2), "restarted node should apply state"),
+        )
+        .await
+        .expect("restart recovery should finish")
+        .expect("restart recovery should succeed");
+        let state = restarted
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("restarted state machine should be readable");
+        assert_eq!(
+            state.snapshot().get(&Bytes::from_static(b"restart-key")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"restart-value"
+            )))
+        );
+
+        restarted
+            .shutdown()
+            .await
+            .expect("restarted node should stop");
+        restart_shutdown_tx
+            .send(true)
+            .expect("restart rpc shutdown should send");
+        restart_task.await.expect("restart rpc task should join");
+        for raft in rafts {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
