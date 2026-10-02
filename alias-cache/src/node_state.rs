@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::protocol::{Frame, Request};
+use crate::snapshot::SnapshotStore;
 use crate::state_machine::{Operation, StateMachine};
 use crate::wal::Wal;
 
@@ -12,16 +13,23 @@ use crate::wal::Wal;
 pub struct NodeState {
     state_machine: StateMachine,
     wal: Wal,
+    snapshot: SnapshotStore,
 }
 
 impl NodeState {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let wal_path = data_dir.as_ref().join("raft.log");
-        let mut state_machine = StateMachine::default();
+        let data_dir = data_dir.as_ref();
+        let snapshot = SnapshotStore::new(data_dir)?;
+        let mut state_machine = snapshot.load()?.unwrap_or_default();
+        let wal_path = data_dir.join("raft.log");
         let mut replay_wal = Wal::open(&wal_path)?;
         replay_wal.replay(&mut state_machine)?;
         let wal = Wal::open(wal_path)?;
-        Ok(Self { state_machine, wal })
+        Ok(Self {
+            state_machine,
+            wal,
+            snapshot,
+        })
     }
 
     pub fn execute(&mut self, request: Request) -> Result<Frame> {
@@ -36,6 +44,10 @@ impl NodeState {
         self.wal.append(&operation)?;
         let _ = self.state_machine.apply(operation);
         Ok(())
+    }
+
+    pub fn save_snapshot(&self) -> Result<()> {
+        self.snapshot.save(&self.state_machine)
     }
 }
 

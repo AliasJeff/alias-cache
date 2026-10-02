@@ -3,6 +3,7 @@ pub mod error;
 pub mod node_state;
 pub mod protocol;
 pub mod server;
+pub mod snapshot;
 pub mod state_machine;
 pub mod time;
 pub mod wal;
