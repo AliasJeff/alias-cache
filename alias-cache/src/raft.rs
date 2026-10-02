@@ -2531,9 +2531,65 @@ mod tests {
         add_raft_learner(&rafts[0], 4, nodes[&4].clone())
             .await
             .expect("learner should be added");
+        let before_catch_up_index = rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| metrics.last_log_index.is_some(),
+                "leader should have a log before catch-up",
+            )
+            .await
+            .expect("leader metrics should be readable")
+            .last_log_index
+            .expect("leader should have a log before catch-up");
+        for index in 0..16 {
+            rafts[0]
+                .client_write(RaftRequest::Apply(Operation::Set {
+                    key: Bytes::from(format!("membership-key-{index}")),
+                    value: Bytes::from(format!("membership-value-{index}")),
+                }))
+                .await
+                .expect("writes during learner catch-up should succeed");
+        }
+        let after_writes_index = rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .last_log_index
+                        .is_some_and(|index| index > before_catch_up_index)
+                },
+                "leader should append catch-up writes",
+            )
+            .await
+            .expect("leader metrics after catch-up writes should be readable")
+            .last_log_index
+            .expect("leader should have a log after catch-up writes");
+        assert!(after_writes_index > before_catch_up_index);
         wait_for_raft_replication(&rafts[0], 4)
             .await
             .expect("learner should catch up");
+        rafts[3]
+            .wait(None)
+            .applied_index_at_least(
+                Some(after_writes_index),
+                "learner should apply catch-up writes",
+            )
+            .await
+            .expect("learner should apply catch-up writes");
+        let learner_state = rafts[3]
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("learner state should be readable");
+        assert_eq!(
+            learner_state
+                .snapshot()
+                .get(&Bytes::from_static(b"membership-key-15")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"membership-value-15"
+            )))
+        );
         promote_raft_learner(&rafts[0], 4)
             .await
             .expect("learner should be promoted");
