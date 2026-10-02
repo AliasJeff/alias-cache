@@ -8,7 +8,8 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::protocol::{Decoder, Frame};
+use crate::node_state::{NodeState, SharedNodeState};
+use crate::protocol::{Decoder, Frame, command_from_frame};
 
 pub struct Server {
     config: Config,
@@ -29,6 +30,9 @@ impl Server {
         info!(addr = %self.config.client_addr, node_id = self.config.node_id, "client listener started");
 
         let shutdown = Arc::new(self.shutdown);
+        let node_state = Arc::new(tokio::sync::Mutex::new(NodeState::open(
+            &self.config.data_dir,
+        )?));
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -36,8 +40,11 @@ impl Server {
                         .map_err(|source| Error::io("accept client connection", source))?;
                     let child_shutdown = shutdown.clone();
                     let limits = self.config.protocol_limits();
+                    let child_state = node_state.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_connection(stream, child_shutdown, limits).await {
+                        if let Err(error) =
+                            handle_connection(stream, child_shutdown, child_state, limits).await
+                        {
                             warn!(%peer, %error, "client connection failed");
                         }
                     });
@@ -64,6 +71,7 @@ async fn wait_for_shutdown(shutdown: Arc<watch::Receiver<bool>>) -> Result<()> {
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: Arc<watch::Receiver<bool>>,
+    node_state: SharedNodeState,
     limits: crate::protocol::ProtocolLimits,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
@@ -82,12 +90,18 @@ async fn handle_connection(
                         return Err(error);
                     }
                 };
-                for _frame in frames {
-                    write_frame(
-                        &mut stream,
-                        Frame::error("ERR alias-cache foundation server is not ready"),
-                    )
-                    .await?;
+                for frame in frames {
+                    let response = match command_from_frame(frame) {
+                        Ok(request) => {
+                            let mut state = node_state.lock().await;
+                            match state.execute(request) {
+                                Ok(response) => response,
+                                Err(error) => Frame::error(format!("ERR {error}")),
+                            }
+                        }
+                        Err(error) => Frame::error(format!("ERR {error}")),
+                    };
+                    write_frame(&mut stream, response).await?;
                 }
             }
             result = wait_for_shutdown(shutdown.clone()) => {
@@ -136,16 +150,20 @@ mod tests {
         let limits = config.protocol_limits();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, shutdown, limits).await
+            let state = Arc::new(tokio::sync::Mutex::new(
+                NodeState::open(&config.data_dir).unwrap(),
+            ));
+            handle_connection(stream, shutdown, state, limits).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
-            .write_all(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nECHO\r\n")
+            .write_all(
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+            )
             .await
             .unwrap();
-        let expected =
-            b"-ERR alias-cache foundation server is not ready\r\n-ERR alias-cache foundation server is not ready\r\n";
+        let expected = b"+OK\r\n$5\r\nvalue\r\n";
         let mut output = Vec::with_capacity(expected.len());
         let mut buffer = [0_u8; 96];
         while output.len() < expected.len() {

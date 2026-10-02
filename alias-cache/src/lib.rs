@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub mod node_state;
 pub mod protocol;
 pub mod server;
 pub mod state_machine;
