@@ -1,10 +1,11 @@
 use std::fmt;
 
 use bytes::{Buf, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Frame {
     SimpleString(Bytes),
     Error(Bytes),

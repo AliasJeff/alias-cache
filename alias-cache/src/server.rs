@@ -8,8 +8,10 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+#[cfg(test)]
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
+use crate::raft::{RaftHandle, execute_raft_request, open_single_node};
 
 pub struct Server {
     config: Config,
@@ -30,9 +32,14 @@ impl Server {
         info!(addr = %self.config.client_addr, node_id = self.config.node_id, "client listener started");
 
         let shutdown = Arc::new(self.shutdown);
-        let node_state = Arc::new(tokio::sync::Mutex::new(NodeState::open(
-            &self.config.data_dir,
-        )?));
+        let raft = Arc::new(
+            open_single_node(
+                self.config.node_id,
+                &self.config.data_dir,
+                self.config.raft_addr.to_string(),
+            )
+            .await?,
+        );
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -40,10 +47,10 @@ impl Server {
                         .map_err(|source| Error::io("accept client connection", source))?;
                     let child_shutdown = shutdown.clone();
                     let limits = self.config.protocol_limits();
-                    let child_state = node_state.clone();
+                    let child_raft = raft.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
-                            handle_connection(stream, child_shutdown, child_state, limits).await
+                            handle_raft_connection(stream, child_shutdown, child_raft, limits).await
                         {
                             warn!(%peer, %error, "client connection failed");
                         }
@@ -52,6 +59,9 @@ impl Server {
                 result = wait_for_shutdown(shutdown.clone()) => {
                     result?;
                     info!("client listener stopped");
+                    raft.shutdown()
+                        .await
+                        .map_err(|error| Error::server(format!("shutdown raft node: {error}")))?;
                     return Ok(());
                 }
             }
@@ -68,6 +78,7 @@ async fn wait_for_shutdown(shutdown: Arc<watch::Receiver<bool>>) -> Result<()> {
         .map_err(|_| Error::server("shutdown signal was closed"))
 }
 
+#[cfg(test)]
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: Arc<watch::Receiver<bool>>,
@@ -99,6 +110,49 @@ async fn handle_connection(
                                 Err(error) => Frame::error(format!("ERR {error}")),
                             }
                         }
+                        Err(error) => Frame::error(format!("ERR {error}")),
+                    };
+                    write_frame(&mut stream, response).await?;
+                }
+            }
+            result = wait_for_shutdown(shutdown.clone()) => {
+                result?;
+                stream.shutdown().await
+                    .map_err(|source| Error::io("close client connection", source))?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn handle_raft_connection(
+    mut stream: TcpStream,
+    shutdown: Arc<watch::Receiver<bool>>,
+    raft: Arc<RaftHandle>,
+    limits: crate::protocol::ProtocolLimits,
+) -> Result<()> {
+    let mut decoder = Decoder::new(limits);
+    let mut input = [0_u8; 8 * 1024];
+    loop {
+        tokio::select! {
+            result = stream.read(&mut input) => {
+                let read = result.map_err(|source| Error::io("read client request", source))?;
+                if read == 0 {
+                    return Ok(());
+                }
+                let frames = match decoder.push(&input[..read]) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        write_frame(&mut stream, Frame::error(format!("ERR {error}"))).await?;
+                        return Err(error);
+                    }
+                };
+                for frame in frames {
+                    let response = match command_from_frame(frame) {
+                        Ok(request) => match execute_raft_request(&raft, request).await {
+                            Ok(response) => response,
+                            Err(error) => Frame::error(format!("ERR {error}")),
+                        },
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
                     write_frame(&mut stream, response).await?;
@@ -178,5 +232,60 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn single_node_server_serves_raft_backed_commands() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-raft-server-test-{}",
+            std::process::id()
+        ));
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(stream, shutdown, raft, config.protocol_limits()).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+            )
+            .await
+            .unwrap();
+        let expected = b"+OK\r\n$5\r\nvalue\r\n";
+        let mut output = Vec::with_capacity(expected.len());
+        let mut buffer = [0_u8; 96];
+        while output.len() < expected.len() {
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            output.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(&output[..expected.len()], expected);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

@@ -18,6 +18,15 @@ pub enum Operation {
     Delete { keys: Vec<Bytes> },
 }
 
+impl Operation {
+    fn keys(&self) -> &[Bytes] {
+        match self {
+            Self::Delete { keys } => keys,
+            Self::Set { .. } | Self::MultiSet { .. } => &[],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplyResult {
     Response(Frame),
@@ -52,7 +61,7 @@ impl StateMachine {
         }
     }
 
-    pub fn execute_request(&mut self, request: Request) -> Result<(Option<Operation>, Frame)> {
+    pub fn prepare_request(&self, request: Request) -> Result<(Option<Operation>, Frame)> {
         let Request::Command(arguments) = request;
         let command = arguments
             .first()
@@ -87,6 +96,19 @@ impl StateMachine {
         )))
     }
 
+    pub fn execute_request(&mut self, request: Request) -> Result<(Option<Operation>, Frame)> {
+        let (operation, response) = self.prepare_request(request)?;
+        if let Some(operation) = operation.clone() {
+            let applied = self.apply(operation);
+            if applied != ApplyResult::Response(response.clone()) {
+                return Err(Error::server(
+                    "prepared response differs from applied response",
+                ));
+            }
+        }
+        Ok((operation, response))
+    }
+
     pub fn snapshot(&self) -> &BTreeMap<Bytes, Value> {
         &self.values
     }
@@ -97,33 +119,26 @@ impl StateMachine {
         Ok((None, value_to_frame(value)))
     }
 
-    fn execute_set(&mut self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+    fn execute_set(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("SET", &arguments, 3)?;
         let operation = Operation::Set {
             key: arguments[1].clone(),
             value: arguments[2].clone(),
         };
-        let response = match self.apply(operation.clone()) {
-            ApplyResult::Response(response) => response,
-            ApplyResult::NoResponse => {
-                return Err(Error::server("SET produced no response"));
-            }
-        };
-        Ok((Some(operation), response))
+        Ok((Some(operation), Frame::simple_string("OK")))
     }
 
-    fn execute_del(&mut self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+    fn execute_del(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("DEL", &arguments, 2)?;
         let operation = Operation::Delete {
             keys: unique_keys(&arguments[1..]),
         };
-        let response = match self.apply(operation.clone()) {
-            ApplyResult::Response(response) => response,
-            ApplyResult::NoResponse => {
-                return Err(Error::server("DEL produced no response"));
-            }
-        };
-        Ok((Some(operation), response))
+        let removed = operation
+            .keys()
+            .iter()
+            .filter(|key| self.values.contains_key(*key))
+            .count();
+        Ok((Some(operation), Frame::Integer(removed as i64)))
     }
 
     fn execute_exists(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -144,7 +159,7 @@ impl StateMachine {
         Ok((None, Frame::Array(values)))
     }
 
-    fn execute_mset(&mut self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+    fn execute_mset(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("MSET", &arguments, 3)?;
         if (arguments.len() - 1) % 2 != 0 {
             return Err(Error::protocol("MSET requires key/value pairs"));
@@ -154,13 +169,7 @@ impl StateMachine {
             pairs.push((pair[0].clone(), pair[1].clone()));
         }
         let operation = Operation::MultiSet { pairs };
-        let response = match self.apply(operation.clone()) {
-            ApplyResult::Response(response) => response,
-            ApplyResult::NoResponse => {
-                return Err(Error::server("MSET produced no response"));
-            }
-        };
-        Ok((Some(operation), response))
+        Ok((Some(operation), Frame::simple_string("OK")))
     }
 
     fn execute_type(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -295,6 +304,28 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.snapshot().len(), 0);
+    }
+
+    #[test]
+    fn prepare_request_does_not_mutate_state() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"a", b"one"]))
+            .unwrap();
+        let before = state.clone();
+
+        let (operation, response) = state
+            .prepare_request(command(&[b"DEL", b"a", b"a"]))
+            .unwrap();
+
+        assert_eq!(
+            operation,
+            Some(Operation::Delete {
+                keys: vec![Bytes::from_static(b"a")],
+            })
+        );
+        assert_eq!(response, Frame::Integer(1));
+        assert_eq!(state, before);
     }
 
     #[test]

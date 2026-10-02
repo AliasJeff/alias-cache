@@ -1,6 +1,7 @@
 //! OpenRaft type configuration and an in-memory storage vertical slice.
 
 use crate::error::{Error, Result as CacheResult};
+use crate::protocol::{Frame, Request};
 use crate::state_machine::{Operation, StateMachine};
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption};
@@ -54,7 +55,7 @@ impl std::fmt::Display for RaftRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RaftResponse {
-    Applied,
+    Applied(Frame),
     Noop,
 }
 
@@ -544,6 +545,30 @@ impl MemStateMachine {
     }
 }
 
+pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheResult<Frame> {
+    raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+        .await
+        .map_err(|error| Error::server(format!("raft read barrier failed: {error}")))?;
+    let (operation, response) = raft
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.state().await.prepare_request(request) })
+        })
+        .await
+        .map_err(|error| Error::server(format!("read raft state machine: {error}")))??;
+    let Some(operation) = operation else {
+        return Ok(response);
+    };
+
+    let result = raft
+        .client_write(RaftRequest::Apply(operation))
+        .await
+        .map_err(|error| Error::server(format!("raft write failed: {error}")))?;
+    match result.data {
+        RaftResponse::Applied(response) => Ok(response),
+        RaftResponse::Noop => Err(Error::server("raft write produced no response")),
+    }
+}
+
 impl RaftStateMachine<TypeConfig> for MemStateMachine {
     type SnapshotData = std::io::Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
@@ -566,8 +591,13 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
             let response = match entry.payload {
                 EntryPayload::Blank => RaftResponse::Noop,
                 EntryPayload::Normal(RaftRequest::Apply(operation)) => {
-                    let _ = inner.state.apply(operation);
-                    RaftResponse::Applied
+                    let response = match inner.state.apply(operation) {
+                        crate::state_machine::ApplyResult::Response(response) => response,
+                        crate::state_machine::ApplyResult::NoResponse => {
+                            return Err(io::Error::other("state machine produced no response"));
+                        }
+                    };
+                    RaftResponse::Applied(response)
                 }
                 EntryPayload::Membership(membership) => {
                     inner.membership = StoredMembership::new(Some(entry.log_id), membership);
@@ -661,8 +691,8 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
 
 pub type SharedMemStateMachine = Arc<Mutex<MemStateMachine>>;
 
-type RaftHandle = openraft::Raft<TypeConfig, MemStateMachine>;
-type PeerMap = Arc<Mutex<BTreeMap<NodeId, RaftHandle>>>;
+pub type RaftHandle = openraft::Raft<TypeConfig, MemStateMachine>;
+pub type PeerMap = Arc<Mutex<BTreeMap<NodeId, RaftHandle>>>;
 
 #[derive(Clone)]
 pub struct MemNetworkFactory {
@@ -824,7 +854,7 @@ pub async fn new_file_raft(
     .map_err(|_| openraft::error::Fatal::Panicked)?;
     let data_dir = data_dir.as_ref();
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
-    let log_store = FileLogStore::open(data_dir.join("raft.log"))
+    let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     let raft = openraft::Raft::new(
         node_id,
@@ -835,6 +865,36 @@ pub async fn new_file_raft(
     )
     .await?;
     peers.lock().await.insert(node_id, raft.clone());
+    Ok(raft)
+}
+
+pub async fn open_single_node(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    raft_addr: impl Into<String>,
+) -> CacheResult<RaftHandle> {
+    let peers = Arc::new(Mutex::new(BTreeMap::new()));
+    let raft = new_file_raft(node_id, data_dir, Arc::clone(&peers))
+        .await
+        .map_err(|error| Error::server(format!("open raft node: {error}")))?;
+    if !raft
+        .is_initialized()
+        .await
+        .map_err(|error| Error::server(format!("check raft initialization: {error}")))?
+    {
+        raft.initialize(BTreeMap::from([(
+            node_id,
+            Node {
+                addr: raft_addr.into(),
+            },
+        )]))
+        .await
+        .map_err(|error| Error::server(format!("initialize raft cluster: {error}")))?;
+    }
+    raft.wait(None)
+        .current_leader(node_id, "single-node raft leader election")
+        .await
+        .map_err(|error| Error::server(format!("wait for raft leader: {error}")))?;
     Ok(raft)
 }
 
