@@ -66,6 +66,7 @@ pub enum RaftResponse {
 }
 
 static NEXT_CLIENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn new_client_request_id() -> ClientRequestId {
     (u128::from(current_time_millis()) << 64)
@@ -106,6 +107,7 @@ enum NetworkRequest {
     SnapshotStart {
         vote: Vote,
         total_len: u64,
+        checksum: u64,
         meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
     },
 }
@@ -121,7 +123,16 @@ enum NetworkResponse {
 const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
 const SNAPSHOT_CHUNK_SIZE: usize = 256 * 1024;
 const NETWORK_MAX_SNAPSHOT_SIZE: u64 = 512 * 1024 * 1024;
+const SNAPSHOT_CHECKSUM_OFFSET: u64 = 0xcbf29ce484222325;
+const SNAPSHOT_CHECKSUM_PRIME: u64 = 0x100000001b3;
 const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 2;
+
+fn snapshot_checksum(data: &[u8]) -> u64 {
+    data.iter()
+        .fold(SNAPSHOT_CHECKSUM_OFFSET, |checksum, byte| {
+            (checksum ^ u64::from(*byte)).wrapping_mul(SNAPSHOT_CHECKSUM_PRIME)
+        })
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RaftSnapshotPayload {
@@ -1294,6 +1305,7 @@ async fn send_snapshot_rpc(
         &NetworkRequest::SnapshotStart {
             vote,
             total_len,
+            checksum: snapshot_checksum(&data),
             meta,
         },
     )
@@ -1601,9 +1613,10 @@ async fn handle_raft_rpc(
         NetworkRequest::SnapshotStart {
             vote,
             total_len,
+            checksum,
             meta,
         } => {
-            let snapshot = read_snapshot_chunks(&mut stream, total_len).await?;
+            let snapshot = read_snapshot_chunks(&mut stream, total_len, checksum).await?;
             let response = raft
                 .install_full_snapshot(
                     vote,
@@ -1644,32 +1657,65 @@ async fn read_network_message<T: for<'de> Deserialize<'de>>(
 async fn read_snapshot_chunks<R: AsyncRead + Unpin>(
     stream: &mut R,
     total_len: u64,
+    expected_checksum: u64,
 ) -> CacheResult<Vec<u8>> {
     if total_len > NETWORK_MAX_SNAPSHOT_SIZE {
         return Err(Error::protocol("raft snapshot exceeds maximum size"));
     }
     let total_len = usize::try_from(total_len)
         .map_err(|_| Error::protocol("raft snapshot length overflows usize"))?;
-    let mut data = Vec::with_capacity(total_len);
-    while data.len() < total_len {
-        let mut header = [0_u8; 4];
-        stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|error| Error::io("read raft snapshot chunk header", error))?;
-        let length = u32::from_be_bytes(header) as usize;
-        let remaining = total_len - data.len();
-        if length == 0 || length > NETWORK_MAX_FRAME || length > remaining {
-            return Err(Error::protocol("raft snapshot chunk length is invalid"));
+    let path = std::env::temp_dir().join(format!(
+        "alias-cache-raft-snapshot-{}-{}",
+        std::process::id(),
+        NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = async {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| Error::io("create raft snapshot temporary file", error))?;
+        let mut received = 0_usize;
+        let mut checksum = SNAPSHOT_CHECKSUM_OFFSET;
+        while received < total_len {
+            let mut header = [0_u8; 4];
+            stream
+                .read_exact(&mut header)
+                .await
+                .map_err(|error| Error::io("read raft snapshot chunk header", error))?;
+            let length = u32::from_be_bytes(header) as usize;
+            let remaining = total_len - received;
+            if length == 0 || length > NETWORK_MAX_FRAME || length > remaining {
+                return Err(Error::protocol("raft snapshot chunk length is invalid"));
+            }
+            let mut chunk = vec![0_u8; length];
+            stream
+                .read_exact(&mut chunk)
+                .await
+                .map_err(|error| Error::io("read raft snapshot chunk", error))?;
+            file.write_all(&chunk)
+                .map_err(|error| Error::io("write raft snapshot temporary file", error))?;
+            checksum = chunk.iter().fold(checksum, |checksum, byte| {
+                (checksum ^ u64::from(*byte)).wrapping_mul(SNAPSHOT_CHECKSUM_PRIME)
+            });
+            received += length;
         }
-        let start = data.len();
-        data.resize(start + length, 0);
-        stream
-            .read_exact(&mut data[start..])
-            .await
-            .map_err(|error| Error::io("read raft snapshot chunk", error))?;
+        file.sync_all()
+            .map_err(|error| Error::io("sync raft snapshot temporary file", error))?;
+        if checksum != expected_checksum {
+            return Err(Error::protocol("raft snapshot checksum mismatch"));
+        }
+        drop(file);
+        let mut data = Vec::with_capacity(total_len);
+        File::open(&path)
+            .map_err(|error| Error::io("open raft snapshot temporary file", error))?
+            .read_to_end(&mut data)
+            .map_err(|error| Error::io("read raft snapshot temporary file", error))?;
+        Ok(data)
     }
-    Ok(data)
+    .await;
+    let _ = std::fs::remove_file(&path);
+    result
 }
 
 async fn write_raw_frame(stream: &mut TcpStream, payload: &[u8]) -> CacheResult<()> {
@@ -2625,9 +2671,13 @@ mod tests {
             }
         });
 
-        let actual = read_snapshot_chunks(&mut reader, expected.len() as u64)
-            .await
-            .expect("snapshot chunks should be reassembled");
+        let actual = read_snapshot_chunks(
+            &mut reader,
+            expected.len() as u64,
+            snapshot_checksum(&expected),
+        )
+        .await
+        .expect("snapshot chunks should be reassembled");
         writer_task.await.expect("chunk writer should finish");
         assert_eq!(actual, expected);
     }
@@ -2644,10 +2694,29 @@ mod tests {
             .await
             .expect("chunk payload should be written");
 
-        let error = read_snapshot_chunks(&mut reader, 4)
+        let error = read_snapshot_chunks(&mut reader, 4, 0)
             .await
             .expect_err("oversized chunk should be rejected");
         assert!(error.to_string().contains("chunk length is invalid"));
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_chunks_reject_checksum_mismatch() {
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        let payload = b"snapshot".to_vec();
+        writer
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .expect("chunk header should be written");
+        writer
+            .write_all(&payload)
+            .await
+            .expect("chunk payload should be written");
+
+        let error = read_snapshot_chunks(&mut reader, payload.len() as u64, 0)
+            .await
+            .expect_err("checksum mismatch should be rejected");
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[tokio::test]
