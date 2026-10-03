@@ -17,6 +17,7 @@ use crate::raft::{
     open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request_with_id,
     send_transaction_request_with_id, serve_raft_rpc, wait_for_leader,
 };
+use crate::sentinel::{self, SentinelContext};
 
 pub struct Server {
     config: Config,
@@ -80,6 +81,7 @@ impl Server {
         let expiration_worker_raft = raft.clone();
         let expiration_worker_shutdown = shutdown.as_ref().clone();
         let node_id = self.config.node_id;
+        let sentinel_context = SentinelContext::from_config(&self.config);
         tokio::spawn(async move {
             run_expiration_worker(
                 expiration_worker_raft,
@@ -100,9 +102,17 @@ impl Server {
                     let child_shutdown = shutdown.clone();
                     let limits = self.config.protocol_limits();
                     let child_raft = raft.clone();
+                    let sentinel_context = sentinel_context.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
-                            handle_raft_connection(stream, child_shutdown, child_raft, limits).await
+                            handle_raft_connection(
+                                stream,
+                                child_shutdown,
+                                child_raft,
+                                limits,
+                                sentinel_context.clone(),
+                            )
+                            .await
                         {
                             warn!(%peer, %error, "client connection failed");
                         }
@@ -182,6 +192,7 @@ async fn handle_raft_connection(
     shutdown: Arc<watch::Receiver<bool>>,
     raft: Arc<RaftHandle>,
     limits: crate::protocol::ProtocolLimits,
+    sentinel_context: SentinelContext,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
@@ -203,7 +214,13 @@ async fn handle_raft_connection(
                 for frame in frames {
                     let response = match command_from_frame(frame) {
                         Ok(request) => {
-                            handle_transaction_command(&raft, &mut transaction, request).await
+                            handle_transaction_command(
+                                &raft,
+                                &mut transaction,
+                                request,
+                                &sentinel_context,
+                            )
+                            .await
                         }
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
@@ -224,7 +241,13 @@ async fn handle_transaction_command(
     raft: &RaftHandle,
     transaction: &mut Option<Vec<crate::protocol::Request>>,
     request: crate::protocol::Request,
+    sentinel_context: &SentinelContext,
 ) -> Frame {
+    if transaction.is_none()
+        && let Some(response) = sentinel::execute(raft, sentinel_context, &request).await
+    {
+        return response;
+    }
     let crate::protocol::Request::Command(arguments) = &request;
     let command = arguments.first().map(|argument| argument.as_ref());
     if command.is_some_and(|command| command.eq_ignore_ascii_case(b"MULTI")) {
@@ -448,7 +471,14 @@ mod tests {
         );
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, config.protocol_limits()).await
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                config.protocol_limits(),
+                SentinelContext::from_config(&config),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -535,7 +565,14 @@ mod tests {
         );
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, config.protocol_limits()).await
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                config.protocol_limits(),
+                SentinelContext::from_config(&config),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -557,6 +594,77 @@ mod tests {
             output.extend_from_slice(&buffer[..read]);
         }
         assert_eq!(&output[..expected.len()], expected);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn single_node_server_serves_read_only_sentinel_discovery() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-sentinel-server-test-{}",
+            std::process::id()
+        ));
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: data_dir.clone(),
+            sentinel_master_name: "cache".to_string(),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut sentinel_context = SentinelContext::from_config(&config);
+        sentinel_context.local_client_addr = addr;
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                config.protocol_limits(),
+                sentinel_context,
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"*3\r\n$8\r\nSENTINEL\r\n$23\r\nGET-MASTER-ADDR-BY-NAME\r\n$5\r\ncache\r\n")
+            .await
+            .unwrap();
+        let mut decoder = crate::protocol::Decoder::new(crate::protocol::ProtocolLimits::default());
+        let mut buffer = [0_u8; 128];
+        let response = loop {
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            let frames = decoder.push(&buffer[..read]).unwrap();
+            if let Some(frame) = frames.into_iter().next() {
+                break frame;
+            }
+        };
+        assert_eq!(
+            response,
+            Frame::Array(vec![
+                Frame::bulk_string("127.0.0.1"),
+                Frame::bulk_string(addr.port().to_string()),
+            ])
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = task.await;

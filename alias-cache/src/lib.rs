@@ -3,6 +3,7 @@ pub mod error;
 pub mod node_state;
 pub mod protocol;
 pub mod raft;
+pub mod sentinel;
 pub mod server;
 pub mod snapshot;
 pub mod state_machine;

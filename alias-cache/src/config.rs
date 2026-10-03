@@ -12,7 +12,9 @@ pub struct Config {
     pub raft_addr: SocketAddr,
     pub node_id: u64,
     pub bootstrap: bool,
+    pub sentinel_master_name: String,
     pub cluster_nodes: BTreeMap<NodeId, Node>,
+    pub cluster_client_addrs: BTreeMap<NodeId, SocketAddr>,
     pub data_dir: PathBuf,
     pub max_frame_size: usize,
     pub max_array_len: usize,
@@ -27,7 +29,9 @@ impl Default for Config {
             raft_addr: SocketAddr::from(([127, 0, 0, 1], 16379)),
             node_id: 1,
             bootstrap: false,
+            sentinel_master_name: "alias-cache".to_string(),
             cluster_nodes: BTreeMap::new(),
+            cluster_client_addrs: BTreeMap::new(),
             data_dir: PathBuf::from("data/node-1"),
             max_frame_size: 512 * 1024 * 1024,
             max_array_len: 1_024,
@@ -41,6 +45,11 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.node_id == 0 {
             return Err(Error::invalid_config("node_id must be greater than zero"));
+        }
+        if self.sentinel_master_name.trim().is_empty() {
+            return Err(Error::invalid_config(
+                "sentinel_master_name must not be empty",
+            ));
         }
         if !self.cluster_nodes.is_empty() && !self.cluster_nodes.contains_key(&self.node_id) {
             return Err(Error::invalid_config(
@@ -98,6 +107,16 @@ impl Config {
         self
     }
 
+    pub fn with_sentinel_master_name(mut self, name: impl Into<String>) -> Self {
+        self.sentinel_master_name = name.into();
+        self
+    }
+
+    pub fn with_cluster_client_addrs(mut self, addresses: BTreeMap<NodeId, SocketAddr>) -> Self {
+        self.cluster_client_addrs = addresses;
+        self
+    }
+
     pub fn ensure_data_dir(&self) -> Result<()> {
         std::fs::create_dir_all(Path::new(&self.data_dir))
             .map_err(|source| Error::io("create data directory", source))
@@ -135,6 +154,15 @@ mod tests {
     fn identical_addresses_are_rejected() {
         let config = Config {
             raft_addr: Config::default().client_addr,
+            ..Config::default()
+        };
+        assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn empty_sentinel_master_name_is_rejected() {
+        let config = Config {
+            sentinel_master_name: "  ".to_string(),
             ..Config::default()
         };
         assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
