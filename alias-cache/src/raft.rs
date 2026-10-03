@@ -565,7 +565,14 @@ struct MemState {
     state: StateMachine,
     last_applied: Option<LogId>,
     membership: StoredMembership,
-    snapshot: Option<Vec<u8>>,
+    snapshot: Option<StoredSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredSnapshot {
+    data: Vec<u8>,
+    last_log_id: Option<LogId>,
+    membership: StoredMembership,
 }
 
 impl MemStateMachine {
@@ -852,7 +859,11 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         inner.state = state;
         inner.last_applied = meta.last_log_id;
         inner.membership = meta.last_membership.clone();
-        inner.snapshot = Some(data);
+        inner.snapshot = Some(StoredSnapshot {
+            data,
+            last_log_id: meta.last_log_id,
+            membership: meta.last_membership.clone(),
+        });
         Ok(())
     }
 
@@ -870,12 +881,12 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         io::Error,
     > {
         let inner = self.inner.lock().await;
-        Ok(inner.snapshot.clone().map(|data| openraft::Snapshot {
+        Ok(inner.snapshot.clone().map(|snapshot| openraft::Snapshot {
             meta: openraft::SnapshotMeta {
-                last_log_id: inner.last_applied,
-                last_membership: inner.membership.clone(),
+                last_log_id: snapshot.last_log_id,
+                last_membership: snapshot.membership,
             },
-            snapshot: std::io::Cursor::new(data),
+            snapshot: std::io::Cursor::new(snapshot.data),
         }))
     }
 }
@@ -896,11 +907,17 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
     > {
         let mut inner = self.inner.lock().await;
         let data = bincode::serialize(&inner.state).map_err(io::Error::other)?;
-        inner.snapshot = Some(data.clone());
+        let last_log_id = inner.last_applied;
+        let membership = inner.membership.clone();
+        inner.snapshot = Some(StoredSnapshot {
+            data: data.clone(),
+            last_log_id,
+            membership: membership.clone(),
+        });
         Ok(openraft::Snapshot {
             meta: openraft::SnapshotMeta {
-                last_log_id: inner.last_applied,
-                last_membership: inner.membership.clone(),
+                last_log_id,
+                last_membership: membership,
             },
             snapshot: std::io::Cursor::new(data),
         })
@@ -1618,8 +1635,12 @@ pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheRe
 }
 
 pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
-    let mut voters = raft
-        .voter_ids()
+    let current_voters = raft.voter_ids().collect::<Vec<_>>();
+    if !current_voters.contains(&node_id) {
+        return Err(Error::server(format!("raft node {node_id} is not a voter")));
+    }
+    let mut voters = current_voters
+        .into_iter()
         .filter(|voter_id| *voter_id != node_id)
         .collect::<Vec<_>>();
     voters.sort_unstable();
@@ -1631,6 +1652,41 @@ pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResul
     raft.change_membership(voters, false)
         .await
         .map_err(|error| Error::server(format!("remove raft voter {node_id}: {error}")))?;
+    Ok(())
+}
+
+pub async fn drain_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    let voters = raft.voter_ids().collect::<Vec<_>>();
+    if !voters.contains(&node_id) {
+        return Err(Error::server(format!("raft node {node_id} is not a voter")));
+    }
+    let remaining = voters
+        .into_iter()
+        .filter(|voter_id| *voter_id != node_id)
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        return Err(Error::invalid_config("refuse to drain the last raft voter"));
+    }
+    raft.change_membership(remaining, true)
+        .await
+        .map_err(|error| Error::server(format!("drain raft voter {node_id}: {error}")))?;
+    raft.wait(None)
+        .metrics(
+            |metrics| {
+                !metrics
+                    .membership_config
+                    .voter_ids()
+                    .any(|id| id == node_id)
+                    && metrics
+                        .membership_config
+                        .membership()
+                        .get_node(&node_id)
+                        .is_some()
+            },
+            format!("wait for raft voter {node_id} drain"),
+        )
+        .await
+        .map_err(|error| Error::server(format!("wait for raft voter {node_id} drain: {error}")))?;
     Ok(())
 }
 
@@ -1937,18 +1993,50 @@ mod tests {
             return_previous: false,
         });
         let RaftRequest::Apply(operation) = request;
-        state_machine.inner.lock().await.state.apply(operation);
+        let snapshot_log_id =
+            openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 1);
+        {
+            let mut inner = state_machine.inner.lock().await;
+            inner.state.apply(operation);
+            inner.last_applied = Some(snapshot_log_id);
+        }
+        let expected_snapshot_state = state_machine.state().await;
 
         let snapshot = state_machine
             .build_snapshot()
             .await
             .expect("snapshot should succeed");
+        assert_eq!(snapshot.meta.last_log_id, Some(snapshot_log_id));
+        let later_log_id =
+            openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 2);
+        {
+            let mut inner = state_machine.inner.lock().await;
+            inner.state.apply(Operation::Set {
+                key: Bytes::from_static(b"later-key"),
+                value: Bytes::from_static(b"later-value"),
+            });
+            inner.last_applied = Some(later_log_id);
+        }
+        let current_snapshot = state_machine
+            .get_current_snapshot()
+            .await
+            .expect("current snapshot should be readable")
+            .expect("current snapshot should exist");
+        assert_eq!(current_snapshot.meta.last_log_id, Some(snapshot_log_id));
         let mut restored = MemStateMachine::default();
         restored
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .install_snapshot(&current_snapshot.meta, current_snapshot.snapshot)
             .await
             .expect("snapshot install should succeed");
-        assert_eq!(restored.state().await, state_machine.state().await);
+        assert_eq!(restored.state().await, expected_snapshot_state);
+        assert_eq!(
+            restored
+                .state()
+                .await
+                .snapshot()
+                .get(&Bytes::from_static(b"later-key")),
+            None
+        );
         assert_eq!(restored.state().await.logical_time(), 1_000);
         assert_eq!(
             restored
@@ -2647,7 +2735,282 @@ mod tests {
             .await
             .expect_err("last voter removal should fail");
         assert!(error.to_string().contains("last raft voter"));
+        let error = drain_raft_voter(&raft, 1)
+            .await
+            .expect_err("last voter drain should fail");
+        assert!(error.to_string().contains("last raft voter"));
         raft.shutdown().await.expect("raft should shut down");
+    }
+
+    #[tokio::test]
+    async fn mem_cluster_self_drain_stops_before_remaining_voters_write() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let node1 = new_mem_raft(1, Arc::clone(&peers))
+            .await
+            .expect("node 1 should start");
+        let node2 = new_mem_raft(2, Arc::clone(&peers))
+            .await
+            .expect("node 2 should start");
+        let node3 = new_mem_raft(3, Arc::clone(&peers))
+            .await
+            .expect("node 3 should start");
+        node1
+            .initialize(BTreeMap::from([
+                (
+                    1,
+                    Node {
+                        addr: "mem://1".into(),
+                    },
+                ),
+                (
+                    2,
+                    Node {
+                        addr: "mem://2".into(),
+                    },
+                ),
+                (
+                    3,
+                    Node {
+                        addr: "mem://3".into(),
+                    },
+                ),
+            ]))
+            .await
+            .expect("cluster should initialize");
+        timeout(
+            Duration::from_secs(3),
+            node1.wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        node1
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .committed_membership_config
+                        .voter_ids()
+                        .eq([1, 2, 3])
+                },
+                "initial membership should be committed",
+            )
+            .await
+            .expect("initial membership should commit");
+
+        drain_raft_voter(&node1, 1)
+            .await
+            .expect("local voter should drain");
+        node1
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    !metrics.membership_config.voter_ids().any(|id| id == 1)
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .learner_ids()
+                            .any(|id| id == 1)
+                },
+                "local node should become a learner",
+            )
+            .await
+            .expect("local drain should commit");
+        node1
+            .shutdown()
+            .await
+            .expect("drained node should stop before leaving");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let leader = node2.current_leader().await;
+                if matches!(leader, Some(2 | 3)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("remaining voters should elect a leader");
+        let leader = if node2.current_leader().await == Some(2) {
+            &node2
+        } else {
+            &node3
+        };
+        let response = leader
+            .client_write(RaftRequest::Apply(Operation::Set {
+                key: Bytes::from_static(b"self-drain-key"),
+                value: Bytes::from_static(b"self-drain-value"),
+            }))
+            .await
+            .expect("remaining voters should accept writes");
+        assert!(matches!(
+            response.data,
+            RaftResponse::Applied(Frame::SimpleString(_))
+        ));
+
+        node2.shutdown().await.expect("node 2 should stop");
+        node3.shutdown().await.expect("node 3 should stop");
+    }
+
+    #[tokio::test]
+    async fn tcp_cluster_drains_voter_and_retains_it_as_learner() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-drain-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), nodes.clone()).await
+            } else {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                )
+                .await
+            }
+            .expect("raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .committed_membership_config
+                        .voter_ids()
+                        .eq([1, 2, 3])
+                },
+                "initial membership should be committed",
+            )
+            .await
+            .expect("initial membership should commit");
+
+        drain_raft_voter(&rafts[0], 3)
+            .await
+            .expect("node 3 should drain");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics.membership_config.voter_ids().eq([1, 2])
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .learner_ids()
+                            .any(|id| id == 3)
+                },
+                "node 3 should be retained as learner",
+            )
+            .await
+            .expect("drain membership should commit");
+        rafts[2]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    !metrics.membership_config.voter_ids().any(|id| id == 3)
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .learner_ids()
+                            .any(|id| id == 3)
+                },
+                "drained node should observe learner membership",
+            )
+            .await
+            .expect("drained node should observe membership");
+        let error = remove_raft_voter(&rafts[0], 3)
+            .await
+            .expect_err("removing a drained learner as voter should fail");
+        assert!(error.to_string().contains("is not a voter"));
+
+        let response = timeout(Duration::from_secs(5), async {
+            loop {
+                match rafts[0]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"drain-key"),
+                        value: Bytes::from_static(b"drain-value"),
+                    }))
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("write after drain should succeed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("write after drain should finish");
+        assert!(matches!(
+            response.data,
+            RaftResponse::Applied(Frame::SimpleString(_))
+        ));
+
+        let drained_outcome = execute_client_request(
+            &rafts[2],
+            Request::Command(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"drained-local-key"),
+                Bytes::from_static(b"must-forward"),
+            ]),
+        )
+        .await
+        .expect("drained node request should be handled");
+        assert!(matches!(drained_outcome, ClientRequestOutcome::Redirect(_)));
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -3113,15 +3476,30 @@ mod tests {
         } else {
             &rafts[2]
         };
-        let response = execute_client_request(
-            new_leader,
-            Request::Command(vec![
-                Bytes::from_static(b"GET"),
-                Bytes::from_static(b"failover-key"),
-            ]),
-        )
+        let response = timeout(Duration::from_secs(5), async {
+            loop {
+                match execute_client_request(
+                    new_leader,
+                    Request::Command(vec![
+                        Bytes::from_static(b"GET"),
+                        Bytes::from_static(b"failover-key"),
+                    ]),
+                )
+                .await
+                {
+                    Ok(response) => break response,
+                    Err(error)
+                        if error.contains("not enough for a quorum")
+                            || error.contains("leader is not known") =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("read after failover should succeed: {error}"),
+                }
+            }
+        })
         .await
-        .expect("read after failover should succeed");
+        .expect("read after failover should finish");
         assert_eq!(response, ClientRequestOutcome::Applied(Frame::Null));
 
         for raft in rafts.into_iter().skip(1) {
