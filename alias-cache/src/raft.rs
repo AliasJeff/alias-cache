@@ -974,20 +974,90 @@ impl MemNetwork {
 }
 
 #[derive(Clone)]
-pub struct TcpNetworkFactory;
+pub struct TcpNetworkControl {
+    blocked_links: Arc<Mutex<BTreeSet<(NodeId, NodeId)>>>,
+}
+
+impl TcpNetworkControl {
+    pub async fn block_link(&self, from: NodeId, to: NodeId) {
+        self.blocked_links.lock().await.insert((from, to));
+    }
+
+    pub async fn unblock_link(&self, from: NodeId, to: NodeId) {
+        self.blocked_links.lock().await.remove(&(from, to));
+    }
+
+    pub async fn block_bidirectional(&self, first: NodeId, second: NodeId) {
+        let mut blocked_links = self.blocked_links.lock().await;
+        blocked_links.insert((first, second));
+        blocked_links.insert((second, first));
+    }
+
+    pub async fn unblock_bidirectional(&self, first: NodeId, second: NodeId) {
+        let mut blocked_links = self.blocked_links.lock().await;
+        blocked_links.remove(&(first, second));
+        blocked_links.remove(&(second, first));
+    }
+
+    async fn is_blocked(&self, from: NodeId, to: NodeId) -> bool {
+        self.blocked_links.lock().await.contains(&(from, to))
+    }
+}
+
+impl Default for TcpNetworkControl {
+    fn default() -> Self {
+        Self {
+            blocked_links: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TcpNetworkFactory {
+    source: NodeId,
+    control: TcpNetworkControl,
+}
 
 #[derive(Clone)]
 pub struct TcpNetwork {
+    source: NodeId,
+    target: NodeId,
     address: String,
+    control: TcpNetworkControl,
+}
+
+impl TcpNetworkFactory {
+    fn new(source: NodeId, control: TcpNetworkControl) -> Self {
+        Self { source, control }
+    }
 }
 
 impl RaftNetworkFactory<TypeConfig> for TcpNetworkFactory {
     type Network = TcpNetwork;
 
-    async fn new_client(&mut self, _target: NodeId, node: &Node) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, node: &Node) -> Self::Network {
         TcpNetwork {
+            source: self.source,
+            target,
             address: node.addr.clone(),
+            control: self.control.clone(),
         }
+    }
+}
+
+impl TcpNetwork {
+    async fn send(
+        &self,
+        request: NetworkRequest,
+        option: &RPCOption,
+    ) -> Result<NetworkResponse, RPCError<TypeConfig>> {
+        if self.control.is_blocked(self.source, self.target).await {
+            return Err(RPCError::Unreachable(Unreachable::from_string(format!(
+                "raft network link {} -> {} is blocked",
+                self.source, self.target
+            ))));
+        }
+        send_rpc(&self.address, request, option).await
     }
 }
 
@@ -1101,7 +1171,7 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match send_rpc(&self.address, NetworkRequest::Append(rpc), &option).await? {
+        match self.send(NetworkRequest::Append(rpc), &option).await? {
             NetworkResponse::Append(response) => response.map_err(rpc_response_error),
             _ => Err(rpc_response_error(
                 "unexpected raft rpc response".to_string(),
@@ -1114,7 +1184,7 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
         rpc: VoteRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match send_rpc(&self.address, NetworkRequest::Vote(rpc), &option).await? {
+        match self.send(NetworkRequest::Vote(rpc), &option).await? {
             NetworkResponse::Vote(response) => response.map_err(rpc_response_error),
             _ => Err(rpc_response_error(
                 "unexpected raft rpc response".to_string(),
@@ -1127,7 +1197,7 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
         rpc: VoteRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match send_rpc(&self.address, NetworkRequest::PreVote(rpc), &option).await? {
+        match self.send(NetworkRequest::PreVote(rpc), &option).await? {
             NetworkResponse::Vote(response) => response.map_err(rpc_response_error),
             _ => Err(rpc_response_error(
                 "unexpected raft rpc response".to_string(),
@@ -1153,17 +1223,17 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                 ))?;
             }
         }
-        let response = send_rpc(
-            &self.address,
-            NetworkRequest::Snapshot {
-                vote,
-                snapshot: data,
-                meta: snapshot.meta,
-            },
-            &option,
-        )
-        .await
-        .map_err(StreamingError::from)?;
+        let response = self
+            .send(
+                NetworkRequest::Snapshot {
+                    vote,
+                    snapshot: data,
+                    meta: snapshot.meta,
+                },
+                &option,
+            )
+            .await
+            .map_err(StreamingError::from)?;
         match response {
             NetworkResponse::Snapshot(response) => response.map_err(|error| {
                 StreamingError::Network(openraft::error::NetworkError::from_string(error))
@@ -1468,7 +1538,16 @@ pub async fn new_tcp_raft(
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, true).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, true, TcpNetworkControl::default()).await
+}
+
+pub async fn new_tcp_raft_with_control(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    control: TcpNetworkControl,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner(node_id, data_dir, nodes, true, control).await
 }
 
 pub async fn new_tcp_raft_joiner(
@@ -1476,7 +1555,23 @@ pub async fn new_tcp_raft_joiner(
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, false).await
+    new_tcp_raft_inner(
+        node_id,
+        data_dir,
+        nodes,
+        false,
+        TcpNetworkControl::default(),
+    )
+    .await
+}
+
+pub async fn new_tcp_raft_joiner_with_control(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    control: TcpNetworkControl,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner(node_id, data_dir, nodes, false, control).await
 }
 
 async fn new_tcp_raft_inner(
@@ -1484,6 +1579,7 @@ async fn new_tcp_raft_inner(
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
     bootstrap: bool,
+    control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
@@ -1503,7 +1599,7 @@ async fn new_tcp_raft_inner(
     let raft = openraft::Raft::new(
         node_id,
         Arc::new(config),
-        TcpNetworkFactory,
+        TcpNetworkFactory::new(node_id, control),
         log_store,
         MemStateMachine::default(),
     )
@@ -1763,7 +1859,16 @@ pub async fn restart_tcp_raft(
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
 ) -> CacheResult<RaftHandle> {
-    new_tcp_raft_joiner(node_id, data_dir, nodes)
+    restart_tcp_raft_with_control(node_id, data_dir, nodes, TcpNetworkControl::default()).await
+}
+
+pub async fn restart_tcp_raft_with_control(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    control: TcpNetworkControl,
+) -> CacheResult<RaftHandle> {
+    new_tcp_raft_joiner_with_control(node_id, data_dir, nodes, control)
         .await
         .map_err(|error| Error::server(format!("restart tcp raft node: {error}")))
 }
@@ -3822,6 +3927,246 @@ mod tests {
         }
 
         for raft in rafts.into_iter().skip(1) {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tcp_minority_partition_separates_read_write_and_redirect_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-minority-partition-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let control = TcpNetworkControl::default();
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft_with_control(1, root.join("node-1"), nodes.clone(), control.clone())
+                    .await
+            } else {
+                new_tcp_raft_joiner_with_control(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                    control.clone(),
+                )
+                .await
+            }
+            .expect("tcp raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("initial leader election should finish")
+        .expect("initial leader election should succeed");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .committed_membership_config
+                        .voter_ids()
+                        .eq([1, 2, 3])
+                },
+                "initial membership should be committed",
+            )
+            .await
+            .expect("initial membership commit wait should succeed");
+
+        let initial_write = execute_client_request(
+            &rafts[0],
+            Request::Command(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"partition-key"),
+                Bytes::from_static(b"initial-value"),
+            ]),
+        )
+        .await
+        .expect("initial write should be handled");
+        assert_eq!(
+            initial_write,
+            ClientRequestOutcome::Applied(Frame::simple_string("OK"))
+        );
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(2), "initial write should apply"),
+            )
+            .await
+            .expect("initial write replication should finish")
+            .expect("initial write apply wait should succeed");
+        }
+
+        control.block_bidirectional(1, 2).await;
+        control.block_bidirectional(1, 3).await;
+
+        let majority_leader = timeout(Duration::from_secs(8), async {
+            loop {
+                let node2_leader = rafts[1].current_leader().await;
+                let node3_leader = rafts[2].current_leader().await;
+                if node2_leader == node3_leader && matches!(node2_leader, Some(2 | 3)) {
+                    break node2_leader.expect("majority leader should be known");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("majority should elect a new leader");
+        let majority_index = match majority_leader {
+            2 => 1,
+            3 => 2,
+            leader => panic!("unexpected majority leader {leader}"),
+        };
+        let majority_follower_index = if majority_index == 1 { 2 } else { 1 };
+
+        let majority_read = timeout(
+            Duration::from_secs(5),
+            execute_client_request(
+                &rafts[majority_index],
+                Request::Command(vec![
+                    Bytes::from_static(b"GET"),
+                    Bytes::from_static(b"partition-key"),
+                ]),
+            ),
+        )
+        .await
+        .expect("majority read should finish")
+        .expect("majority read should succeed");
+        assert_eq!(
+            majority_read,
+            ClientRequestOutcome::Applied(Frame::bulk_string("initial-value"))
+        );
+
+        let majority_write = timeout(
+            Duration::from_secs(5),
+            execute_client_request(
+                &rafts[majority_index],
+                Request::Command(vec![
+                    Bytes::from_static(b"SET"),
+                    Bytes::from_static(b"majority-key"),
+                    Bytes::from_static(b"majority-value"),
+                ]),
+            ),
+        )
+        .await
+        .expect("majority write should finish")
+        .expect("majority write should succeed");
+        assert_eq!(
+            majority_write,
+            ClientRequestOutcome::Applied(Frame::simple_string("OK"))
+        );
+
+        let majority_redirect = timeout(
+            Duration::from_secs(5),
+            execute_client_request(
+                &rafts[majority_follower_index],
+                Request::Command(vec![
+                    Bytes::from_static(b"SET"),
+                    Bytes::from_static(b"redirect-key"),
+                    Bytes::from_static(b"redirect-value"),
+                ]),
+            ),
+        )
+        .await
+        .expect("majority follower request should finish")
+        .expect("majority follower request should be classified");
+        assert_eq!(
+            majority_redirect,
+            ClientRequestOutcome::Redirect(nodes[&majority_leader].addr.clone())
+        );
+
+        let minority_read_error = timeout(
+            Duration::from_secs(5),
+            execute_client_request(
+                &rafts[0],
+                Request::Command(vec![
+                    Bytes::from_static(b"GET"),
+                    Bytes::from_static(b"partition-key"),
+                ]),
+            ),
+        )
+        .await
+        .expect("minority read should finish")
+        .expect_err("minority read must not return a linearizable value");
+        assert!(minority_read_error.contains("read barrier failed"));
+        assert!(minority_read_error.to_ascii_lowercase().contains("quorum"));
+
+        let minority_write_error = timeout(
+            Duration::from_secs(5),
+            execute_client_request(
+                &rafts[0],
+                Request::Command(vec![
+                    Bytes::from_static(b"SET"),
+                    Bytes::from_static(b"minority-key"),
+                    Bytes::from_static(b"minority-value"),
+                ]),
+            ),
+        )
+        .await
+        .expect("minority write should finish")
+        .expect_err("minority write must not be acknowledged");
+        assert_eq!(minority_write_error, "raft leader is not known");
+
+        let minority_state = rafts[0]
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("minority state should be readable locally");
+        assert_eq!(
+            minority_state
+                .snapshot()
+                .get(&Bytes::from_static(b"minority-key")),
+            None
+        );
+
+        control.unblock_bidirectional(1, 2).await;
+        control.unblock_bidirectional(1, 3).await;
+        for raft in rafts {
             raft.shutdown().await.expect("raft node should stop");
         }
         for (shutdown_tx, task) in rpc_tasks {
