@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::protocol::{Frame, Request};
 
+pub type ClientRequestId = u128;
+
+const CLIENT_RESULT_CACHE_CAPACITY: usize = 4_096;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(Bytes),
@@ -13,6 +17,10 @@ pub enum Value {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
+    Client {
+        request_id: ClientRequestId,
+        operation: Box<Operation>,
+    },
     Set {
         key: Bytes,
         value: Bytes,
@@ -63,6 +71,7 @@ pub enum Operation {
 impl Operation {
     pub fn write_time(&self) -> u64 {
         match self {
+            Self::Client { operation, .. } => operation.write_time(),
             Self::SetWithExpiration { write_time, .. }
             | Self::Expire { write_time, .. }
             | Self::ExpireSeconds { write_time, .. }
@@ -79,7 +88,8 @@ impl Operation {
     fn keys(&self) -> &[Bytes] {
         match self {
             Self::Delete { keys } => keys,
-            Self::Set { .. }
+            Self::Client { .. }
+            | Self::Set { .. }
             | Self::SetWithExpiration { .. }
             | Self::MultiSet { .. }
             | Self::DeleteIfExpired { .. }
@@ -102,6 +112,7 @@ pub enum ApplyResult {
 pub struct StateMachine {
     values: BTreeMap<Bytes, Entry>,
     logical_time: u64,
+    client_results: BTreeMap<ClientRequestId, Frame>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -113,6 +124,7 @@ struct Entry {
 impl StateMachine {
     pub fn apply(&mut self, operation: Operation) -> ApplyResult {
         let write_time = match &operation {
+            Operation::Client { operation, .. } => Some(operation.write_time()),
             Operation::SetWithExpiration { write_time, .. }
             | Operation::Expire { write_time, .. }
             | Operation::ExpireSeconds { write_time, .. }
@@ -128,6 +140,26 @@ impl StateMachine {
             self.advance_logical_time(write_time);
         }
         match operation {
+            Operation::Client {
+                request_id,
+                operation,
+            } => {
+                if let Some(response) = self.client_results.get(&request_id) {
+                    return ApplyResult::Response(response.clone());
+                }
+                let result = self.apply(*operation);
+                if let ApplyResult::Response(response) = &result {
+                    self.client_results.insert(request_id, response.clone());
+                    while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
+                        let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id)
+                        else {
+                            break;
+                        };
+                        self.client_results.remove(&oldest);
+                    }
+                }
+                result
+            }
             Operation::Set { key, value } => {
                 self.values.insert(
                     key,
@@ -281,9 +313,18 @@ impl StateMachine {
         request: Request,
         write_time: u64,
     ) -> Result<(Option<Operation>, Frame)> {
+        self.prepare_request_at_with_id(request, write_time, None)
+    }
+
+    pub fn prepare_request_at_with_id(
+        &self,
+        request: Request,
+        write_time: u64,
+        request_id: Option<ClientRequestId>,
+    ) -> Result<(Option<Operation>, Frame)> {
         let mut state = self.clone();
         state.advance_logical_time(write_time);
-        state.prepare_request(request)
+        state.prepare_request_with_id(request, request_id)
     }
 
     pub fn prepare_time_advance(&self, write_time: u64) -> Operation {
@@ -293,6 +334,31 @@ impl StateMachine {
     }
 
     pub fn prepare_request(&self, request: Request) -> Result<(Option<Operation>, Frame)> {
+        self.prepare_request_with_id(request, None)
+    }
+
+    pub fn prepare_request_with_id(
+        &self,
+        request: Request,
+        request_id: Option<ClientRequestId>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        if let Some(request_id) = request_id
+            && let Some(response) = self.client_results.get(&request_id)
+        {
+            return Ok((None, response.clone()));
+        }
+        let (operation, response) = self.prepare_request_inner(request)?;
+        let operation = match (request_id, operation) {
+            (Some(request_id), Some(operation)) => Some(Operation::Client {
+                request_id,
+                operation: Box::new(operation),
+            }),
+            (_, operation) => operation,
+        };
+        Ok((operation, response))
+    }
+
+    fn prepare_request_inner(&self, request: Request) -> Result<(Option<Operation>, Frame)> {
         let Request::Command(arguments) = request;
         let command = arguments
             .first()
@@ -347,6 +413,15 @@ impl StateMachine {
         requests: &[Request],
         write_time: u64,
     ) -> Result<(Operation, Frame)> {
+        self.prepare_transaction_with_id(requests, write_time, None)
+    }
+
+    pub fn prepare_transaction_with_id(
+        &self,
+        requests: &[Request],
+        write_time: u64,
+        request_id: Option<ClientRequestId>,
+    ) -> Result<(Operation, Frame)> {
         let mut state = self.clone();
         state.advance_logical_time(write_time);
         let mut operations = Vec::with_capacity(requests.len());
@@ -381,13 +456,15 @@ impl StateMachine {
             operations.push(operation);
             responses.push(response);
         }
-        Ok((
-            Operation::Transaction {
-                operations,
-                write_time: state.logical_time,
-            },
-            Frame::Array(responses),
-        ))
+        let operation = Operation::Transaction {
+            operations,
+            write_time: state.logical_time,
+        };
+        let operation = request_id.map_or(operation.clone(), |request_id| Operation::Client {
+            request_id,
+            operation: Box::new(operation),
+        });
+        Ok((operation, Frame::Array(responses)))
     }
 
     pub fn execute_request(&mut self, request: Request) -> Result<(Option<Operation>, Frame)> {
@@ -907,6 +984,44 @@ mod tests {
         );
         assert_eq!(response, Frame::Integer(1));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn client_request_id_replays_response_without_reapplying_operation() {
+        let mut state = StateMachine::default();
+        let first_request = command(&[b"SET", b"key", b"first"]);
+        let (operation, response) = state
+            .prepare_request_at_with_id(first_request, 1_000, Some(7))
+            .unwrap();
+        assert_eq!(response, Frame::simple_string("OK"));
+        state.apply(operation.expect("first request should produce an operation"));
+
+        let (duplicate_operation, duplicate_response) = state
+            .prepare_request_at_with_id(command(&[b"SET", b"key", b"second"]), 2_000, Some(7))
+            .unwrap();
+        assert_eq!(duplicate_operation, None);
+        assert_eq!(duplicate_response, Frame::simple_string("OK"));
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::bulk_string("first")
+        );
+    }
+
+    #[test]
+    fn client_request_results_survive_state_serialization() {
+        let mut state = StateMachine::default();
+        let (operation, _) = state
+            .prepare_request_at_with_id(command(&[b"SET", b"key", b"value"]), 1_000, Some(11))
+            .unwrap();
+        state.apply(operation.expect("request should produce an operation"));
+
+        let encoded = bincode::serialize(&state).unwrap();
+        let restored: StateMachine = bincode::deserialize(&encoded).unwrap();
+        let (operation, response) = restored
+            .prepare_request_at_with_id(command(&[b"SET", b"key", b"changed"]), 2_000, Some(11))
+            .unwrap();
+        assert_eq!(operation, None);
+        assert_eq!(response, Frame::simple_string("OK"));
     }
 
     #[test]

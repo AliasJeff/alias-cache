@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result as CacheResult};
 use crate::protocol::{Frame, Request};
-use crate::state_machine::{Operation, StateMachine};
+use crate::state_machine::{ClientRequestId, Operation, StateMachine};
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption};
 use openraft::raft::{
@@ -24,6 +24,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,6 +65,13 @@ pub enum RaftResponse {
     Noop,
 }
 
+static NEXT_CLIENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn new_client_request_id() -> ClientRequestId {
+    (u128::from(current_time_millis()) << 64)
+        | u128::from(NEXT_CLIENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = RaftRequest,
@@ -82,8 +90,14 @@ enum NetworkRequest {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<TypeConfig>),
     PreVote(VoteRequest<TypeConfig>),
-    Client(Request),
-    Transaction(Vec<Request>),
+    Client {
+        request_id: ClientRequestId,
+        request: Request,
+    },
+    Transaction {
+        request_id: ClientRequestId,
+        requests: Vec<Request>,
+    },
     Snapshot {
         vote: Vote,
         snapshot: Vec<u8>,
@@ -631,12 +645,20 @@ pub async fn execute_client_request(
     raft: &RaftHandle,
     request: Request,
 ) -> Result<ClientRequestOutcome, String> {
+    execute_client_request_with_id(raft, new_client_request_id(), request).await
+}
+
+pub async fn execute_client_request_with_id(
+    raft: &RaftHandle,
+    request_id: ClientRequestId,
+    request: Request,
+) -> Result<ClientRequestOutcome, String> {
     let write_time = current_time_millis();
     let (operation, response) = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
                 let state = state_machine.state().await;
-                state.prepare_request_at(request, write_time)
+                state.prepare_request_at_with_id(request, write_time, Some(request_id))
             })
         })
         .await
@@ -670,13 +692,21 @@ pub async fn execute_transaction_request(
     raft: &RaftHandle,
     requests: Vec<Request>,
 ) -> Result<ClientRequestOutcome, String> {
+    execute_transaction_request_with_id(raft, new_client_request_id(), requests).await
+}
+
+pub async fn execute_transaction_request_with_id(
+    raft: &RaftHandle,
+    request_id: ClientRequestId,
+    requests: Vec<Request>,
+) -> Result<ClientRequestOutcome, String> {
     let write_time = current_time_millis();
     let operation = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
                 let state = state_machine.state().await;
                 state
-                    .prepare_transaction(&requests, write_time)
+                    .prepare_transaction_with_id(&requests, write_time, Some(request_id))
                     .map(|(operation, _)| operation)
             })
         })
@@ -1134,9 +1164,25 @@ pub async fn send_client_request(
     request: Request,
     option: &RPCOption,
 ) -> CacheResult<Frame> {
-    let response = send_rpc(address, NetworkRequest::Client(request), option)
-        .await
-        .map_err(|error| Error::server(format!("send client request: {error}")))?;
+    send_client_request_with_id(address, new_client_request_id(), request, option).await
+}
+
+pub async fn send_client_request_with_id(
+    address: &str,
+    request_id: ClientRequestId,
+    request: Request,
+    option: &RPCOption,
+) -> CacheResult<Frame> {
+    let response = send_rpc(
+        address,
+        NetworkRequest::Client {
+            request_id,
+            request,
+        },
+        option,
+    )
+    .await
+    .map_err(|error| Error::server(format!("send client request: {error}")))?;
     match response {
         NetworkResponse::Client(Ok(frame)) => Ok(frame),
         NetworkResponse::Client(Err(error)) => Err(Error::server(error)),
@@ -1149,9 +1195,25 @@ pub async fn send_transaction_request(
     requests: Vec<Request>,
     option: &RPCOption,
 ) -> CacheResult<Frame> {
-    let response = send_rpc(address, NetworkRequest::Transaction(requests), option)
-        .await
-        .map_err(|error| Error::server(format!("send transaction request: {error}")))?;
+    send_transaction_request_with_id(address, new_client_request_id(), requests, option).await
+}
+
+pub async fn send_transaction_request_with_id(
+    address: &str,
+    request_id: ClientRequestId,
+    requests: Vec<Request>,
+    option: &RPCOption,
+) -> CacheResult<Frame> {
+    let response = send_rpc(
+        address,
+        NetworkRequest::Transaction {
+            request_id,
+            requests,
+        },
+        option,
+    )
+    .await
+    .map_err(|error| Error::server(format!("send transaction request: {error}")))?;
     match response {
         NetworkResponse::Client(Ok(frame)) => Ok(frame),
         NetworkResponse::Client(Err(error)) => Err(Error::server(error)),
@@ -1312,22 +1374,27 @@ async fn handle_raft_rpc(
                 .await
                 .map_err(|error| error.to_string()),
         ),
-        NetworkRequest::Client(request) => {
-            let response =
-                execute_client_request(&raft, request)
-                    .await
-                    .map(|outcome| match outcome {
-                        ClientRequestOutcome::Applied(frame) => frame,
-                        ClientRequestOutcome::Redirect(address) => {
-                            // Client forwarding is intentionally one hop. The edge server
-                            // resolves the next leader and owns the retry boundary.
-                            Frame::error(format!("MOVED {address}"))
-                        }
-                    });
+        NetworkRequest::Client {
+            request_id,
+            request,
+        } => {
+            let response = execute_client_request_with_id(&raft, request_id, request)
+                .await
+                .map(|outcome| match outcome {
+                    ClientRequestOutcome::Applied(frame) => frame,
+                    ClientRequestOutcome::Redirect(address) => {
+                        // Client forwarding is intentionally one hop. The edge server
+                        // resolves the next leader and owns the retry boundary.
+                        Frame::error(format!("MOVED {address}"))
+                    }
+                });
             NetworkResponse::Client(response)
         }
-        NetworkRequest::Transaction(requests) => {
-            let response = execute_transaction_request(&raft, requests)
+        NetworkRequest::Transaction {
+            request_id,
+            requests,
+        } => {
+            let response = execute_transaction_request_with_id(&raft, request_id, requests)
                 .await
                 .map(|outcome| match outcome {
                     ClientRequestOutcome::Applied(frame) => frame,
@@ -1666,7 +1733,23 @@ pub fn enable_raft_runtime(raft: &RaftHandle) {
     raft.runtime_config().elect(true);
 }
 
+async fn wait_for_membership_commit(
+    raft: &RaftHandle,
+    context: impl Into<String>,
+) -> CacheResult<()> {
+    let context = context.into();
+    raft.wait(None)
+        .metrics(
+            |metrics| metrics.membership_config == metrics.committed_membership_config,
+            context.clone(),
+        )
+        .await
+        .map_err(|error| Error::server(format!("{context}: {error}")))?;
+    Ok(())
+}
+
 pub async fn add_raft_learner(raft: &RaftHandle, node_id: NodeId, node: Node) -> CacheResult<()> {
+    wait_for_membership_commit(raft, format!("wait before adding raft learner {node_id}")).await?;
     raft.add_learner(node_id, node, false)
         .await
         .map_err(|error| Error::server(format!("add raft learner {node_id}: {error}")))?;
@@ -1703,12 +1786,22 @@ pub async fn update_raft_node(raft: &RaftHandle, node_id: NodeId, node: Node) ->
     }
 
     let expected_node = node.clone();
+    wait_for_membership_commit(
+        raft,
+        format!("wait before removing raft node {node_id} for address update"),
+    )
+    .await?;
     raft.change_membership(
         openraft::ChangeMembers::RemoveNodes(BTreeSet::from([node_id])),
         false,
     )
     .await
     .map_err(|error| Error::server(format!("remove raft node {node_id}: {error}")))?;
+    wait_for_membership_commit(
+        raft,
+        format!("wait after removing raft node {node_id} for address update"),
+    )
+    .await?;
     raft.add_learner(node_id, node, false)
         .await
         .map_err(|error| Error::server(format!("re-add raft learner {node_id}: {error}")))?;
@@ -1779,6 +1872,11 @@ pub async fn purge_raft_log(raft: &RaftHandle, upto: u64) -> CacheResult<()> {
 }
 
 pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    wait_for_membership_commit(
+        raft,
+        format!("wait before promoting raft learner {node_id}"),
+    )
+    .await?;
     let mut voters = raft.voter_ids().collect::<Vec<_>>();
     if !voters.contains(&node_id) {
         voters.push(node_id);
@@ -1791,6 +1889,7 @@ pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheRe
 }
 
 pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    wait_for_membership_commit(raft, format!("wait before removing raft voter {node_id}")).await?;
     let current_voters = raft.voter_ids().collect::<Vec<_>>();
     if !current_voters.contains(&node_id) {
         return Err(Error::server(format!("raft node {node_id} is not a voter")));
@@ -1812,6 +1911,7 @@ pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResul
 }
 
 pub async fn drain_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
+    wait_for_membership_commit(raft, format!("wait before draining raft voter {node_id}")).await?;
     let voters = raft.voter_ids().collect::<Vec<_>>();
     if !voters.contains(&node_id) {
         return Err(Error::server(format!("raft node {node_id} is not a voter")));
@@ -4166,6 +4266,73 @@ mod tests {
 
         control.unblock_bidirectional(1, 2).await;
         control.unblock_bidirectional(1, 3).await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if rafts[0].current_leader().await == Some(majority_leader) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("old leader should learn the majority leader after recovery");
+
+        let request_id = new_client_request_id();
+        let rediscovery_request = Request::Command(vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"rediscovery-key"),
+            Bytes::from_static(b"first-value"),
+        ]);
+        let old_leader_response = send_client_request_with_id(
+            &nodes[&1].addr,
+            request_id,
+            rediscovery_request.clone(),
+            &RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .expect("old leader redirect should be returned as a RESP error");
+        assert_eq!(
+            old_leader_response,
+            Frame::error(format!("MOVED {}", nodes[&majority_leader].addr))
+        );
+
+        let response = send_client_request_with_id(
+            &nodes[&majority_leader].addr,
+            request_id,
+            rediscovery_request,
+            &RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .expect("rediscovered leader should accept the request");
+        assert_eq!(response, Frame::simple_string("OK"));
+
+        let duplicate_response = send_client_request_with_id(
+            &nodes[&majority_leader].addr,
+            request_id,
+            Request::Command(vec![
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"rediscovery-key"),
+                Bytes::from_static(b"second-value"),
+            ]),
+            &RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .expect("duplicate request should return the cached response");
+        assert_eq!(duplicate_response, Frame::simple_string("OK"));
+        let value = execute_client_request(
+            &rafts[majority_index],
+            Request::Command(vec![
+                Bytes::from_static(b"GET"),
+                Bytes::from_static(b"rediscovery-key"),
+            ]),
+        )
+        .await
+        .expect("rediscovery value read should succeed");
+        assert_eq!(
+            value,
+            ClientRequestOutcome::Applied(Frame::bulk_string("first-value"))
+        );
+
         for raft in rafts {
             raft.shutdown().await.expect("raft node should stop");
         }

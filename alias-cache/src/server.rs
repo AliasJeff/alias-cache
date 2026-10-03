@@ -12,9 +12,10 @@ use crate::error::{Error, Result};
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
 use crate::raft::{
-    ClientRequestOutcome, RaftHandle, execute_client_request, execute_transaction_request,
-    new_tcp_raft_for_server, open_single_node, run_expiration_worker, run_leader_time_worker,
-    send_client_request, send_transaction_request, serve_raft_rpc, wait_for_leader,
+    ClientRequestOutcome, RaftHandle, execute_client_request_with_id,
+    execute_transaction_request_with_id, new_client_request_id, new_tcp_raft_for_server,
+    open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request_with_id,
+    send_transaction_request_with_id, serve_raft_rpc, wait_for_leader,
 };
 
 pub struct Server {
@@ -263,10 +264,12 @@ async fn handle_transaction_command(
 }
 
 async fn execute_transaction(raft: &RaftHandle, requests: Vec<crate::protocol::Request>) -> Frame {
-    match execute_transaction_request(raft, requests.clone()).await {
+    let request_id = new_client_request_id();
+    match execute_transaction_request_with_id(raft, request_id, requests.clone()).await {
         Ok(ClientRequestOutcome::Applied(response)) => response,
-        Ok(ClientRequestOutcome::Redirect(address)) => match send_transaction_request(
+        Ok(ClientRequestOutcome::Redirect(address)) => match send_transaction_request_with_id(
             &address,
+            request_id,
             requests,
             &openraft::network::RPCOption::new(std::time::Duration::from_secs(1)),
         )
@@ -280,11 +283,13 @@ async fn execute_transaction(raft: &RaftHandle, requests: Vec<crate::protocol::R
 }
 
 async fn execute_client_command(raft: &RaftHandle, request: crate::protocol::Request) -> Frame {
-    match execute_client_request(raft, request.clone()).await {
+    let request_id = new_client_request_id();
+    match execute_client_request_with_id(raft, request_id, request.clone()).await {
         Ok(ClientRequestOutcome::Applied(response)) => response,
         Ok(ClientRequestOutcome::Redirect(address)) => {
-            match send_client_request(
+            match send_client_request_with_id(
                 &address,
+                request_id,
                 request,
                 &openraft::network::RPCOption::new(std::time::Duration::from_secs(1)),
             )
