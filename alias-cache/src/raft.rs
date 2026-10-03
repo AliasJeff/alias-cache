@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, watch};
 use tokio::time::interval;
@@ -103,6 +103,11 @@ enum NetworkRequest {
         snapshot: Vec<u8>,
         meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
     },
+    SnapshotStart {
+        vote: Vote,
+        total_len: u64,
+        meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +119,8 @@ enum NetworkResponse {
 }
 
 const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
+const SNAPSHOT_CHUNK_SIZE: usize = 256 * 1024;
+const NETWORK_MAX_SNAPSHOT_SIZE: u64 = 512 * 1024 * 1024;
 const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1260,6 +1267,89 @@ async fn send_rpc(
     })
 }
 
+async fn send_snapshot_rpc(
+    address: &str,
+    vote: Vote,
+    meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
+    data: Vec<u8>,
+    cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+    option: &RPCOption,
+) -> Result<NetworkResponse, StreamingError<TypeConfig>> {
+    let mut stream = connect(address, option)
+        .await
+        .map_err(StreamingError::from)?;
+    let total_len = u64::try_from(data.len()).map_err(|_| {
+        StreamingError::Network(openraft::error::NetworkError::from_string(
+            "raft snapshot length overflows u64",
+        ))
+    })?;
+    if total_len > NETWORK_MAX_SNAPSHOT_SIZE {
+        return Err(StreamingError::Network(
+            openraft::error::NetworkError::from_string("raft snapshot exceeds maximum size"),
+        ));
+    }
+
+    write_network_message(
+        &mut stream,
+        &NetworkRequest::SnapshotStart {
+            vote,
+            total_len,
+            meta,
+        },
+    )
+    .await
+    .map_err(|error| {
+        StreamingError::Network(openraft::error::NetworkError::from_string(
+            error.to_string(),
+        ))
+    })?;
+
+    tokio::pin!(cancel);
+    for chunk in data.chunks(SNAPSHOT_CHUNK_SIZE) {
+        tokio::select! {
+            closed = &mut cancel => return Err(StreamingError::Closed(closed)),
+            result = write_raw_frame(&mut stream, chunk) => {
+                result.map_err(|error| StreamingError::Network(
+                    openraft::error::NetworkError::from_string(error.to_string())
+                ))?;
+            }
+        }
+    }
+    stream.flush().await.map_err(|error| {
+        StreamingError::Network(openraft::error::NetworkError::from_string(
+            error.to_string(),
+        ))
+    })?;
+
+    read_network_response(&mut stream, option)
+        .await
+        .map_err(StreamingError::Network)
+}
+
+async fn read_network_response(
+    stream: &mut TcpStream,
+    option: &RPCOption,
+) -> Result<NetworkResponse, openraft::error::NetworkError<TypeConfig>> {
+    let mut header = [0_u8; 4];
+    timeout(option.soft_ttl(), stream.read_exact(&mut header))
+        .await
+        .map_err(|error| openraft::error::NetworkError::from_string(error.to_string()))?
+        .map_err(|error| openraft::error::NetworkError::from_string(error.to_string()))?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length > NETWORK_MAX_FRAME {
+        return Err(openraft::error::NetworkError::from_string(
+            "raft rpc response exceeds maximum frame size",
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    timeout(option.soft_ttl(), stream.read_exact(&mut payload))
+        .await
+        .map_err(|error| openraft::error::NetworkError::from_string(error.to_string()))?
+        .map_err(|error| openraft::error::NetworkError::from_string(error.to_string()))?;
+    bincode::deserialize(&payload)
+        .map_err(|error| openraft::error::NetworkError::from_string(error.to_string()))
+}
+
 pub async fn send_client_request(
     address: &str,
     request: Request,
@@ -1376,27 +1466,13 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
         option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
         let mut data = Vec::new();
-        tokio::select! {
-            closed = cancel => return Err(StreamingError::Closed(closed)),
-            result = async {
-                std::io::Read::read_to_end(&mut snapshot.snapshot, &mut data)
-            } => {
-                result.map_err(|error| StreamingError::Network(
-                    openraft::error::NetworkError::from_string(error.to_string())
-                ))?;
-            }
-        }
-        let response = self
-            .send(
-                NetworkRequest::Snapshot {
-                    vote,
-                    snapshot: data,
-                    meta: snapshot.meta,
-                },
-                &option,
-            )
-            .await
-            .map_err(StreamingError::from)?;
+        std::io::Read::read_to_end(&mut snapshot.snapshot, &mut data).map_err(|error| {
+            StreamingError::Network(openraft::error::NetworkError::from_string(
+                error.to_string(),
+            ))
+        })?;
+        let response =
+            send_snapshot_rpc(&self.address, vote, snapshot.meta, data, cancel, &option).await?;
         match response {
             NetworkResponse::Snapshot(response) => response.map_err(|error| {
                 StreamingError::Network(openraft::error::NetworkError::from_string(error))
@@ -1522,6 +1598,24 @@ async fn handle_raft_rpc(
                 .map_err(|error| error.to_string());
             NetworkResponse::Snapshot(response)
         }
+        NetworkRequest::SnapshotStart {
+            vote,
+            total_len,
+            meta,
+        } => {
+            let snapshot = read_snapshot_chunks(&mut stream, total_len).await?;
+            let response = raft
+                .install_full_snapshot(
+                    vote,
+                    openraft::Snapshot {
+                        meta,
+                        snapshot: std::io::Cursor::new(snapshot),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string());
+            NetworkResponse::Snapshot(response)
+        }
     };
     write_network_message(&mut stream, &response).await
 }
@@ -1545,6 +1639,53 @@ async fn read_network_message<T: for<'de> Deserialize<'de>>(
         .map_err(|error| Error::io("read raft rpc frame", error))?;
     bincode::deserialize(&payload)
         .map_err(|error| Error::server(format!("decode raft rpc frame: {error}")))
+}
+
+async fn read_snapshot_chunks<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    total_len: u64,
+) -> CacheResult<Vec<u8>> {
+    if total_len > NETWORK_MAX_SNAPSHOT_SIZE {
+        return Err(Error::protocol("raft snapshot exceeds maximum size"));
+    }
+    let total_len = usize::try_from(total_len)
+        .map_err(|_| Error::protocol("raft snapshot length overflows usize"))?;
+    let mut data = Vec::with_capacity(total_len);
+    while data.len() < total_len {
+        let mut header = [0_u8; 4];
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| Error::io("read raft snapshot chunk header", error))?;
+        let length = u32::from_be_bytes(header) as usize;
+        let remaining = total_len - data.len();
+        if length == 0 || length > NETWORK_MAX_FRAME || length > remaining {
+            return Err(Error::protocol("raft snapshot chunk length is invalid"));
+        }
+        let start = data.len();
+        data.resize(start + length, 0);
+        stream
+            .read_exact(&mut data[start..])
+            .await
+            .map_err(|error| Error::io("read raft snapshot chunk", error))?;
+    }
+    Ok(data)
+}
+
+async fn write_raw_frame(stream: &mut TcpStream, payload: &[u8]) -> CacheResult<()> {
+    let length = u32::try_from(payload.len())
+        .map_err(|_| Error::protocol("raft rpc frame length overflows u32"))?;
+    if payload.is_empty() || payload.len() > NETWORK_MAX_FRAME {
+        return Err(Error::protocol("raft rpc frame length is invalid"));
+    }
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| Error::io("write raft rpc frame header", error))?;
+    stream
+        .write_all(payload)
+        .await
+        .map_err(|error| Error::io("write raft rpc frame", error))
 }
 
 async fn write_network_message<T: Serialize>(
@@ -2443,6 +2584,49 @@ mod tests {
                 .to_string()
                 .contains("unsupported raft snapshot payload version")
         );
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_chunks_are_reassembled_in_order() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let payload = b"snapshot payload split across frames".to_vec();
+        let expected = payload.clone();
+        let writer_task = tokio::spawn(async move {
+            for chunk in payload.chunks(7) {
+                writer
+                    .write_all(&(chunk.len() as u32).to_be_bytes())
+                    .await
+                    .expect("chunk header should be written");
+                writer
+                    .write_all(chunk)
+                    .await
+                    .expect("chunk payload should be written");
+            }
+        });
+
+        let actual = read_snapshot_chunks(&mut reader, expected.len() as u64)
+            .await
+            .expect("snapshot chunks should be reassembled");
+        writer_task.await.expect("chunk writer should finish");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_chunks_reject_length_overrun() {
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        writer
+            .write_all(&8_u32.to_be_bytes())
+            .await
+            .expect("chunk header should be written");
+        writer
+            .write_all(b"too-long")
+            .await
+            .expect("chunk payload should be written");
+
+        let error = read_snapshot_chunks(&mut reader, 4)
+            .await
+            .expect_err("oversized chunk should be rejected");
+        assert!(error.to_string().contains("chunk length is invalid"));
     }
 
     #[tokio::test]
