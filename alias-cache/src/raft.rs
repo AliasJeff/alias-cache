@@ -114,23 +114,28 @@ enum NetworkResponse {
 }
 
 const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
-const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 1;
+const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RaftSnapshotPayload {
     version: u16,
     state: StateMachine,
+    pending_operations: Vec<Operation>,
 }
 
-fn encode_raft_snapshot(state: &StateMachine) -> io::Result<Vec<u8>> {
+fn encode_raft_snapshot(
+    state: &StateMachine,
+    pending_operations: Vec<Operation>,
+) -> io::Result<Vec<u8>> {
     bincode::serialize(&RaftSnapshotPayload {
         version: RAFT_SNAPSHOT_PAYLOAD_VERSION,
         state: state.clone(),
+        pending_operations,
     })
     .map_err(io::Error::other)
 }
 
-fn decode_raft_snapshot(data: &[u8]) -> io::Result<StateMachine> {
+fn decode_raft_snapshot(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>)> {
     let payload: RaftSnapshotPayload = bincode::deserialize(data).map_err(io::Error::other)?;
     if payload.version != RAFT_SNAPSHOT_PAYLOAD_VERSION {
         return Err(io::Error::new(
@@ -141,7 +146,7 @@ fn decode_raft_snapshot(data: &[u8]) -> io::Result<StateMachine> {
             ),
         ));
     }
-    Ok(payload.state)
+    Ok((payload.state, payload.pending_operations))
 }
 
 const RAFT_LOG_MAGIC: [u8; 4] = *b"ARLG";
@@ -603,12 +608,22 @@ pub struct MemStateMachine {
     inner: Arc<Mutex<MemState>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum SnapshotState {
+    #[default]
+    End,
+    Start,
+    Tail,
+}
+
 #[derive(Debug, Default)]
 struct MemState {
     state: StateMachine,
     last_applied: Option<LogId>,
     membership: StoredMembership,
     snapshot: Option<StoredSnapshot>,
+    snapshot_state: SnapshotState,
+    snapshot_queue: Vec<Operation>,
 }
 
 #[derive(Debug, Clone)]
@@ -872,6 +887,10 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         while let Some((entry, responder)) = tokio_stream::StreamExt::try_next(&mut entries).await?
         {
             let mut inner = self.inner.lock().await;
+            let snapshot_operation = match &entry.payload {
+                EntryPayload::Normal(RaftRequest::Apply(operation)) => Some(operation.clone()),
+                EntryPayload::Blank | EntryPayload::Membership(_) => None,
+            };
             if let EntryPayload::Normal(RaftRequest::Apply(operation)) = &entry.payload {
                 inner.state.advance_logical_time(operation.write_time());
             }
@@ -890,6 +909,11 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
                     RaftResponse::Noop
                 }
             };
+            if inner.snapshot_state == SnapshotState::Start {
+                if let Some(operation) = snapshot_operation {
+                    inner.snapshot_queue.push(operation);
+                }
+            }
             drop(inner);
             if let Some(responder) = responder {
                 responder.send(response);
@@ -902,8 +926,9 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         self.clone()
     }
 
-    async fn try_create_snapshot_builder(&mut self, _force: bool) -> Option<Self::SnapshotBuilder> {
-        Some(self.clone())
+    async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self::SnapshotBuilder> {
+        let inner = self.inner.lock().await;
+        (force || inner.snapshot_state == SnapshotState::End).then(|| self.clone())
     }
 
     async fn install_snapshot(
@@ -913,11 +938,17 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
     ) -> Result<(), io::Error> {
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut snapshot, &mut data)?;
-        let state = decode_raft_snapshot(&data)?;
+        let (mut state, pending_operations) = decode_raft_snapshot(&data)?;
+        for operation in pending_operations {
+            state.advance_logical_time(operation.write_time());
+            let _ = state.apply(operation);
+        }
         let mut inner = self.inner.lock().await;
         inner.state = state;
         inner.last_applied = meta.last_log_id;
         inner.membership = meta.last_membership.clone();
+        inner.snapshot_state = SnapshotState::End;
+        inner.snapshot_queue.clear();
         inner.snapshot = Some(StoredSnapshot {
             data,
             last_log_id: meta.last_log_id,
@@ -964,15 +995,56 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         >,
         io::Error,
     > {
+        let base_state = {
+            let mut inner = self.inner.lock().await;
+            if inner.snapshot_state != SnapshotState::End {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "raft snapshot is already in progress",
+                ));
+            }
+            inner.snapshot_state = SnapshotState::Start;
+            inner.state.clone()
+        };
+
+        let result = self.build_snapshot_from_base(base_state).await;
+        if result.is_err() {
+            self.inner.lock().await.snapshot_state = SnapshotState::End;
+        }
+        result
+    }
+}
+
+impl MemStateMachine {
+    async fn build_snapshot_from_base(
+        &self,
+        base_state: StateMachine,
+    ) -> Result<
+        openraft::Snapshot<
+            <TypeConfig as RaftTypeConfig>::LeaderId,
+            NodeId,
+            Node,
+            std::io::Cursor<Vec<u8>>,
+        >,
+        io::Error,
+    > {
+        let (pending_operations, last_log_id, membership) = {
+            let mut inner = self.inner.lock().await;
+            inner.snapshot_state = SnapshotState::Tail;
+            (
+                std::mem::take(&mut inner.snapshot_queue),
+                inner.last_applied,
+                inner.membership.clone(),
+            )
+        };
+        let data = encode_raft_snapshot(&base_state, pending_operations)?;
         let mut inner = self.inner.lock().await;
-        let data = encode_raft_snapshot(&inner.state)?;
-        let last_log_id = inner.last_applied;
-        let membership = inner.membership.clone();
         inner.snapshot = Some(StoredSnapshot {
             data: data.clone(),
             last_log_id,
             membership: membership.clone(),
         });
+        inner.snapshot_state = SnapshotState::End;
         Ok(openraft::Snapshot {
             meta: openraft::SnapshotMeta {
                 last_log_id,
@@ -2358,6 +2430,7 @@ mod tests {
         let payload = bincode::serialize(&RaftSnapshotPayload {
             version: RAFT_SNAPSHOT_PAYLOAD_VERSION + 1,
             state: StateMachine::default(),
+            pending_operations: Vec::new(),
         })
         .expect("snapshot payload should encode");
         let mut restored = state_machine;
@@ -2369,6 +2442,67 @@ mod tests {
             error
                 .to_string()
                 .contains("unsupported raft snapshot payload version")
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_replays_operations_collected_during_start() {
+        let state_machine = MemStateMachine::default();
+        let base_state = {
+            let mut inner = state_machine.inner.lock().await;
+            inner.state.advance_logical_time(1_000);
+            inner.state.apply(Operation::Set {
+                key: Bytes::from_static(b"base"),
+                value: Bytes::from_static(b"value"),
+            });
+            inner.snapshot_state = SnapshotState::Start;
+            inner.snapshot_queue.push(Operation::SetWithExpiration {
+                key: Bytes::from_static(b"pending"),
+                value: Bytes::from_static(b"value"),
+                expire_at: Some(3_000),
+                write_time: 2_000,
+                only_if_exists: false,
+                only_if_missing: false,
+                keep_ttl: false,
+                return_previous: false,
+            });
+            inner.state.clone()
+        };
+
+        let snapshot = state_machine
+            .build_snapshot_from_base(base_state)
+            .await
+            .expect("snapshot with pending operations should build");
+        let mut restored = MemStateMachine::default();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("snapshot with pending operations should install");
+        let mut restored_state = restored.state().await;
+        assert_eq!(
+            restored_state.snapshot().get(&Bytes::from_static(b"base")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"value"
+            )))
+        );
+        assert_eq!(
+            restored_state
+                .snapshot()
+                .get(&Bytes::from_static(b"pending")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"value"
+            )))
+        );
+        assert_eq!(restored_state.logical_time(), 2_000);
+        assert_eq!(
+            restored_state
+                .execute_request(crate::protocol::Request::Command(vec![
+                    Bytes::from_static(b"PTTL"),
+                    Bytes::from_static(b"pending"),
+                ]))
+                .unwrap()
+                .1,
+            crate::protocol::Frame::Integer(1_000)
         );
     }
 
