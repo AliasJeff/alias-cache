@@ -114,6 +114,35 @@ enum NetworkResponse {
 }
 
 const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
+const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RaftSnapshotPayload {
+    version: u16,
+    state: StateMachine,
+}
+
+fn encode_raft_snapshot(state: &StateMachine) -> io::Result<Vec<u8>> {
+    bincode::serialize(&RaftSnapshotPayload {
+        version: RAFT_SNAPSHOT_PAYLOAD_VERSION,
+        state: state.clone(),
+    })
+    .map_err(io::Error::other)
+}
+
+fn decode_raft_snapshot(data: &[u8]) -> io::Result<StateMachine> {
+    let payload: RaftSnapshotPayload = bincode::deserialize(data).map_err(io::Error::other)?;
+    if payload.version != RAFT_SNAPSHOT_PAYLOAD_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported raft snapshot payload version {}",
+                payload.version
+            ),
+        ));
+    }
+    Ok(payload.state)
+}
 
 const RAFT_LOG_MAGIC: [u8; 4] = *b"ARLG";
 const RAFT_LOG_VERSION: u16 = 1;
@@ -884,7 +913,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
     ) -> Result<(), io::Error> {
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut snapshot, &mut data)?;
-        let state = bincode::deserialize(&data).map_err(io::Error::other)?;
+        let state = decode_raft_snapshot(&data)?;
         let mut inner = self.inner.lock().await;
         inner.state = state;
         inner.last_applied = meta.last_log_id;
@@ -936,7 +965,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         io::Error,
     > {
         let mut inner = self.inner.lock().await;
-        let data = bincode::serialize(&inner.state).map_err(io::Error::other)?;
+        let data = encode_raft_snapshot(&inner.state)?;
         let last_log_id = inner.last_applied;
         let membership = inner.membership.clone();
         inner.snapshot = Some(StoredSnapshot {
@@ -2314,6 +2343,32 @@ mod tests {
                 .unwrap()
                 .1,
             crate::protocol::Frame::Integer(1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_rejects_unsupported_payload_version() {
+        let state_machine = MemStateMachine::default();
+        let snapshot_log_id =
+            openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 1);
+        let meta = openraft::SnapshotMeta {
+            last_log_id: Some(snapshot_log_id),
+            last_membership: StoredMembership::default(),
+        };
+        let payload = bincode::serialize(&RaftSnapshotPayload {
+            version: RAFT_SNAPSHOT_PAYLOAD_VERSION + 1,
+            state: StateMachine::default(),
+        })
+        .expect("snapshot payload should encode");
+        let mut restored = state_machine;
+        let error = restored
+            .install_snapshot(&meta, std::io::Cursor::new(payload))
+            .await
+            .expect_err("unknown snapshot payload version should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported raft snapshot payload version")
         );
     }
 
