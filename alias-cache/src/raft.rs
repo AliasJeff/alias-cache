@@ -4177,6 +4177,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_old_leader_conflict_is_overwritten_after_partition_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-old-leader-recovery-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let control = TcpNetworkControl::default();
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft_with_control(1, root.join("node-1"), nodes.clone(), control.clone())
+                    .await
+            } else {
+                new_tcp_raft_joiner_with_control(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    nodes.clone(),
+                    control.clone(),
+                )
+                .await
+            }
+            .expect("tcp raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        initialize_if_pristine(&rafts[0], nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("initial leader election should finish")
+        .expect("initial leader election should succeed");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .committed_membership_config
+                        .voter_ids()
+                        .eq([1, 2, 3])
+                },
+                "initial membership should be committed",
+            )
+            .await
+            .expect("initial membership commit wait should succeed");
+
+        let initial_write = rafts[0]
+            .client_write(RaftRequest::Apply(Operation::Set {
+                key: Bytes::from_static(b"recovery-base-key"),
+                value: Bytes::from_static(b"recovery-base-value"),
+            }))
+            .await
+            .expect("initial write should commit");
+        let base_log_index = initial_write.log_id.index;
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None)
+                    .applied_index_at_least(Some(base_log_index), "base write should apply"),
+            )
+            .await
+            .expect("base write replication should finish")
+            .expect("base write apply wait should succeed");
+        }
+
+        rafts[1].runtime_config().elect(false);
+        rafts[2].runtime_config().elect(false);
+        control.block_bidirectional(1, 2).await;
+        control.block_bidirectional(1, 3).await;
+
+        let before_conflict_index = rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| metrics.last_log_index.is_some(),
+                "old leader should expose its current log index",
+            )
+            .await
+            .expect("old leader metrics should be readable")
+            .last_log_index
+            .expect("old leader log index should exist");
+        // OpenRaft keeps a leader-side client write pending while it waits for quorum.
+        // Observe the local append, then cancel only the caller so the uncommitted entry
+        // remains available for the conflict-overwrite check.
+        let stale_write = {
+            let raft = rafts[0].clone();
+            tokio::spawn(async move {
+                raft.client_write(RaftRequest::Apply(Operation::Set {
+                    key: Bytes::from_static(b"recovery-conflict-key"),
+                    value: Bytes::from_static(b"stale-value"),
+                }))
+                .await
+            })
+        };
+        let stale_log_index = timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).metrics(
+                |metrics| {
+                    metrics
+                        .last_log_index
+                        .is_some_and(|index| index > before_conflict_index)
+                },
+                "old leader should append an uncommitted conflict",
+            ),
+        )
+        .await
+        .expect("old leader conflict append should finish")
+        .expect("old leader should append the conflict")
+        .last_log_index
+        .expect("stale log index should exist");
+        stale_write.abort();
+        let _ = stale_write.await;
+        assert!(stale_log_index > before_conflict_index);
+
+        rafts[1].runtime_config().elect(true);
+        rafts[2].runtime_config().elect(true);
+        let majority_leader = timeout(Duration::from_secs(8), async {
+            loop {
+                let node2_leader = rafts[1].current_leader().await;
+                let node3_leader = rafts[2].current_leader().await;
+                if node2_leader == node3_leader && matches!(node2_leader, Some(2 | 3)) {
+                    break node2_leader.expect("majority leader should be known");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("majority should elect a new leader");
+        let majority_index = match majority_leader {
+            2 => 1,
+            3 => 2,
+            leader => panic!("unexpected majority leader {leader}"),
+        };
+
+        let committed_conflict = timeout(Duration::from_secs(5), async {
+            loop {
+                match rafts[majority_index]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"recovery-conflict-key"),
+                        value: Bytes::from_static(b"fresh-value"),
+                    }))
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    Err(error) => panic!("majority conflict write failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("majority conflict write should finish");
+        let committed_log_index = committed_conflict.log_id.index;
+        assert!(committed_log_index >= stale_log_index);
+        assert!(matches!(
+            committed_conflict.data,
+            RaftResponse::Applied(Frame::SimpleString(_))
+        ));
+
+        control.unblock_bidirectional(1, 2).await;
+        control.unblock_bidirectional(1, 3).await;
+        timeout(Duration::from_secs(12), async {
+            loop {
+                let mut states = Vec::new();
+                for raft in &rafts {
+                    let (state, applied) = raft
+                        .with_state_machine(|state_machine| {
+                            Box::pin(async move { state_machine.state_with_applied_index().await })
+                        })
+                        .await
+                        .expect("recovered state should be readable");
+                    if applied.is_none_or(|log_id| log_id.index < committed_log_index) {
+                        states.clear();
+                        break;
+                    }
+                    states.push(state);
+                }
+                if states.len() == rafts.len() && states.windows(2).all(|pair| pair[0] == pair[1]) {
+                    break states;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all nodes should converge after partition recovery");
+
+        let expected_state = rafts[majority_index]
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("expected state should be readable");
+        assert_eq!(
+            expected_state
+                .snapshot()
+                .get(&Bytes::from_static(b"recovery-conflict-key")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"fresh-value"
+            )))
+        );
+        for raft in &rafts {
+            let state = raft
+                .with_state_machine(|state_machine| {
+                    Box::pin(async move { state_machine.state().await })
+                })
+                .await
+                .expect("final state should be readable");
+            assert_eq!(state, expected_state);
+            assert_ne!(
+                state
+                    .snapshot()
+                    .get(&Bytes::from_static(b"recovery-conflict-key")),
+                Some(&crate::state_machine::Value::String(Bytes::from_static(
+                    b"stale-value"
+                )))
+            );
+        }
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn committed_expired_key_does_not_reappear_after_leader_failover() {
         let root = std::env::temp_dir().join(format!(
             "alias-cache-tcp-ttl-failover-{}-{}",
