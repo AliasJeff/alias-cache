@@ -2866,6 +2866,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_raft_snapshot_install_preserves_previous_state() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-raft-snapshot-install-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut state_machine =
+            MemStateMachine::persistent(&path).expect("persistent state machine should open");
+        let snapshot_log_id =
+            openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 3);
+        {
+            let mut inner = state_machine.inner.lock().await;
+            inner.state.apply(Operation::Set {
+                key: Bytes::from_static(b"stable"),
+                value: Bytes::from_static(b"value"),
+            });
+            inner.last_applied = Some(snapshot_log_id);
+        }
+        let snapshot = state_machine
+            .build_snapshot()
+            .await
+            .expect("stable snapshot should build");
+        state_machine
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("stable snapshot should install");
+        let persisted_before = std::fs::read(&path).expect("snapshot file should be readable");
+
+        let invalid_meta = openraft::SnapshotMeta {
+            last_log_id: Some(openraft::LogId::new(
+                <TypeConfig as RaftTypeConfig>::LeaderId::new(2, 1),
+                4,
+            )),
+            last_membership: StoredMembership::default(),
+        };
+        assert!(
+            state_machine
+                .install_snapshot(&invalid_meta, std::io::Cursor::new(b"invalid".to_vec()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state_machine
+                .state()
+                .await
+                .snapshot()
+                .get(&Bytes::from_static(b"stable")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"value"
+            )))
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("snapshot file should remain readable"),
+            persisted_before
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn raft_snapshot_chunks_are_reassembled_in_order() {
         let (mut writer, mut reader) = tokio::io::duplex(128);
         let payload = b"snapshot payload split across frames".to_vec();
