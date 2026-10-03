@@ -17,7 +17,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -126,12 +126,112 @@ const NETWORK_MAX_SNAPSHOT_SIZE: u64 = 512 * 1024 * 1024;
 const SNAPSHOT_CHECKSUM_OFFSET: u64 = 0xcbf29ce484222325;
 const SNAPSHOT_CHECKSUM_PRIME: u64 = 0x100000001b3;
 const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 2;
+const RAFT_SNAPSHOT_FILE_MAGIC: [u8; 4] = *b"ARSS";
+const RAFT_SNAPSHOT_FILE_VERSION: u16 = 1;
+const RAFT_SNAPSHOT_FILE_HEADER_LEN: usize = 4 + 2 + 8;
+const RAFT_SNAPSHOT_FILE_CHECKSUM_LEN: usize = 8;
 
 fn snapshot_checksum(data: &[u8]) -> u64 {
     data.iter()
         .fold(SNAPSHOT_CHECKSUM_OFFSET, |checksum, byte| {
             (checksum ^ u64::from(*byte)).wrapping_mul(SNAPSHOT_CHECKSUM_PRIME)
         })
+}
+
+fn persist_raft_snapshot(path: &Path, snapshot: &StoredSnapshot) -> io::Result<()> {
+    let payload = bincode::serialize(snapshot).map_err(io::Error::other)?;
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflows u64"))?;
+    let mut record = Vec::with_capacity(
+        RAFT_SNAPSHOT_FILE_HEADER_LEN + payload.len() + RAFT_SNAPSHOT_FILE_CHECKSUM_LEN,
+    );
+    record.extend_from_slice(&RAFT_SNAPSHOT_FILE_MAGIC);
+    record.extend_from_slice(&RAFT_SNAPSHOT_FILE_VERSION.to_le_bytes());
+    record.extend_from_slice(&payload_len.to_le_bytes());
+    record.extend_from_slice(&payload);
+    record.extend_from_slice(&snapshot_checksum(&record).to_le_bytes());
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary_path = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary_path)?;
+    file.write_all(&record)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary_path, path)?;
+    if let Some(parent) = path.parent() {
+        let directory = File::open(parent)?;
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+fn load_persisted_raft_snapshot(path: &Path) -> io::Result<Option<StoredSnapshot>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut record = Vec::new();
+    file.read_to_end(&mut record)?;
+    if record.len() < RAFT_SNAPSHOT_FILE_HEADER_LEN + RAFT_SNAPSHOT_FILE_CHECKSUM_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot file is truncated",
+        ));
+    }
+    if record[..4] != RAFT_SNAPSHOT_FILE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot file magic is invalid",
+        ));
+    }
+    if u16::from_le_bytes([record[4], record[5]]) != RAFT_SNAPSHOT_FILE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot file version is unsupported",
+        ));
+    }
+    let payload_len = u64::from_le_bytes(
+        record[6..14]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid snapshot length"))?,
+    );
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot length overflows usize",
+        )
+    })?;
+    let expected_len = RAFT_SNAPSHOT_FILE_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(RAFT_SNAPSHOT_FILE_CHECKSUM_LEN))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflows"))?;
+    if record.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot file length does not match header",
+        ));
+    }
+    let checksum_offset = RAFT_SNAPSHOT_FILE_HEADER_LEN + payload_len;
+    let expected_checksum =
+        u64::from_le_bytes(record[checksum_offset..].try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid snapshot checksum")
+        })?);
+    if snapshot_checksum(&record[..checksum_offset]) != expected_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot file checksum mismatch",
+        ));
+    }
+    let snapshot = bincode::deserialize(&record[RAFT_SNAPSHOT_FILE_HEADER_LEN..checksum_offset])
+        .map_err(io::Error::other)?;
+    Ok(Some(snapshot))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -624,6 +724,7 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 #[derive(Debug, Clone, Default)]
 pub struct MemStateMachine {
     inner: Arc<Mutex<MemState>>,
+    snapshot_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -644,7 +745,7 @@ struct MemState {
     snapshot_queue: Vec<Operation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSnapshot {
     data: Vec<u8>,
     last_log_id: Option<LogId>,
@@ -652,6 +753,18 @@ struct StoredSnapshot {
 }
 
 impl MemStateMachine {
+    fn persistent(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let snapshot = load_persisted_raft_snapshot(&path)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(MemState {
+                snapshot,
+                ..MemState::default()
+            })),
+            snapshot_path: Some(path),
+        })
+    }
+
     pub async fn state(&self) -> StateMachine {
         self.inner.lock().await.state.clone()
     }
@@ -961,17 +1074,21 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
             state.advance_logical_time(operation.write_time());
             let _ = state.apply(operation);
         }
+        let stored_snapshot = StoredSnapshot {
+            data,
+            last_log_id: meta.last_log_id,
+            membership: meta.last_membership.clone(),
+        };
+        if let Some(path) = &self.snapshot_path {
+            persist_raft_snapshot(path, &stored_snapshot)?;
+        }
         let mut inner = self.inner.lock().await;
         inner.state = state;
         inner.last_applied = meta.last_log_id;
         inner.membership = meta.last_membership.clone();
         inner.snapshot_state = SnapshotState::End;
         inner.snapshot_queue.clear();
-        inner.snapshot = Some(StoredSnapshot {
-            data,
-            last_log_id: meta.last_log_id,
-            membership: meta.last_membership.clone(),
-        });
+        inner.snapshot = Some(stored_snapshot);
         Ok(())
     }
 
@@ -1056,12 +1173,16 @@ impl MemStateMachine {
             )
         };
         let data = encode_raft_snapshot(&base_state, pending_operations)?;
-        let mut inner = self.inner.lock().await;
-        inner.snapshot = Some(StoredSnapshot {
+        let stored_snapshot = StoredSnapshot {
             data: data.clone(),
             last_log_id,
             membership: membership.clone(),
-        });
+        };
+        if let Some(path) = &self.snapshot_path {
+            persist_raft_snapshot(path, &stored_snapshot)?;
+        }
+        let mut inner = self.inner.lock().await;
+        inner.snapshot = Some(stored_snapshot);
         inner.snapshot_state = SnapshotState::End;
         Ok(openraft::Snapshot {
             meta: openraft::SnapshotMeta {
@@ -1876,12 +1997,14 @@ pub async fn new_file_raft(
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
     let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
+        .map_err(|_| openraft::error::Fatal::Panicked)?;
     let raft = openraft::Raft::new(
         node_id,
         Arc::new(config),
         MemNetworkFactory::new(Arc::clone(&peers)),
         log_store,
-        MemStateMachine::default(),
+        state_machine,
     )
     .await?;
     peers.lock().await.insert(node_id, raft.clone());
@@ -1951,12 +2074,14 @@ async fn new_tcp_raft_inner(
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
     let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
+        .map_err(|_| openraft::error::Fatal::Panicked)?;
     let raft = openraft::Raft::new(
         node_id,
         Arc::new(config),
         TcpNetworkFactory::new(node_id, control),
         log_store,
-        MemStateMachine::default(),
+        state_machine,
     )
     .await?;
     if bootstrap
@@ -2464,7 +2589,7 @@ mod tests {
             .block_on(reader.try_get_log_entries(1..=2))
             .expect("entries should recover");
         assert_eq!(entries, vec![first, second]);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2651,6 +2776,93 @@ mod tests {
                 .to_string()
                 .contains("unsupported raft snapshot payload version")
         );
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_persists_and_recovers_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-raft-snapshot-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut state_machine =
+            MemStateMachine::persistent(&path).expect("persistent state machine should open");
+        let snapshot_log_id =
+            openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 7);
+        {
+            let mut inner = state_machine.inner.lock().await;
+            inner.state.apply(Operation::Set {
+                key: Bytes::from_static(b"persisted"),
+                value: Bytes::from_static(b"value"),
+            });
+            inner.last_applied = Some(snapshot_log_id);
+        }
+        state_machine
+            .build_snapshot()
+            .await
+            .expect("persistent snapshot should build");
+        std::fs::write(path.with_extension("tmp"), b"partial")
+            .expect("temporary partial snapshot should be writable");
+
+        let mut reopened =
+            MemStateMachine::persistent(&path).expect("persisted snapshot should reopen");
+        let temporary_path = path.with_extension("tmp");
+        assert_eq!(std::fs::read(&temporary_path).unwrap(), b"partial");
+        let snapshot = reopened
+            .get_current_snapshot()
+            .await
+            .expect("persisted snapshot should be readable")
+            .expect("persisted snapshot should exist");
+        assert_eq!(snapshot.meta.last_log_id, Some(snapshot_log_id));
+        reopened
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("reopened snapshot should install");
+        assert_eq!(
+            reopened
+                .state()
+                .await
+                .snapshot()
+                .get(&Bytes::from_static(b"persisted")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"value"
+            )))
+        );
+        assert!(!temporary_path.exists());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(temporary_path);
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_persistence_rejects_corruption() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-raft-snapshot-corrupt-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut state_machine =
+            MemStateMachine::persistent(&path).expect("persistent state machine should open");
+        {
+            let mut inner = state_machine.inner.lock().await;
+            inner.state.apply(Operation::Set {
+                key: Bytes::from_static(b"key"),
+                value: Bytes::from_static(b"value"),
+            });
+            inner.last_applied = Some(openraft::LogId::new(
+                <TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1),
+                1,
+            ));
+        }
+        state_machine
+            .build_snapshot()
+            .await
+            .expect("persistent snapshot should build");
+        let mut bytes = std::fs::read(&path).expect("snapshot file should be readable");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&path, bytes).expect("corrupted snapshot should be writable");
+        assert!(MemStateMachine::persistent(&path).is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
