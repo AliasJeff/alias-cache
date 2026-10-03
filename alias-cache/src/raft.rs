@@ -15,7 +15,7 @@ use openraft::{
     EntryPayload, OptionalSend, RaftLogReader, RaftNetworkFactory, RaftNetworkV2, RaftTypeConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -1577,6 +1577,66 @@ pub async fn add_raft_learner(raft: &RaftHandle, node_id: NodeId, node: Node) ->
     Ok(())
 }
 
+/// Move a learner to a new network address without retaining a stale replication stream.
+///
+/// Voters must be drained before their address is changed so an old and a new endpoint
+/// cannot both participate in quorum formation.
+pub async fn update_raft_node(raft: &RaftHandle, node_id: NodeId, node: Node) -> CacheResult<()> {
+    let membership = raft
+        .wait(None)
+        .metrics(
+            |_| true,
+            format!("read raft node {node_id} membership before address update"),
+        )
+        .await
+        .map_err(|error| {
+            Error::server(format!(
+                "read raft node {node_id} membership before address update: {error}"
+            ))
+        })?
+        .membership_config;
+    if membership.membership().get_node(&node_id).is_none() {
+        return Err(Error::server(format!(
+            "raft node {node_id} is not in membership"
+        )));
+    }
+    if membership.voter_ids().any(|voter_id| voter_id == node_id) {
+        return Err(Error::invalid_config(format!(
+            "raft voter {node_id} must be drained before address update"
+        )));
+    }
+
+    let expected_node = node.clone();
+    raft.change_membership(
+        openraft::ChangeMembers::RemoveNodes(BTreeSet::from([node_id])),
+        false,
+    )
+    .await
+    .map_err(|error| Error::server(format!("remove raft node {node_id}: {error}")))?;
+    raft.add_learner(node_id, node, false)
+        .await
+        .map_err(|error| Error::server(format!("re-add raft learner {node_id}: {error}")))?;
+    raft.wait(None)
+        .metrics(
+            |metrics| {
+                metrics.membership_config.membership().get_node(&node_id) == Some(&expected_node)
+                    && metrics
+                        .committed_membership_config
+                        .membership()
+                        .get_node(&node_id)
+                        == Some(&expected_node)
+            },
+            format!("wait for raft node {node_id} address update"),
+        )
+        .await
+        .map_err(|error| {
+            Error::server(format!(
+                "wait for raft node {node_id} address update: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
 pub async fn wait_for_raft_replication(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
     raft.wait(None)
         .metrics(
@@ -2713,6 +2773,435 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_membership_change_survives_target_restart_and_leader_loss() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-membership-recovery-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+        let initial_nodes = nodes
+            .iter()
+            .take(3)
+            .map(|(id, node)| (*id, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), initial_nodes.clone()).await
+            } else if index < 3 {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    initial_nodes.clone(),
+                )
+                .await
+            } else {
+                new_tcp_raft_joiner(4, root.join("node-4"), BTreeMap::new()).await
+            }
+            .expect("tcp raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        initialize_if_pristine(&rafts[0], initial_nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..3] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .committed_membership_config
+                        .voter_ids()
+                        .eq([1, 2, 3])
+                },
+                "initial membership should be committed",
+            )
+            .await
+            .expect("initial membership commit wait should finish");
+
+        add_raft_learner(&rafts[0], 4, nodes[&4].clone())
+            .await
+            .expect("learner should be added");
+        enable_raft_runtime(&rafts[3]);
+        timeout(
+            Duration::from_secs(8),
+            wait_for_raft_replication(&rafts[0], 4),
+        )
+        .await
+        .expect("learner replication should finish")
+        .expect("learner should catch up");
+        add_raft_learner(&rafts[0], 4, nodes[&4].clone())
+            .await
+            .expect("re-adding an existing learner should be accepted");
+        wait_for_raft_replication(&rafts[0], 4)
+            .await
+            .expect("re-added learner should remain caught up");
+
+        let target = rafts.pop().expect("target raft should exist");
+        target.shutdown().await.expect("target raft should stop");
+        let (target_shutdown, target_task) = rpc_tasks.pop().expect("target rpc should exist");
+        target_shutdown
+            .send(true)
+            .expect("target rpc shutdown should send");
+        target_task.await.expect("target rpc task should stop");
+
+        let restarted = restart_tcp_raft(4, root.join("node-4"), nodes.clone())
+            .await
+            .expect("target raft should restart");
+        let listener = TcpListener::bind(nodes[&4].addr.clone())
+            .await
+            .expect("restarted target listener should bind");
+        let (restart_shutdown_tx, restart_shutdown_rx) = tokio::sync::watch::channel(false);
+        let rpc_raft = restarted.clone();
+        let restart_task = tokio::spawn(async move {
+            serve_raft_rpc(listener, rpc_raft, restart_shutdown_rx)
+                .await
+                .expect("restarted rpc server should stop");
+        });
+        enable_raft_runtime(&restarted);
+        rafts.push(restarted);
+        rpc_tasks.push((restart_shutdown_tx, restart_task));
+
+        wait_for_raft_replication(&rafts[0], 4)
+            .await
+            .expect("restarted learner should catch up");
+        add_raft_learner(&rafts[0], 4, nodes[&4].clone())
+            .await
+            .expect("re-adding a restarted learner should be accepted");
+        wait_for_raft_replication(&rafts[0], 4)
+            .await
+            .expect("restarted learner should remain caught up");
+
+        let old_leader = rafts.remove(0);
+        old_leader.shutdown().await.expect("old leader should stop");
+        let (leader_shutdown, leader_task) = rpc_tasks.remove(0);
+        leader_shutdown
+            .send(true)
+            .expect("old leader rpc shutdown should send");
+        leader_task.await.expect("old leader rpc task should stop");
+
+        timeout(Duration::from_secs(8), async {
+            loop {
+                let node2_leader = rafts[0].current_leader().await;
+                let node3_leader = rafts[1].current_leader().await;
+                if node2_leader == node3_leader && matches!(node2_leader, Some(2 | 3)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("remaining voters should elect a leader");
+
+        let leader_index = if rafts[0].current_leader().await == Some(2) {
+            0
+        } else {
+            1
+        };
+        promote_raft_learner(&rafts[leader_index], 4)
+            .await
+            .expect("new leader should promote the restarted learner");
+        promote_raft_learner(&rafts[leader_index], 4)
+            .await
+            .expect("repeating promotion should be accepted");
+
+        for raft in &rafts {
+            timeout(
+                Duration::from_secs(8),
+                raft.wait(None).metrics(
+                    |metrics| metrics.membership_config.voter_ids().eq([1, 2, 3, 4]),
+                    "promoted learner should be a voter",
+                ),
+            )
+            .await
+            .expect("promotion should reach every live node")
+            .expect("promotion metrics wait should succeed");
+        }
+
+        let response = timeout(Duration::from_secs(8), async {
+            loop {
+                match rafts[leader_index]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"membership-recovery-key"),
+                        value: Bytes::from_static(b"membership-recovery-value"),
+                    }))
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    Err(error) => panic!("write after membership recovery failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("write after membership recovery should finish");
+        assert!(matches!(
+            response.data,
+            RaftResponse::Applied(Frame::SimpleString(_))
+        ));
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tcp_raft_node_address_update_rebuilds_replication_route() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-tcp-membership-address-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("rpc listener should bind");
+            let address = listener.local_addr().expect("rpc address should resolve");
+            listeners.push(listener);
+            nodes.insert(
+                (index + 1) as NodeId,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+        }
+        let initial_nodes = nodes
+            .iter()
+            .take(3)
+            .map(|(id, node)| (*id, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let raft = if index == 0 {
+                new_tcp_raft(1, root.join("node-1"), initial_nodes.clone()).await
+            } else if index < 3 {
+                new_tcp_raft_joiner(
+                    (index + 1) as NodeId,
+                    root.join(format!("node-{}", index + 1)),
+                    initial_nodes.clone(),
+                )
+                .await
+            } else {
+                new_tcp_raft_joiner(4, root.join("node-4"), BTreeMap::new()).await
+            }
+            .expect("tcp raft node should start");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, rpc_raft, shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        initialize_if_pristine(&rafts[0], initial_nodes.clone())
+            .await
+            .expect("cluster should initialize");
+        for raft in &rafts[1..3] {
+            enable_raft_runtime(raft);
+        }
+        timeout(
+            Duration::from_secs(5),
+            rafts[0].wait(None).current_leader(1, "node 1 should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+        rafts[0]
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics
+                        .committed_membership_config
+                        .voter_ids()
+                        .eq([1, 2, 3])
+                },
+                "initial membership should be committed",
+            )
+            .await
+            .expect("initial membership commit wait should finish");
+
+        add_raft_learner(&rafts[0], 4, nodes[&4].clone())
+            .await
+            .expect("learner should be added");
+        enable_raft_runtime(&rafts[3]);
+        timeout(
+            Duration::from_secs(8),
+            wait_for_raft_replication(&rafts[0], 4),
+        )
+        .await
+        .expect("learner replication should finish")
+        .expect("learner should catch up");
+
+        let new_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("new rpc listener should bind");
+        let new_address = new_listener
+            .local_addr()
+            .expect("new rpc address should resolve")
+            .to_string();
+        let (new_shutdown_tx, new_shutdown_rx) = tokio::sync::watch::channel(false);
+        let rpc_raft = rafts[3].clone();
+        let new_task = tokio::spawn(async move {
+            serve_raft_rpc(new_listener, rpc_raft, new_shutdown_rx)
+                .await
+                .expect("new rpc server should stop");
+        });
+
+        timeout(
+            Duration::from_secs(8),
+            update_raft_node(
+                &rafts[0],
+                4,
+                Node {
+                    addr: new_address.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("learner address update should finish")
+        .expect("learner address should update");
+        for raft in &rafts[..3] {
+            timeout(
+                Duration::from_secs(5),
+                raft.wait(None).metrics(
+                    |metrics| {
+                        metrics
+                            .membership_config
+                            .membership()
+                            .get_node(&4)
+                            .is_some_and(|node| node.addr == new_address)
+                    },
+                    "updated learner address should replicate",
+                ),
+            )
+            .await
+            .expect("updated address should reach voters")
+            .expect("updated address metrics wait should succeed");
+        }
+
+        let (old_target_shutdown, old_target_task) = rpc_tasks.swap_remove(3);
+        old_target_shutdown
+            .send(true)
+            .expect("old target rpc shutdown should send");
+        old_target_task
+            .await
+            .expect("old target rpc task should stop");
+
+        let response = timeout(Duration::from_secs(8), async {
+            loop {
+                match rafts[0]
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"address-update-key"),
+                        value: Bytes::from_static(b"address-update-value"),
+                    }))
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    Err(error) => panic!("write after address update failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("write after address update should finish");
+        let final_log_index = response.log_id.index;
+        timeout(
+            Duration::from_secs(8),
+            wait_for_raft_replication(&rafts[0], 4),
+        )
+        .await
+        .expect("updated learner replication should finish")
+        .expect("learner should replicate through the new address");
+        rafts[3]
+            .wait(None)
+            .applied_index_at_least(Some(final_log_index), "updated learner should apply write")
+            .await
+            .expect("updated learner should apply write");
+        let state = rafts[3]
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("updated learner state should be readable");
+        assert_eq!(
+            state
+                .snapshot()
+                .get(&Bytes::from_static(b"address-update-key")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"address-update-value"
+            )))
+        );
+
+        for raft in rafts {
+            raft.shutdown().await.expect("raft node should stop");
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).expect("rpc shutdown should send");
+            task.await.expect("rpc task should join");
+        }
+        new_shutdown_tx
+            .send(true)
+            .expect("new target rpc shutdown should send");
+        new_task.await.expect("new target rpc task should join");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn raft_membership_refuses_to_remove_last_voter() {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
         let raft = new_mem_raft(1, Arc::clone(&peers))
@@ -2739,6 +3228,16 @@ mod tests {
             .await
             .expect_err("last voter drain should fail");
         assert!(error.to_string().contains("last raft voter"));
+        let error = update_raft_node(
+            &raft,
+            1,
+            Node {
+                addr: "mem://new-address".into(),
+            },
+        )
+        .await
+        .expect_err("voter address update should require a drain");
+        assert!(error.to_string().contains("must be drained"));
         raft.shutdown().await.expect("raft should shut down");
     }
 
