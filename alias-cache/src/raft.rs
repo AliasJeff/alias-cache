@@ -2119,6 +2119,17 @@ pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheRe
         format!("wait before promoting raft learner {node_id}"),
     )
     .await?;
+    raft.wait(None)
+        .metrics(
+            |metrics| metrics.current_leader == Some(metrics.id),
+            format!("wait for local leader before promoting raft learner {node_id}"),
+        )
+        .await
+        .map_err(|error| {
+            Error::server(format!(
+                "wait for local leader before promoting raft learner {node_id}: {error}"
+            ))
+        })?;
     let mut voters = raft.voter_ids().collect::<Vec<_>>();
     if !voters.contains(&node_id) {
         voters.push(node_id);
@@ -2536,6 +2547,16 @@ mod tests {
             .await
             .expect("snapshot install should succeed");
         assert_eq!(restored.state().await, expected_snapshot_state);
+        let repeated_snapshot = restored
+            .get_current_snapshot()
+            .await
+            .expect("repeated snapshot should be readable")
+            .expect("repeated snapshot should exist");
+        restored
+            .install_snapshot(&repeated_snapshot.meta, repeated_snapshot.snapshot)
+            .await
+            .expect("repeated snapshot install should succeed");
+        assert_eq!(restored.state().await, expected_snapshot_state);
         assert_eq!(
             restored
                 .state()
@@ -2627,6 +2648,33 @@ mod tests {
             .await
             .expect_err("oversized chunk should be rejected");
         assert!(error.to_string().contains("chunk length is invalid"));
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_send_honors_replication_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("snapshot listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("snapshot listener address should resolve")
+            .to_string();
+        let meta = openraft::SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        };
+        let result = send_snapshot_rpc(
+            &address,
+            Vote::new_committed(1, 1),
+            meta,
+            vec![1_u8; SNAPSHOT_CHUNK_SIZE],
+            async { ReplicationClosed::new("test cancellation") },
+            &RPCOption::new(Duration::from_secs(1)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(StreamingError::Closed(_))));
+        drop(listener);
     }
 
     #[tokio::test]
