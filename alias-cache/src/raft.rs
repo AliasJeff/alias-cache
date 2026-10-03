@@ -3018,6 +3018,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raft_snapshot_tcp_transport_handles_payload_larger_than_one_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("snapshot listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("snapshot listener address should resolve")
+            .to_string();
+        let vote = Vote::new_committed(1, 1);
+        let meta = openraft::SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        };
+        let expected_len = NETWORK_MAX_FRAME + 1;
+        let expected_meta = meta.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("snapshot client should connect");
+            let request: NetworkRequest = read_network_message(&mut stream)
+                .await
+                .expect("snapshot start should decode");
+            let NetworkRequest::SnapshotStart {
+                vote: received_vote,
+                total_len,
+                checksum,
+                meta: received_meta,
+            } = request
+            else {
+                panic!("snapshot request should start a chunked transfer");
+            };
+            assert_eq!(received_vote, vote);
+            assert_eq!(received_meta, expected_meta);
+            assert_eq!(total_len, expected_len as u64);
+            let snapshot = read_snapshot_chunks(&mut stream, total_len, checksum)
+                .await
+                .expect("large snapshot should be reassembled");
+            assert_eq!(snapshot.len(), expected_len);
+            assert!(snapshot.iter().all(|byte| *byte == 0x5a));
+            write_network_message(
+                &mut stream,
+                &NetworkResponse::Snapshot(Ok(SnapshotResponse::new(received_vote))),
+            )
+            .await
+            .expect("snapshot response should be written");
+        });
+
+        let result = send_snapshot_rpc(
+            &address,
+            vote,
+            meta,
+            vec![0x5a; expected_len],
+            std::future::pending(),
+            &RPCOption::new(Duration::from_secs(10)),
+        )
+        .await
+        .expect("large snapshot should be sent");
+        assert!(matches!(result, NetworkResponse::Snapshot(Ok(_))));
+        server.await.expect("snapshot server should finish");
+    }
+
+    #[tokio::test]
     async fn raft_snapshot_replays_operations_collected_during_start() {
         let state_machine = MemStateMachine::default();
         let base_state = {
