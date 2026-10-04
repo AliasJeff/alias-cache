@@ -66,6 +66,7 @@ pub enum RaftResponse {
 }
 
 static NEXT_CLIENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn new_client_request_id() -> ClientRequestId {
@@ -108,6 +109,7 @@ enum NetworkRequest {
         vote: Vote,
         total_len: u64,
         checksum: u64,
+        offset: u64,
         meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
     },
 }
@@ -117,6 +119,7 @@ enum NetworkResponse {
     Append(Result<AppendEntriesResponse<TypeConfig>, String>),
     Vote(Result<VoteResponse<TypeConfig>, String>),
     Snapshot(Result<SnapshotResponse<TypeConfig>, String>),
+    SnapshotResume(Result<u64, String>),
     Client(Result<Frame, String>),
 }
 
@@ -1427,6 +1430,7 @@ async fn send_snapshot_rpc(
             vote,
             total_len,
             checksum: snapshot_checksum(&data),
+            offset: 0,
             meta,
         },
     )
@@ -1436,9 +1440,39 @@ async fn send_snapshot_rpc(
             error.to_string(),
         ))
     })?;
+    let offset = match read_network_response(&mut stream, option)
+        .await
+        .map_err(StreamingError::Network)?
+    {
+        NetworkResponse::SnapshotResume(Ok(offset)) => offset,
+        NetworkResponse::SnapshotResume(Err(error)) => {
+            return Err(StreamingError::Network(
+                openraft::error::NetworkError::from_string(error),
+            ));
+        }
+        _ => {
+            return Err(StreamingError::Network(
+                openraft::error::NetworkError::from_string(
+                    "unexpected raft snapshot resume response",
+                ),
+            ));
+        }
+    };
+    let offset = usize::try_from(offset).map_err(|_| {
+        StreamingError::Network(openraft::error::NetworkError::from_string(
+            "raft snapshot resume offset overflows usize",
+        ))
+    })?;
+    if offset > data.len() {
+        return Err(StreamingError::Network(
+            openraft::error::NetworkError::from_string(
+                "raft snapshot resume offset exceeds snapshot length",
+            ),
+        ));
+    }
 
     tokio::pin!(cancel);
-    for chunk in data.chunks(SNAPSHOT_CHUNK_SIZE) {
+    for chunk in data[offset..].chunks(SNAPSHOT_CHUNK_SIZE) {
         tokio::select! {
             closed = &mut cancel => return Err(StreamingError::Closed(closed)),
             result = write_raw_frame(&mut stream, chunk) => {
@@ -1735,9 +1769,19 @@ async fn handle_raft_rpc(
             vote,
             total_len,
             checksum,
+            offset: _requested_offset,
             meta,
         } => {
-            let snapshot = read_snapshot_chunks(&mut stream, total_len, checksum).await?;
+            let path = snapshot_transfer_path(total_len, checksum);
+            let resume = prepare_snapshot_transfer(&path, total_len, checksum)
+                .map_err(|error| error.to_string());
+            write_network_message(&mut stream, &NetworkResponse::SnapshotResume(resume)).await?;
+            let offset = match prepare_snapshot_transfer(&path, total_len, checksum) {
+                Ok(offset) => offset,
+                Err(_) => return Ok(()),
+            };
+            let snapshot =
+                receive_snapshot_chunks(&mut stream, total_len, checksum, &path, offset).await?;
             let response = raft
                 .install_full_snapshot(
                     vote,
@@ -1748,7 +1792,11 @@ async fn handle_raft_rpc(
                 )
                 .await
                 .map_err(|error| error.to_string());
-            NetworkResponse::Snapshot(response)
+            if response.is_ok() {
+                let _ = fs::remove_file(&path);
+            }
+            write_network_message(&mut stream, &NetworkResponse::Snapshot(response)).await?;
+            return Ok(());
         }
     };
     write_network_message(&mut stream, &response).await
@@ -1775,6 +1823,109 @@ async fn read_network_message<T: for<'de> Deserialize<'de>>(
         .map_err(|error| Error::server(format!("decode raft rpc frame: {error}")))
 }
 
+fn snapshot_transfer_path(total_len: u64, checksum: u64) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "alias-cache-raft-transfer-{total_len}-{checksum:016x}.part"
+    ))
+}
+
+fn prepare_snapshot_transfer(path: &Path, total_len: u64, checksum: u64) -> io::Result<u64> {
+    if total_len > NETWORK_MAX_SNAPSHOT_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot exceeds maximum size",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            OpenOptions::new().write(true).create_new(true).open(path)?;
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata()?.len();
+    if length > total_len {
+        drop(file);
+        OpenOptions::new().write(true).truncate(true).open(path)?;
+        return Ok(0);
+    }
+    if length == total_len {
+        let mut data = Vec::with_capacity(usize::try_from(length).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot length overflows usize",
+            )
+        })?);
+        File::open(path)?.read_to_end(&mut data)?;
+        if snapshot_checksum(&data) == checksum {
+            return Ok(length);
+        }
+        drop(file);
+        OpenOptions::new().write(true).truncate(true).open(path)?;
+        return Ok(0);
+    }
+    Ok(length)
+}
+
+async fn receive_snapshot_chunks<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    total_len: u64,
+    expected_checksum: u64,
+    path: &Path,
+    offset: u64,
+) -> CacheResult<Vec<u8>> {
+    let total_len = usize::try_from(total_len)
+        .map_err(|_| Error::protocol("raft snapshot length overflows usize"))?;
+    let mut received = usize::try_from(offset)
+        .map_err(|_| Error::protocol("raft snapshot offset overflows usize"))?;
+    if received > total_len {
+        return Err(Error::protocol("raft snapshot offset exceeds length"));
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| Error::io("open raft snapshot transfer file", error))?;
+    while received < total_len {
+        let mut header = [0_u8; 4];
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| Error::io("read raft snapshot chunk header", error))?;
+        let length = u32::from_be_bytes(header) as usize;
+        let remaining = total_len - received;
+        if length == 0 || length > NETWORK_MAX_FRAME || length > remaining {
+            return Err(Error::protocol("raft snapshot chunk length is invalid"));
+        }
+        let mut chunk = vec![0_u8; length];
+        stream
+            .read_exact(&mut chunk)
+            .await
+            .map_err(|error| Error::io("read raft snapshot chunk", error))?;
+        file.write_all(&chunk)
+            .map_err(|error| Error::io("write raft snapshot transfer file", error))?;
+        received += length;
+    }
+    file.sync_all()
+        .map_err(|error| Error::io("sync raft snapshot transfer file", error))?;
+    drop(file);
+
+    let mut data = Vec::with_capacity(total_len);
+    File::open(path)
+        .map_err(|error| Error::io("open raft snapshot transfer file", error))?
+        .read_to_end(&mut data)
+        .map_err(|error| Error::io("read raft snapshot transfer file", error))?;
+    if snapshot_checksum(&data) != expected_checksum {
+        let _ = fs::remove_file(path);
+        return Err(Error::protocol("raft snapshot checksum mismatch"));
+    }
+    Ok(data)
+}
+
+#[cfg(test)]
 async fn read_snapshot_chunks<R: AsyncRead + Unpin>(
     stream: &mut R,
     total_len: u64,
@@ -3046,6 +3197,7 @@ mod tests {
                 total_len,
                 checksum,
                 meta: received_meta,
+                offset: _,
             } = request
             else {
                 panic!("snapshot request should start a chunked transfer");
@@ -3053,6 +3205,9 @@ mod tests {
             assert_eq!(received_vote, vote);
             assert_eq!(received_meta, expected_meta);
             assert_eq!(total_len, expected_len as u64);
+            write_network_message(&mut stream, &NetworkResponse::SnapshotResume(Ok(0)))
+                .await
+                .expect("snapshot resume response should be written");
             let snapshot = read_snapshot_chunks(&mut stream, total_len, checksum)
                 .await
                 .expect("large snapshot should be reassembled");
@@ -3078,6 +3233,146 @@ mod tests {
         .expect("large snapshot should be sent");
         assert!(matches!(result, NetworkResponse::Snapshot(Ok(_))));
         server.await.expect("snapshot server should finish");
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_tcp_transport_resumes_after_connection_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("snapshot listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("snapshot listener address should resolve")
+            .to_string();
+        let vote = Vote::new_committed(1, 1);
+        let meta = openraft::SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        };
+        let data = vec![0x37; SNAPSHOT_CHUNK_SIZE * 2];
+        let total_len = data.len() as u64;
+        let checksum = snapshot_checksum(&data);
+        let transfer_path = snapshot_transfer_path(total_len, checksum);
+        let _ = fs::remove_file(&transfer_path);
+        let expected_meta = meta.clone();
+        let server_data = data.clone();
+        let server_transfer_path = transfer_path.clone();
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener
+                .accept()
+                .await
+                .expect("first client should connect");
+            let first_request: NetworkRequest = read_network_message(&mut first_stream)
+                .await
+                .expect("first snapshot start should decode");
+            let NetworkRequest::SnapshotStart {
+                vote: first_vote,
+                total_len: first_total_len,
+                checksum: first_checksum,
+                meta: first_meta,
+                ..
+            } = first_request
+            else {
+                panic!("first request should start a snapshot");
+            };
+            assert_eq!(first_vote, vote);
+            assert_eq!(first_total_len, total_len);
+            assert_eq!(first_checksum, checksum);
+            assert_eq!(first_meta, expected_meta);
+            let first_offset =
+                prepare_snapshot_transfer(&server_transfer_path, total_len, checksum)
+                .expect("first transfer should prepare");
+            assert_eq!(first_offset, 0);
+            write_network_message(
+                &mut first_stream,
+                &NetworkResponse::SnapshotResume(Ok(first_offset)),
+            )
+            .await
+            .expect("first resume response should be written");
+            let mut header = [0_u8; 4];
+            first_stream
+                .read_exact(&mut header)
+                .await
+                .expect("first chunk header should be read");
+            let first_chunk_len = u32::from_be_bytes(header) as usize;
+            assert_eq!(first_chunk_len, SNAPSHOT_CHUNK_SIZE);
+            let mut first_chunk = vec![0_u8; first_chunk_len];
+            first_stream
+                .read_exact(&mut first_chunk)
+                .await
+                .expect("first chunk should be read");
+            let mut transfer = OpenOptions::new()
+                .append(true)
+                .open(&server_transfer_path)
+                .expect("transfer file should open");
+            transfer
+                .write_all(&first_chunk)
+                .expect("first chunk should be persisted");
+            transfer.sync_all().expect("first chunk should sync");
+            drop(first_stream);
+
+            let (mut second_stream, _) = listener
+                .accept()
+                .await
+                .expect("second client should connect");
+            let second_request: NetworkRequest = read_network_message(&mut second_stream)
+                .await
+                .expect("second snapshot start should decode");
+            let NetworkRequest::SnapshotStart { .. } = second_request else {
+                panic!("second request should start a snapshot");
+            };
+            let second_offset =
+                prepare_snapshot_transfer(&server_transfer_path, total_len, checksum)
+                .expect("second transfer should prepare");
+            assert_eq!(second_offset, SNAPSHOT_CHUNK_SIZE as u64);
+            write_network_message(
+                &mut second_stream,
+                &NetworkResponse::SnapshotResume(Ok(second_offset)),
+            )
+            .await
+            .expect("second resume response should be written");
+            let snapshot = receive_snapshot_chunks(
+                &mut second_stream,
+                total_len,
+                checksum,
+                &server_transfer_path,
+                second_offset,
+            )
+            .await
+            .expect("second transfer should finish");
+            assert_eq!(snapshot, server_data);
+            write_network_message(
+                &mut second_stream,
+                &NetworkResponse::Snapshot(Ok(SnapshotResponse::new(vote))),
+            )
+            .await
+            .expect("final snapshot response should be written");
+            let _ = fs::remove_file(server_transfer_path);
+        });
+
+        let first_result = send_snapshot_rpc(
+            &address,
+            vote,
+            meta.clone(),
+            data.clone(),
+            std::future::pending(),
+            &RPCOption::new(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(first_result.is_err());
+        let second_result = send_snapshot_rpc(
+            &address,
+            vote,
+            meta,
+            data,
+            std::future::pending(),
+            &RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .expect("resumed snapshot should finish");
+        assert!(matches!(second_result, NetworkResponse::Snapshot(Ok(_))));
+        server.await.expect("snapshot server should finish");
+        assert!(!transfer_path.exists());
     }
 
     #[tokio::test]
