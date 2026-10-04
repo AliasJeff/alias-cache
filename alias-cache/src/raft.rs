@@ -1410,6 +1410,7 @@ async fn send_snapshot_rpc(
     cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
     option: &RPCOption,
 ) -> Result<NetworkResponse, StreamingError<TypeConfig>> {
+    tokio::pin!(cancel);
     let mut stream = connect(address, option)
         .await
         .map_err(StreamingError::from)?;
@@ -1424,26 +1425,25 @@ async fn send_snapshot_rpc(
         ));
     }
 
-    write_network_message(
-        &mut stream,
-        &NetworkRequest::SnapshotStart {
-            vote,
-            total_len,
-            checksum: snapshot_checksum(&data),
-            offset: 0,
-            meta,
-        },
-    )
-    .await
-    .map_err(|error| {
-        StreamingError::Network(openraft::error::NetworkError::from_string(
-            error.to_string(),
-        ))
-    })?;
-    let offset = match read_network_response(&mut stream, option)
-        .await
-        .map_err(StreamingError::Network)?
-    {
+    let start_request = NetworkRequest::SnapshotStart {
+        vote,
+        total_len,
+        checksum: snapshot_checksum(&data),
+        offset: 0,
+        meta,
+    };
+
+    tokio::select! {
+        closed = &mut cancel => return Err(StreamingError::Closed(closed)),
+        result = write_network_message(&mut stream, &start_request) => result.map_err(|error| StreamingError::Network(
+            openraft::error::NetworkError::from_string(error.to_string())
+        ))?,
+    }
+    let offset_response = tokio::select! {
+        closed = &mut cancel => return Err(StreamingError::Closed(closed)),
+        result = read_network_response(&mut stream, option) => result.map_err(StreamingError::Network)?,
+    };
+    let offset = match offset_response {
         NetworkResponse::SnapshotResume(Ok(offset)) => offset,
         NetworkResponse::SnapshotResume(Err(error)) => {
             return Err(StreamingError::Network(
@@ -1471,7 +1471,6 @@ async fn send_snapshot_rpc(
         ));
     }
 
-    tokio::pin!(cancel);
     for chunk in data[offset..].chunks(SNAPSHOT_CHUNK_SIZE) {
         tokio::select! {
             closed = &mut cancel => return Err(StreamingError::Closed(closed)),
@@ -3281,7 +3280,7 @@ mod tests {
             assert_eq!(first_meta, expected_meta);
             let first_offset =
                 prepare_snapshot_transfer(&server_transfer_path, total_len, checksum)
-                .expect("first transfer should prepare");
+                    .expect("first transfer should prepare");
             assert_eq!(first_offset, 0);
             write_network_message(
                 &mut first_stream,
@@ -3323,7 +3322,7 @@ mod tests {
             };
             let second_offset =
                 prepare_snapshot_transfer(&server_transfer_path, total_len, checksum)
-                .expect("second transfer should prepare");
+                    .expect("second transfer should prepare");
             assert_eq!(second_offset, SNAPSHOT_CHUNK_SIZE as u64);
             write_network_message(
                 &mut second_stream,
