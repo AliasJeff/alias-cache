@@ -7,5 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 alias-cache = { path = "../alias-cache" }
+clap.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
