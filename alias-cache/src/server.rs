@@ -180,10 +180,14 @@ async fn handle_connection(
                 for frame in frames {
                     let response = match command_from_frame(frame) {
                         Ok(request) => {
-                            let mut state = node_state.lock().await;
-                            match state.execute(request) {
-                                Ok(response) => response,
-                                Err(error) => Frame::error(format!("ERR {error}")),
+                            if let Some(response) = connection_command(&request) {
+                                response
+                            } else {
+                                let mut state = node_state.lock().await;
+                                match state.execute(request) {
+                                    Ok(response) => response,
+                                    Err(error) => Frame::error(format!("ERR {error}")),
+                                }
                             }
                         }
                         Err(error) => Frame::error(format!("ERR {error}")),
@@ -251,16 +255,42 @@ async fn handle_raft_connection(
     }
 }
 
+/// Connection-level commands that never touch the replicated state machine.
+///
+/// PING and ECHO observe no state, so any node answers them locally without
+/// leader redirection; a follower must stay usable as a liveness endpoint.
+fn connection_command(request: &crate::protocol::Request) -> Option<Frame> {
+    let crate::protocol::Request::Command(arguments) = request;
+    let command = arguments.first()?;
+    if command.eq_ignore_ascii_case(b"PING") {
+        return Some(match arguments.len() {
+            1 => Frame::simple_string("PONG"),
+            2 => Frame::bulk_string(arguments[1].clone()),
+            _ => Frame::error("ERR wrong number of arguments for 'ping' command"),
+        });
+    }
+    if command.eq_ignore_ascii_case(b"ECHO") {
+        return Some(match arguments.len() {
+            2 => Frame::bulk_string(arguments[1].clone()),
+            _ => Frame::error("ERR wrong number of arguments for 'echo' command"),
+        });
+    }
+    None
+}
+
 async fn handle_transaction_command(
     raft: &RaftHandle,
     transaction: &mut Option<Vec<crate::protocol::Request>>,
     request: crate::protocol::Request,
     sentinel_context: &SentinelContext,
 ) -> Frame {
-    if transaction.is_none()
-        && let Some(response) = sentinel::execute(raft, sentinel_context, &request).await
-    {
-        return response;
+    if transaction.is_none() {
+        if let Some(response) = connection_command(&request) {
+            return response;
+        }
+        if let Some(response) = sentinel::execute(raft, sentinel_context, &request).await {
+            return response;
+        }
     }
     let crate::protocol::Request::Command(arguments) = &request;
     let command = arguments.first().map(|argument| argument.as_ref());
@@ -373,17 +403,35 @@ mod tests {
         ))
     }
 
-    async fn read_frame(stream: &mut TcpStream) -> Frame {
-        let mut decoder = crate::protocol::Decoder::new(crate::protocol::ProtocolLimits::default());
-        let mut buffer = [0_u8; 256];
-        loop {
-            let read = timeout(Duration::from_secs(5), stream.read(&mut buffer))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_ne!(read, 0);
-            if let Some(frame) = decoder.push(&buffer[..read]).unwrap().into_iter().next() {
-                return frame;
+    /// Buffered RESP frame reader that keeps decoder state across reads, so
+    /// multiple responses arriving in one TCP segment are not lost.
+    struct FrameReader {
+        decoder: crate::protocol::Decoder,
+        pending: std::collections::VecDeque<Frame>,
+        buffer: [u8; 256],
+    }
+
+    impl FrameReader {
+        fn new() -> Self {
+            Self {
+                decoder: crate::protocol::Decoder::new(crate::protocol::ProtocolLimits::default()),
+                pending: std::collections::VecDeque::new(),
+                buffer: [0_u8; 256],
+            }
+        }
+
+        async fn next_frame(&mut self, stream: &mut TcpStream) -> Frame {
+            loop {
+                if let Some(frame) = self.pending.pop_front() {
+                    return frame;
+                }
+                let read = timeout(Duration::from_secs(5), stream.read(&mut self.buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(read, 0);
+                self.pending
+                    .extend(self.decoder.push(&self.buffer[..read]).unwrap());
             }
         }
     }
@@ -531,11 +579,15 @@ mod tests {
         let mut writer = TcpStream::connect(cluster.client_addrs[leader])
             .await
             .unwrap();
+        let mut writer_frames = FrameReader::new();
         writer
             .write_all(b"*3\r\n$3\r\nSET\r\n$8\r\nread-key\r\n$10\r\nread-value\r\n")
             .await
             .unwrap();
-        assert_eq!(read_frame(&mut writer).await, Frame::simple_string("OK"));
+        assert_eq!(
+            writer_frames.next_frame(&mut writer).await,
+            Frame::simple_string("OK")
+        );
 
         // The follower cannot pass a linearizable read barrier, so the read
         // must be redirected to the leader and answered with the same value
@@ -543,12 +595,13 @@ mod tests {
         let mut reader = TcpStream::connect(cluster.client_addrs[follower])
             .await
             .unwrap();
+        let mut reader_frames = FrameReader::new();
         reader
             .write_all(b"*2\r\n$3\r\nGET\r\n$8\r\nread-key\r\n")
             .await
             .unwrap();
         assert_eq!(
-            read_frame(&mut reader).await,
+            reader_frames.next_frame(&mut reader).await,
             Frame::bulk_string("read-value")
         );
 
@@ -647,6 +700,73 @@ mod tests {
             output.extend_from_slice(&buffer[..read]);
         }
         assert_eq!(&output[..expected_prefix.len()], expected_prefix);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn connection_commands_answer_ping_and_echo_without_raft() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: unique_server_dir("connection-commands"),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_dir = config.data_dir.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let limits = config.protocol_limits();
+        let sentinel_context = SentinelContext::from_config(&config);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut frames = FrameReader::new();
+        client
+            .write_all(
+                b"*1\r\n$4\r\nPING\r\n\
+                *2\r\n$4\r\nPING\r\n$5\r\nhello\r\n\
+                *2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n\
+                *1\r\n$4\r\nECHO\r\n\
+                *3\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("PONG")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::bulk_string("hello")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::bulk_string("hello")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::error("ERR wrong number of arguments for 'echo' command")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::error("ERR wrong number of arguments for 'ping' command")
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = task.await;
