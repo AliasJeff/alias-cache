@@ -1043,10 +1043,10 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
                     RaftResponse::Noop
                 }
             };
-            if inner.snapshot_state == SnapshotState::Start {
-                if let Some(operation) = snapshot_operation {
-                    inner.snapshot_queue.push(operation);
-                }
+            if inner.snapshot_state == SnapshotState::Start
+                && let Some(operation) = snapshot_operation
+            {
+                inner.snapshot_queue.push(operation);
             }
             drop(inner);
             if let Some(responder) = responder {

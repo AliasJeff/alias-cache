@@ -689,7 +689,7 @@ impl StateMachine {
 
     fn execute_mset(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("MSET", &arguments, 3)?;
-        if (arguments.len() - 1) % 2 != 0 {
+        if !(arguments.len() - 1).is_multiple_of(2) {
             return Err(Error::protocol("MSET requires key/value pairs"));
         }
         let mut pairs = Vec::with_capacity((arguments.len() - 1) / 2);
