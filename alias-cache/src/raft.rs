@@ -843,9 +843,20 @@ pub async fn execute_client_request_with_id(
         .map_err(|error| format!("read raft state machine: {error}"))?
         .map_err(|error| error.to_string())?;
     let Some(operation) = operation else {
-        raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+        // A follower cannot establish a linearizable read barrier; redirect so
+        // the caller forwards the read to the leader, exactly like writes.
+        if let Err(error) = raft
+            .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
             .await
-            .map_err(|error| format!("raft read barrier failed: {error}"))?;
+        {
+            if let Some(forward) = error.forward_to_leader() {
+                if let Some(node) = &forward.leader_node {
+                    return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
+                }
+                return Err("raft leader is not known".to_string());
+            }
+            return Err(format!("raft read barrier failed: {error}"));
+        }
         return Ok(ClientRequestOutcome::Applied(response));
     };
     let result = raft.client_write(RaftRequest::Apply(operation)).await;

@@ -373,6 +373,188 @@ mod tests {
         ))
     }
 
+    async fn read_frame(stream: &mut TcpStream) -> Frame {
+        let mut decoder = crate::protocol::Decoder::new(crate::protocol::ProtocolLimits::default());
+        let mut buffer = [0_u8; 256];
+        loop {
+            let read = timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            if let Some(frame) = decoder.push(&buffer[..read]).unwrap().into_iter().next() {
+                return frame;
+            }
+        }
+    }
+
+    /// A real three-node cluster serving RESP connections through the
+    /// production server path, used by cluster-level connection tests.
+    struct TestCluster {
+        client_addrs: Vec<SocketAddr>,
+        rafts: Vec<Arc<RaftHandle>>,
+        connection_tasks: Vec<tokio::task::JoinHandle<()>>,
+        rpc_tasks: Vec<(watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+        shutdown: watch::Sender<bool>,
+        root: std::path::PathBuf,
+    }
+
+    async fn spawn_three_node_cluster(name: &str) -> TestCluster {
+        use crate::raft::Node;
+
+        let root = unique_server_dir(name);
+        let mut raft_listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 1..=3_u64 {
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            nodes.insert(
+                index,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+            raft_listeners.push(listener);
+        }
+
+        let (shutdown_tx, _) = watch::channel(false);
+        let mut client_addrs = Vec::new();
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        let mut connection_tasks = Vec::new();
+        for (index, raft_listener) in raft_listeners.into_iter().enumerate() {
+            let node_id = u64::try_from(index + 1).unwrap();
+            let client_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            client_addrs.push(client_listener.local_addr().unwrap());
+            let config = Config {
+                node_id,
+                bootstrap: index == 0,
+                cluster_nodes: nodes.clone(),
+                data_dir: root.join(format!("node-{node_id}")),
+                client_addr: client_listener.local_addr().unwrap(),
+                ..Config::default()
+            };
+            let server = Server::new(config.clone(), watch::channel(false).1).unwrap();
+            let raft = server.open_raft().await.unwrap();
+            let rpc_raft = raft.clone();
+            let rpc_shutdown = shutdown_tx.subscribe();
+            rpc_tasks.push((
+                shutdown_tx.clone(),
+                tokio::spawn(async move {
+                    serve_raft_rpc(raft_listener, (*rpc_raft).clone(), rpc_shutdown)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            let connection_raft = raft.clone();
+            let connection_shutdown = Arc::new(shutdown_tx.subscribe());
+            let limits = config.protocol_limits();
+            let sentinel_context = SentinelContext::from_config(&config);
+            connection_tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        accepted = client_listener.accept() => {
+                            let (stream, _) = accepted.unwrap();
+                            let raft = connection_raft.clone();
+                            let shutdown = connection_shutdown.clone();
+                            let sentinel_context = sentinel_context.clone();
+                            tokio::spawn(async move {
+                                let _ = handle_raft_connection(
+                                    stream,
+                                    shutdown,
+                                    raft,
+                                    limits,
+                                    sentinel_context,
+                                )
+                                .await;
+                            });
+                        }
+                        result = wait_for_shutdown(connection_shutdown.clone()) => {
+                            result.unwrap();
+                            break;
+                        }
+                    }
+                }
+            }));
+            rafts.push(raft);
+        }
+        TestCluster {
+            client_addrs,
+            rafts,
+            connection_tasks,
+            rpc_tasks,
+            shutdown: shutdown_tx,
+            root,
+        }
+    }
+
+    impl TestCluster {
+        async fn leader_index(&self) -> usize {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(node_id) = self.rafts[0].current_leader().await {
+                        return usize::try_from(node_id - 1).unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("cluster should elect a leader")
+        }
+
+        async fn shutdown(self) {
+            // One broadcast stops the connection loops and every rpc task.
+            self.shutdown.send(true).unwrap();
+            for task in self.connection_tasks {
+                task.await.unwrap();
+            }
+            for raft in &self.rafts {
+                raft.shutdown().await.unwrap();
+            }
+            for (_, task) in self.rpc_tasks {
+                task.await.unwrap();
+            }
+            let _ = std::fs::remove_dir_all(self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_connection_serves_reads_through_leader_redirect() {
+        let cluster = spawn_three_node_cluster("follower-read").await;
+        let leader = cluster.leader_index().await;
+        let follower = if leader == 0 { 1 } else { 0 };
+
+        let mut writer = TcpStream::connect(cluster.client_addrs[leader])
+            .await
+            .unwrap();
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$8\r\nread-key\r\n$10\r\nread-value\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut writer).await, Frame::simple_string("OK"));
+
+        // The follower cannot pass a linearizable read barrier, so the read
+        // must be redirected to the leader and answered with the same value
+        // a directly connected client would observe.
+        let mut reader = TcpStream::connect(cluster.client_addrs[follower])
+            .await
+            .unwrap();
+        reader
+            .write_all(b"*2\r\n$3\r\nGET\r\n$8\r\nread-key\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).await,
+            Frame::bulk_string("read-value")
+        );
+
+        cluster.shutdown().await;
+    }
+
     #[tokio::test]
     async fn foundation_server_preserves_pipeline_response_order() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
