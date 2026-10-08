@@ -2528,6 +2528,22 @@ pub async fn wait_for_leader(raft: &RaftHandle, node_id: NodeId) -> CacheResult<
     Ok(())
 }
 
+/// Wait until the cluster has elected any leader.
+///
+/// Server startup must not wait for the local node to lead: voter members that
+/// did not seed the cluster would block forever even though the cluster is
+/// already serving through another leader.
+pub async fn wait_for_any_leader(raft: &RaftHandle) -> CacheResult<()> {
+    raft.wait(None)
+        .metrics(
+            |metrics| metrics.current_leader.is_some(),
+            "raft cluster leader election",
+        )
+        .await
+        .map_err(|error| Error::server(format!("wait for raft leader: {error}")))?;
+    Ok(())
+}
+
 pub async fn restart_tcp_raft(
     node_id: NodeId,
     data_dir: impl AsRef<Path>,

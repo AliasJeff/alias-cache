@@ -12,10 +12,10 @@ use crate::error::{Error, Result};
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, command_from_frame};
 use crate::raft::{
-    ClientRequestOutcome, RaftHandle, execute_client_request_with_id,
+    ClientRequestOutcome, RaftHandle, enable_raft_runtime, execute_client_request_with_id,
     execute_transaction_request_with_id, new_client_request_id, new_tcp_raft_for_server,
     open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request_with_id,
-    send_transaction_request_with_id, serve_raft_rpc, wait_for_leader,
+    send_transaction_request_with_id, serve_raft_rpc, wait_for_any_leader,
 };
 use crate::sentinel::{self, SentinelContext};
 
@@ -30,6 +30,35 @@ impl Server {
         Ok(Self { config, shutdown })
     }
 
+    /// Open the local Raft node for the configured topology.
+    ///
+    /// A single-node deployment initializes itself and waits for its own
+    /// leader. In a cluster, exactly one seed node bootstraps membership;
+    /// every other voter joins passively and must have its election runtime
+    /// enabled so it can win leadership after it catches up.
+    async fn open_raft(&self) -> Result<Arc<RaftHandle>> {
+        if self.config.cluster_nodes.is_empty() {
+            let raft = open_single_node(
+                self.config.node_id,
+                &self.config.data_dir,
+                self.config.raft_addr.to_string(),
+            )
+            .await?;
+            return Ok(Arc::new(raft));
+        }
+        let raft = new_tcp_raft_for_server(
+            self.config.node_id,
+            &self.config.data_dir,
+            self.config.cluster_nodes.clone(),
+            self.config.bootstrap,
+        )
+        .await?;
+        if !self.config.bootstrap {
+            enable_raft_runtime(&raft);
+        }
+        Ok(Arc::new(raft))
+    }
+
     pub async fn run(self) -> Result<()> {
         self.config.ensure_data_dir()?;
         let listener = TcpListener::bind(self.config.client_addr)
@@ -37,26 +66,11 @@ impl Server {
             .map_err(|source| Error::io("bind client listener", source))?;
         info!(addr = %self.config.client_addr, node_id = self.config.node_id, "client listener started");
 
-        let shutdown = Arc::new(self.shutdown);
         let raft_listener = TcpListener::bind(self.config.raft_addr)
             .await
             .map_err(|source| Error::io("bind raft listener", source))?;
-        let raft = Arc::new(if self.config.cluster_nodes.is_empty() {
-            open_single_node(
-                self.config.node_id,
-                &self.config.data_dir,
-                self.config.raft_addr.to_string(),
-            )
-            .await?
-        } else {
-            new_tcp_raft_for_server(
-                self.config.node_id,
-                &self.config.data_dir,
-                self.config.cluster_nodes.clone(),
-                self.config.bootstrap,
-            )
-            .await?
-        });
+        let raft = self.open_raft().await?;
+        let shutdown = Arc::new(self.shutdown);
         let raft_shutdown = shutdown.as_ref().clone();
         let rpc_raft = raft.clone();
         tokio::spawn(async move {
@@ -91,8 +105,8 @@ impl Server {
             )
             .await;
         });
-        if !self.config.cluster_nodes.is_empty() && self.config.bootstrap {
-            wait_for_leader(&raft, self.config.node_id).await?;
+        if !self.config.cluster_nodes.is_empty() {
+            wait_for_any_leader(&raft).await?;
         }
         loop {
             tokio::select! {
@@ -338,13 +352,26 @@ async fn write_frame(stream: &mut TcpStream, frame: Frame) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::time::timeout;
 
     use super::*;
+
+    fn unique_server_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "alias-cache-server-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
 
     #[tokio::test]
     async fn foundation_server_preserves_pipeline_response_order() {
@@ -669,5 +696,115 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         let _ = task.await;
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn cluster_servers_form_and_fail_over_without_seed() {
+        use crate::raft::{Node, RaftRequest};
+        use crate::state_machine::Operation;
+        use bytes::Bytes;
+
+        let root = unique_server_dir("cluster-failover");
+
+        // Bind raft listeners first so the seeded membership can reference
+        // concrete ports.
+        let mut listeners = Vec::new();
+        let mut nodes = BTreeMap::new();
+        for index in 1..=3_u64 {
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            nodes.insert(
+                index,
+                Node {
+                    addr: address.to_string(),
+                },
+            );
+            listeners.push(listener);
+        }
+
+        let mut rafts = Vec::new();
+        let mut rpc_tasks = Vec::new();
+        for (index, listener) in listeners.into_iter().enumerate() {
+            let node_id = u64::try_from(index + 1).unwrap();
+            let config = Config {
+                node_id,
+                bootstrap: index == 0,
+                cluster_nodes: nodes.clone(),
+                data_dir: root.join(format!("node-{node_id}")),
+                ..Config::default()
+            };
+            let server = Server::new(config, watch::channel(false).1).unwrap();
+            let raft = server.open_raft().await.unwrap();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let rpc_raft = raft.clone();
+            rpc_tasks.push((
+                shutdown_tx,
+                tokio::spawn(async move {
+                    serve_raft_rpc(listener, (*rpc_raft).clone(), shutdown_rx)
+                        .await
+                        .expect("rpc server should stop");
+                }),
+            ));
+            rafts.push(raft);
+        }
+
+        // Non-seed voters must get past startup by waiting for any cluster
+        // leader instead of blocking until they lead themselves.
+        timeout(Duration::from_secs(10), async {
+            for raft in &rafts {
+                wait_for_any_leader(raft)
+                    .await
+                    .expect("leader wait should succeed");
+            }
+        })
+        .await
+        .expect("cluster servers should observe a leader");
+
+        rafts.remove(0).shutdown().await.unwrap();
+        let (leader_shutdown, leader_task) = rpc_tasks.remove(0);
+        leader_shutdown.send(true).unwrap();
+        leader_task.await.unwrap();
+
+        let new_leader = timeout(Duration::from_secs(8), async {
+            loop {
+                match rafts[0].current_leader().await {
+                    Some(node_id) if node_id != 1 => break node_id,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("remaining voters should elect a new leader");
+        let leader_raft = &rafts[usize::try_from(new_leader - 2).unwrap()];
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match leader_raft
+                    .client_write(RaftRequest::Apply(Operation::Set {
+                        key: Bytes::from_static(b"failover-key"),
+                        value: Bytes::from_static(b"failover-value"),
+                    }))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(openraft::error::RaftError::APIError(
+                        openraft::error::ClientWriteError::ForwardToLeader(_),
+                    )) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    Err(error) => panic!("failover write should succeed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("failover write should finish");
+
+        for raft in &rafts {
+            raft.shutdown().await.unwrap();
+        }
+        for (shutdown_tx, task) in rpc_tasks {
+            shutdown_tx.send(true).unwrap();
+            task.await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
