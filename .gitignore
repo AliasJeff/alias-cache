@@ -1,8 +1,3 @@
-# Documentation stays in the workspace but is intentionally not committed.
-*.md
-docs/
-plans/
-
 /target/
 .DS_Store
 

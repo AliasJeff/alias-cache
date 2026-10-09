@@ -2446,31 +2446,59 @@ pub async fn purge_raft_log(raft: &RaftHandle, upto: u64) -> CacheResult<()> {
 }
 
 pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
-    wait_for_membership_commit(
-        raft,
-        format!("wait before promoting raft learner {node_id}"),
-    )
-    .await?;
-    raft.wait(None)
-        .metrics(
-            |metrics| metrics.current_leader == Some(metrics.id),
-            format!("wait for local leader before promoting raft learner {node_id}"),
+    const MAX_ATTEMPTS: usize = 40;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        wait_for_membership_commit(
+            raft,
+            format!("wait before promoting raft learner {node_id}"),
         )
-        .await
-        .map_err(|error| {
-            Error::server(format!(
-                "wait for local leader before promoting raft learner {node_id}: {error}"
-            ))
-        })?;
-    let mut voters = raft.voter_ids().collect::<Vec<_>>();
-    if !voters.contains(&node_id) {
-        voters.push(node_id);
+        .await?;
+        raft.wait(None)
+            .metrics(
+                |metrics| metrics.current_leader == Some(metrics.id),
+                format!("wait for local leader before promoting raft learner {node_id}"),
+            )
+            .await
+            .map_err(|error| {
+                Error::server(format!(
+                    "wait for local leader before promoting raft learner {node_id}: {error}"
+                ))
+            })?;
+
+        let mut voters = raft.voter_ids().collect::<Vec<_>>();
+        if !voters.contains(&node_id) {
+            voters.push(node_id);
+        } else {
+            return Ok(());
+        }
+        voters.sort_unstable();
+
+        match raft.change_membership(voters, false).await {
+            Ok(_) => return Ok(()),
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(_),
+            )) => {}
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ChangeMembershipError(
+                    openraft::error::ChangeMembershipError::InProgress(_),
+                ),
+            )) => {}
+            Err(error) => {
+                return Err(Error::server(format!(
+                    "promote raft learner {node_id}: {error}"
+                )));
+            }
+        }
+
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
-    voters.sort_unstable();
-    raft.change_membership(voters, false)
-        .await
-        .map_err(|error| Error::server(format!("promote raft learner {node_id}: {error}")))?;
-    Ok(())
+
+    Err(Error::server(format!(
+        "promote raft learner {node_id} timed out while waiting for a stable leader"
+    )))
 }
 
 pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {

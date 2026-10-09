@@ -1,0 +1,118 @@
+# alias-cache
+
+一个使用 Rust 实现的 Redis 兼容、基于 Raft 的强一致分布式内存 KV 存储。
+
+alias-cache 的重点不是复刻全部 Redis 命令，而是用一个足够完整、可验证的工程展示：
+
+- Redis RESP2/RESP3 协议实现
+- Raft 共识、Leader 选举和成员变更
+- 内存状态机与持久化日志
+- 快照、恢复和落后节点追赶
+- TTL 在复制状态机中的确定性语义
+- 故障切换、网络分区和重启恢复
+- 安全、可观测性、基准测试和可重复构建
+
+项目会逐步扩大功能范围。每次迭代都必须先保证一致性语义、恢复语义和测试质量，再增加 Redis 命令或外围能力。
+
+## 项目定位
+
+alias-cache 适合作为：
+
+- 分布式系统学习项目
+- Rust 后端和存储方向的个人项目
+- Redis 协议、Raft、WAL、快照和故障测试的综合实践
+
+它不是 Redis 的替代品，也不承诺第一阶段兼容全部 Redis 行为。所有兼容性声明都必须由测试和文档支持。
+
+## 目标能力
+
+最终版本计划支持：
+
+- Redis RESP2 和 RESP3
+- 字符串、Hash、List、Set、Sorted Set 等常用数据结构
+- TTL、事务、Pipeline
+- Raft 三节点及以上集群
+- Leader 转发、线性一致读和安全写入
+- WAL、快照、崩溃恢复和落后节点快照安装
+- 基础认证、TLS、管理接口和运行指标
+- Sentinel 风格的主节点发现兼容层
+- 故障注入、数据一致性测试和公开 benchmark
+
+## 非目标
+
+以下内容不作为早期目标：
+
+- 一开始实现全部 Redis 命令
+- 一开始追求极限吞吐量
+- 自研完整 Raft 算法替代成熟实现
+- 为了减少代码量而牺牲恢复测试
+- 在没有一致性测试的情况下宣传“绝不丢数据”
+
+## 文档入口
+
+- [项目章程](docs/00-project-charter.md)
+- [架构设计](docs/architecture.md)
+- [协议与一致性模型](docs/protocol-and-consistency.md)
+- [测试与验证标准](docs/testing-and-validation.md)
+- [开发规范](AGENT.md)
+- [开发计划](plans/README.md)
+
+## 快速开始
+
+```bash
+cargo build --release
+```
+
+单节点模式（自动初始化为单节点集群）：
+
+```bash
+./target/release/alias-cache-cli --node-id 1
+redis-cli -p 6379 SET hello world
+redis-cli -p 6379 GET hello
+```
+
+三节点强一致集群（节点 1 种子成员，其余节点以 voter 加入）：
+./target/release/alias-cache-cli --node-id 1 --client-addr 127.0.0.1:6379 \
+  --raft-addr 127.0.0.1:16379 --data-dir data/node-1 --bootstrap \
+  --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
+  --peer 2=127.0.0.1:16380/127.0.0.1:6380 \
+  --peer 3=127.0.0.1:16381/127.0.0.1:6381 &
+
+./target/release/alias-cache-cli --node-id 2 --client-addr 127.0.0.1:6380 \
+  --raft-addr 127.0.0.1:16380 --data-dir data/node-2 \
+  --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
+  --peer 2=127.0.0.1:16380/127.0.0.1:6380 \
+  --peer 3=127.0.0.1:16381/127.0.0.1:6381 &
+
+./target/release/alias-cache-cli --node-id 3 --client-addr 127.0.0.1:6381 \
+  --raft-addr 127.0.0.1:16381 --data-dir data/node-3 \
+  --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
+  --peer 2=127.0.0.1:16380/127.0.0.1:6380 \
+  --peer 3=127.0.0.1:16381/127.0.0.1:6381 &
+```
+
+行为说明：
+
+- 写入任意节点都会被透明转发给 Leader 并经多数派提交。
+- 读取任意节点都走 ReadIndex 线性一致读，follower 读会转发到 Leader。
+- 杀掉 Leader 进程后，剩余节点会自动选出新 Leader 并继续接受写入。
+- `SENTINEL GET-MASTER-ADDR-BY-NAME alias-cache` 可发现当前 Leader 地址。
+
+## 当前状态
+
+已实现并由测试覆盖（当前 `cargo test --workspace --locked`：105 个测试全部通过）：
+
+- RESP2 协议、PING/ECHO、Pipeline、MULTI/EXEC/DISCARD 事务
+- 确定性状态机：String 类型全套 SET 选项、TTL 家族命令
+- OpenRaft 三节点集群：选举、复制、ReadIndex 线性一致读、Leader 转发
+- Learner 加入/提升/移除、网络分区、旧 Leader 冲突恢复
+- 分块快照传输、快照安装/持久化、落后节点追赶、重启恢复
+- 复制逻辑时钟 TTL：跨节点重放、故障切换、重启后语义一致
+- 只读 Sentinel 风格主节点发现
+- CLI 配置化（单节点/集群拓扑/种子引导）
+
+进行中 / 未完成：RESP3（HELLO 协商）、AUTH/TLS、指标与健康检查、Hash/List/Set/ZSet 数据结构、benchmark 与发布工程。当前阶段边界见各 plans 文档的完成标准。
+
+## 许可证
+
+Apache-2.0。
