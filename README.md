@@ -118,10 +118,11 @@ RESP3 基础类型、`HELLO 2/3` 协商和密码认证已实现。密码可通�
 `--password` 或 `ALIAS_CACHE_PASSWORD` 配置；启用后客户端必须先执行 `AUTH` 或
 `HELLO ... AUTH default <password>`。
 
-客户端连接也支持 TLS：同时指定 `--tls-cert-file` 和 `--tls-key-file` 即可启用
-TLS listener；额外指定 `--tls-ca-file --tls-auth-clients` 可要求客户端证书并执行
-mTLS 校验。当前 TLS 只保护客户端入口，Raft 节点间 TLS 仍在后续计划中，避免把
-明文节点间通信误认为已完成全链路加密。
+客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
+`--tls-key-file` 即可启用客户端 TLS listener；额外指定
+`--tls-ca-file --tls-auth-clients` 可要求客户端证书并执行 mTLS 校验。
+集群节点间再指定 `--tls-replication`，Raft RPC 和分块快照会使用独立的双向 TLS
+握手。未指定该参数时，Raft 链路保持明文，便于开发环境和协议测试。
 
 ## 许可证
 

@@ -4,6 +4,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -15,10 +16,10 @@ use crate::raft::{
     ClientRequestOutcome, RaftHandle, enable_raft_runtime, execute_client_request_with_id,
     execute_transaction_request_with_id, new_client_request_id, new_tcp_raft_for_server,
     open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request_with_id,
-    send_transaction_request_with_id, serve_raft_rpc, wait_for_any_leader,
+    send_transaction_request_with_id, serve_raft_rpc_with_tls, wait_for_any_leader,
 };
 use crate::sentinel::{self, SentinelContext};
-use crate::tls::client_acceptor;
+use crate::tls::TlsContext;
 
 pub struct Server {
     config: Config,
@@ -37,7 +38,10 @@ impl Server {
     /// leader. In a cluster, exactly one seed node bootstraps membership;
     /// every other voter joins passively and must have its election runtime
     /// enabled so it can win leadership after it catches up.
-    async fn open_raft(&self) -> Result<Arc<RaftHandle>> {
+    async fn open_raft(
+        &self,
+        tls_connector: Option<tokio_rustls::TlsConnector>,
+    ) -> Result<Arc<RaftHandle>> {
         if self.config.cluster_nodes.is_empty() {
             let raft = open_single_node(
                 self.config.node_id,
@@ -52,6 +56,7 @@ impl Server {
             &self.config.data_dir,
             self.config.cluster_nodes.clone(),
             self.config.bootstrap,
+            tls_connector,
         )
         .await?;
         if !self.config.bootstrap {
@@ -62,7 +67,10 @@ impl Server {
 
     pub async fn run(self) -> Result<()> {
         self.config.ensure_data_dir()?;
-        let tls_acceptor = client_acceptor(&self.config)?;
+        let tls_context = TlsContext::load(&self.config)?;
+        let client_tls_acceptor = tls_context.client_acceptor();
+        let raft_tls_acceptor = tls_context.replication_acceptor();
+        let tls_connector = tls_context.replication_connector();
         let listener = TcpListener::bind(self.config.client_addr)
             .await
             .map_err(|source| Error::io("bind client listener", source))?;
@@ -71,13 +79,18 @@ impl Server {
         let raft_listener = TcpListener::bind(self.config.raft_addr)
             .await
             .map_err(|source| Error::io("bind raft listener", source))?;
-        let raft = self.open_raft().await?;
+        let raft = self.open_raft(tls_connector.clone()).await?;
         let shutdown = Arc::new(self.shutdown);
         let raft_shutdown = shutdown.as_ref().clone();
         let rpc_raft = raft.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_raft_rpc(raft_listener, (*rpc_raft).clone(), raft_shutdown).await
+            if let Err(error) = serve_raft_rpc_with_tls(
+                raft_listener,
+                (*rpc_raft).clone(),
+                raft_shutdown,
+                raft_tls_acceptor,
+            )
+            .await
             {
                 warn!(%error, "raft rpc listener failed");
             }
@@ -120,7 +133,8 @@ impl Server {
                     let child_raft = raft.clone();
                     let sentinel_context = sentinel_context.clone();
                     let password = self.config.password.clone();
-                    let tls_acceptor = tls_acceptor.clone();
+                    let tls_acceptor = client_tls_acceptor.clone();
+                    let tls_connector = tls_connector.clone();
                     tokio::spawn(async move {
                         let result = match tls_acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
@@ -132,6 +146,7 @@ impl Server {
                                         limits,
                                         sentinel_context,
                                         password,
+                                        tls_connector.clone(),
                                     )
                                     .await
                                 }
@@ -147,6 +162,7 @@ impl Server {
                                     limits,
                                     sentinel_context,
                                     password,
+                                    tls_connector.clone(),
                                 )
                                 .await
                             }
@@ -249,6 +265,7 @@ async fn handle_raft_connection(
     limits: crate::protocol::ProtocolLimits,
     sentinel_context: SentinelContext,
     password: Option<Bytes>,
+    tls_connector: Option<TlsConnector>,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
@@ -285,6 +302,7 @@ async fn handle_raft_connection(
                                 &mut resp_version,
                                 &mut authenticated,
                                 password.as_deref(),
+                                tls_connector.clone(),
                             )
                             .await
                         }
@@ -448,6 +466,7 @@ fn hello_command(
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_transaction_command(
     raft: &RaftHandle,
     transaction: &mut Option<Vec<crate::protocol::Request>>,
@@ -456,6 +475,7 @@ async fn handle_transaction_command(
     resp_version: &mut RespVersion,
     authenticated: &mut bool,
     configured_password: Option<&[u8]>,
+    tls_connector: Option<TlsConnector>,
 ) -> Frame {
     let command = match &request {
         crate::protocol::Request::Command(arguments) => {
@@ -501,7 +521,7 @@ async fn handle_transaction_command(
         let Some(requests) = transaction.take() else {
             return Frame::error("ERR EXEC without MULTI");
         };
-        return execute_transaction(raft, requests).await;
+        return execute_transaction_with_tls(raft, requests, tls_connector).await;
     }
     if let Some(requests) = transaction {
         if command.is_some_and(|command| {
@@ -517,10 +537,14 @@ async fn handle_transaction_command(
         requests.push(request);
         return Frame::simple_string("QUEUED");
     }
-    execute_client_command(raft, request).await
+    execute_client_command_with_tls(raft, request, tls_connector).await
 }
 
-async fn execute_transaction(raft: &RaftHandle, requests: Vec<crate::protocol::Request>) -> Frame {
+async fn execute_transaction_with_tls(
+    raft: &RaftHandle,
+    requests: Vec<crate::protocol::Request>,
+    tls_connector: Option<TlsConnector>,
+) -> Frame {
     let request_id = new_client_request_id();
     match execute_transaction_request_with_id(raft, request_id, requests.clone()).await {
         Ok(ClientRequestOutcome::Applied(response)) => response,
@@ -529,6 +553,7 @@ async fn execute_transaction(raft: &RaftHandle, requests: Vec<crate::protocol::R
             request_id,
             requests,
             &openraft::network::RPCOption::new(std::time::Duration::from_secs(1)),
+            tls_connector,
         )
         .await
         {
@@ -539,7 +564,11 @@ async fn execute_transaction(raft: &RaftHandle, requests: Vec<crate::protocol::R
     }
 }
 
-async fn execute_client_command(raft: &RaftHandle, request: crate::protocol::Request) -> Frame {
+async fn execute_client_command_with_tls(
+    raft: &RaftHandle,
+    request: crate::protocol::Request,
+    tls_connector: Option<TlsConnector>,
+) -> Frame {
     let request_id = new_client_request_id();
     match execute_client_request_with_id(raft, request_id, request.clone()).await {
         Ok(ClientRequestOutcome::Applied(response)) => response,
@@ -549,6 +578,7 @@ async fn execute_client_command(raft: &RaftHandle, request: crate::protocol::Req
                 request_id,
                 request,
                 &openraft::network::RPCOption::new(std::time::Duration::from_secs(1)),
+                tls_connector,
             )
             .await
             {
@@ -585,6 +615,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::raft::serve_raft_rpc;
 
     fn unique_server_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -681,7 +712,7 @@ mod tests {
                 ..Config::default()
             };
             let server = Server::new(config.clone(), watch::channel(false).1).unwrap();
-            let raft = server.open_raft().await.unwrap();
+            let raft = server.open_raft(None).await.unwrap();
             let rpc_raft = raft.clone();
             let rpc_shutdown = shutdown_tx.subscribe();
             rpc_tasks.push((
@@ -713,6 +744,7 @@ mod tests {
                                     limits,
                                     sentinel_context,
                                     password,
+                                    None,
                                 )
                                 .await;
                             });
@@ -928,7 +960,8 @@ mod tests {
         let sentinel_context = SentinelContext::from_config(&config);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None).await
+            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None, None)
+                .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1072,6 +1105,7 @@ mod tests {
                 config.protocol_limits(),
                 SentinelContext::from_config(&config),
                 password,
+                None,
             )
             .await
         });
@@ -1169,6 +1203,7 @@ mod tests {
                 config.protocol_limits(),
                 SentinelContext::from_config(&config),
                 None,
+                None,
             )
             .await
         });
@@ -1264,6 +1299,7 @@ mod tests {
                 config.protocol_limits(),
                 SentinelContext::from_config(&config),
                 None,
+                None,
             )
             .await
         });
@@ -1329,6 +1365,7 @@ mod tests {
                 raft,
                 config.protocol_limits(),
                 sentinel_context,
+                None,
                 None,
             )
             .await
@@ -1403,7 +1440,7 @@ mod tests {
                 ..Config::default()
             };
             let server = Server::new(config, watch::channel(false).1).unwrap();
-            let raft = server.open_raft().await.unwrap();
+            let raft = server.open_raft(None).await.unwrap();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let rpc_raft = raft.clone();
             rpc_tasks.push((

@@ -55,6 +55,10 @@ struct Args {
     #[arg(long)]
     tls_auth_clients: bool,
 
+    /// Encrypt and authenticate Raft RPC and snapshot traffic with TLS.
+    #[arg(long)]
+    tls_replication: bool,
+
     /// Cluster member as <NODE_ID=RAFT_ADDR[/CLIENT_ADDR]>. Repeat for every
     /// voter including this node. Omit all peers to run a single-node store.
     #[arg(long = "peer", value_name = "SPEC")]
@@ -88,6 +92,7 @@ fn build_config(args: &Args) -> Result<Config> {
         tls_key_file: args.tls_key_file.clone(),
         tls_ca_file: args.tls_ca_file.clone(),
         tls_auth_clients: args.tls_auth_clients,
+        tls_replication: args.tls_replication,
         bootstrap: args.bootstrap,
         data_dir,
         ..Config::default()
@@ -205,6 +210,7 @@ mod tests {
                 "--tls-ca-file",
                 "clients.crt",
                 "--tls-auth-clients",
+                "--tls-replication",
             ])
             .unwrap(),
         )
@@ -212,5 +218,6 @@ mod tests {
         assert_eq!(config.tls_cert_file, Some(PathBuf::from("server.crt")));
         assert_eq!(config.tls_key_file, Some(PathBuf::from("server.key")));
         assert!(config.tls_auth_clients);
+        assert!(config.tls_replication);
     }
 }

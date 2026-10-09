@@ -74,6 +74,7 @@ pub struct Config {
     pub tls_key_file: Option<PathBuf>,
     pub tls_ca_file: Option<PathBuf>,
     pub tls_auth_clients: bool,
+    pub tls_replication: bool,
     pub cluster_nodes: BTreeMap<NodeId, Node>,
     pub cluster_client_addrs: BTreeMap<NodeId, SocketAddr>,
     pub data_dir: PathBuf,
@@ -96,6 +97,7 @@ impl Default for Config {
             tls_key_file: None,
             tls_ca_file: None,
             tls_auth_clients: false,
+            tls_replication: false,
             cluster_nodes: BTreeMap::new(),
             cluster_client_addrs: BTreeMap::new(),
             data_dir: PathBuf::from("data/node-1"),
@@ -131,6 +133,15 @@ impl Config {
         if self.tls_auth_clients && self.tls_ca_file.is_none() {
             return Err(Error::invalid_config(
                 "tls_ca_file is required when tls_auth_clients is enabled",
+            ));
+        }
+        if self.tls_replication
+            && (self.tls_cert_file.is_none()
+                || self.tls_key_file.is_none()
+                || self.tls_ca_file.is_none())
+        {
+            return Err(Error::invalid_config(
+                "tls_replication requires tls_cert_file, tls_key_file, and tls_ca_file",
             ));
         }
         if self.tls_ca_file.is_some() && self.tls_cert_file.is_none() {

@@ -23,6 +23,7 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -32,6 +33,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, watch};
 use tokio::time::interval;
 use tokio::time::timeout;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub type NodeId = u64;
 
@@ -1300,6 +1302,7 @@ impl Default for TcpNetworkControl {
 pub struct TcpNetworkFactory {
     source: NodeId,
     control: TcpNetworkControl,
+    tls_connector: Option<TlsConnector>,
 }
 
 #[derive(Clone)]
@@ -1308,11 +1311,20 @@ pub struct TcpNetwork {
     target: NodeId,
     address: String,
     control: TcpNetworkControl,
+    tls_connector: Option<TlsConnector>,
 }
 
 impl TcpNetworkFactory {
-    fn new(source: NodeId, control: TcpNetworkControl) -> Self {
-        Self { source, control }
+    fn new(
+        source: NodeId,
+        control: TcpNetworkControl,
+        tls_connector: Option<TlsConnector>,
+    ) -> Self {
+        Self {
+            source,
+            control,
+            tls_connector,
+        }
     }
 }
 
@@ -1325,6 +1337,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpNetworkFactory {
             target,
             address: node.addr.clone(),
             control: self.control.clone(),
+            tls_connector: self.tls_connector.clone(),
         }
     }
 }
@@ -1341,23 +1354,57 @@ impl TcpNetwork {
                 self.source, self.target
             ))));
         }
-        send_rpc(&self.address, request, option).await
+        send_rpc(&self.address, request, option, self.tls_connector.clone()).await
     }
 }
 
-async fn connect(address: &str, option: &RPCOption) -> Result<TcpStream, RPCError<TypeConfig>> {
-    timeout(option.soft_ttl(), TcpStream::connect(address))
+trait AsyncNetworkStream: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncNetworkStream for T where T: AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+type NetworkStream = Pin<Box<dyn AsyncNetworkStream>>;
+
+async fn connect(
+    address: &str,
+    option: &RPCOption,
+    tls_connector: Option<TlsConnector>,
+) -> Result<NetworkStream, RPCError<TypeConfig>> {
+    let stream = timeout(option.soft_ttl(), TcpStream::connect(address))
         .await
         .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?
-        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))
+        .map_err(|error| RPCError::Unreachable(Unreachable::from_string(error.to_string())))?;
+    if let Some(connector) = tls_connector {
+        let socket_addr = address.parse::<std::net::SocketAddr>().map_err(|error| {
+            RPCError::Network(openraft::error::NetworkError::from_string(format!(
+                "TLS peer address is invalid: {error}"
+            )))
+        })?;
+        let server_name = rustls::pki_types::ServerName::IpAddress(socket_addr.ip().into());
+        let stream = timeout(option.soft_ttl(), connector.connect(server_name, stream))
+            .await
+            .map_err(|error| {
+                RPCError::Unreachable(Unreachable::from_string(format!(
+                    "TLS handshake timed out: {error}"
+                )))
+            })?
+            .map_err(|error| {
+                RPCError::Unreachable(Unreachable::from_string(format!(
+                    "TLS handshake failed: {error}"
+                )))
+            })?;
+        Ok(Box::pin(stream))
+    } else {
+        Ok(Box::pin(stream))
+    }
 }
 
 async fn send_rpc(
     address: &str,
     request: NetworkRequest,
     option: &RPCOption,
+    tls_connector: Option<TlsConnector>,
 ) -> Result<NetworkResponse, RPCError<TypeConfig>> {
-    let mut stream = connect(address, option).await?;
+    let mut stream = connect(address, option, tls_connector).await?;
     let payload = bincode::serialize(&request).map_err(|error| {
         RPCError::Network(openraft::error::NetworkError::from_string(
             error.to_string(),
@@ -1420,9 +1467,10 @@ async fn send_snapshot_rpc(
     data: Vec<u8>,
     cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
     option: &RPCOption,
+    tls_connector: Option<TlsConnector>,
 ) -> Result<NetworkResponse, StreamingError<TypeConfig>> {
     tokio::pin!(cancel);
-    let mut stream = connect(address, option)
+    let mut stream = connect(address, option, tls_connector)
         .await
         .map_err(StreamingError::from)?;
     let total_len = u64::try_from(data.len()).map_err(|_| {
@@ -1504,7 +1552,7 @@ async fn send_snapshot_rpc(
 }
 
 async fn read_network_response(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     option: &RPCOption,
 ) -> Result<NetworkResponse, openraft::error::NetworkError<TypeConfig>> {
     let mut header = [0_u8; 4];
@@ -1532,7 +1580,7 @@ pub async fn send_client_request(
     request: Request,
     option: &RPCOption,
 ) -> CacheResult<Frame> {
-    send_client_request_with_id(address, new_client_request_id(), request, option).await
+    send_client_request_with_id(address, new_client_request_id(), request, option, None).await
 }
 
 pub async fn send_client_request_with_id(
@@ -1540,6 +1588,7 @@ pub async fn send_client_request_with_id(
     request_id: ClientRequestId,
     request: Request,
     option: &RPCOption,
+    tls_connector: Option<TlsConnector>,
 ) -> CacheResult<Frame> {
     let response = send_rpc(
         address,
@@ -1548,6 +1597,7 @@ pub async fn send_client_request_with_id(
             request,
         },
         option,
+        tls_connector,
     )
     .await
     .map_err(|error| Error::server(format!("send client request: {error}")))?;
@@ -1563,7 +1613,7 @@ pub async fn send_transaction_request(
     requests: Vec<Request>,
     option: &RPCOption,
 ) -> CacheResult<Frame> {
-    send_transaction_request_with_id(address, new_client_request_id(), requests, option).await
+    send_transaction_request_with_id(address, new_client_request_id(), requests, option, None).await
 }
 
 pub async fn send_transaction_request_with_id(
@@ -1571,6 +1621,7 @@ pub async fn send_transaction_request_with_id(
     request_id: ClientRequestId,
     requests: Vec<Request>,
     option: &RPCOption,
+    tls_connector: Option<TlsConnector>,
 ) -> CacheResult<Frame> {
     let response = send_rpc(
         address,
@@ -1579,6 +1630,7 @@ pub async fn send_transaction_request_with_id(
             requests,
         },
         option,
+        tls_connector,
     )
     .await
     .map_err(|error| Error::server(format!("send transaction request: {error}")))?;
@@ -1648,8 +1700,16 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                 error.to_string(),
             ))
         })?;
-        let response =
-            send_snapshot_rpc(&self.address, vote, snapshot.meta, data, cancel, &option).await?;
+        let response = send_snapshot_rpc(
+            &self.address,
+            vote,
+            snapshot.meta,
+            data,
+            cancel,
+            &option,
+            self.tls_connector.clone(),
+        )
+        .await?;
         match response {
             NetworkResponse::Snapshot(response) => response.map_err(|error| {
                 StreamingError::Network(openraft::error::NetworkError::from_string(error))
@@ -1670,6 +1730,15 @@ pub async fn serve_raft_rpc(
     raft: RaftHandle,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> CacheResult<()> {
+    serve_raft_rpc_with_tls(listener, raft, shutdown, None).await
+}
+
+pub async fn serve_raft_rpc_with_tls(
+    listener: TcpListener,
+    raft: RaftHandle,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_acceptor: Option<TlsAcceptor>,
+) -> CacheResult<()> {
     let shutdown = Arc::new(shutdown);
     loop {
         tokio::select! {
@@ -1677,8 +1746,18 @@ pub async fn serve_raft_rpc(
                 let (stream, _) = result.map_err(|error| Error::io("accept raft rpc connection", error))?;
                 let raft = raft.clone();
                 let shutdown = shutdown.clone();
+                let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_raft_rpc(stream, raft, shutdown).await {
+                    let result = match tls_acceptor {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(stream) => handle_raft_rpc(stream, raft, shutdown).await,
+                            Err(error) => Err(Error::server(format!(
+                                "TLS Raft handshake failed: {error}"
+                            ))),
+                        },
+                        None => handle_raft_rpc(stream, raft, shutdown).await,
+                    };
+                    if let Err(error) = result {
                         tracing::debug!(%error, "raft rpc connection failed");
                     }
                 });
@@ -1703,7 +1782,7 @@ async fn wait_for_raft_shutdown(
 }
 
 async fn handle_raft_rpc(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     raft: RaftHandle,
     shutdown: Arc<tokio::sync::watch::Receiver<bool>>,
 ) -> CacheResult<()> {
@@ -1813,7 +1892,7 @@ async fn handle_raft_rpc(
 }
 
 async fn read_network_message<T: for<'de> Deserialize<'de>>(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
 ) -> CacheResult<T> {
     let mut header = [0_u8; 4];
     stream
@@ -2000,7 +2079,10 @@ async fn read_snapshot_chunks<R: AsyncRead + Unpin>(
     result
 }
 
-async fn write_raw_frame(stream: &mut TcpStream, payload: &[u8]) -> CacheResult<()> {
+async fn write_raw_frame(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    payload: &[u8],
+) -> CacheResult<()> {
     let length = u32::try_from(payload.len())
         .map_err(|_| Error::protocol("raft rpc frame length overflows u32"))?;
     if payload.is_empty() || payload.len() > NETWORK_MAX_FRAME {
@@ -2017,7 +2099,7 @@ async fn write_raw_frame(stream: &mut TcpStream, payload: &[u8]) -> CacheResult<
 }
 
 async fn write_network_message<T: Serialize>(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     message: &T,
 ) -> CacheResult<()> {
     let payload = bincode::serialize(message)
@@ -2177,7 +2259,15 @@ pub async fn new_tcp_raft(
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, true, TcpNetworkControl::default()).await
+    new_tcp_raft_inner(
+        node_id,
+        data_dir,
+        nodes,
+        true,
+        TcpNetworkControl::default(),
+        None,
+    )
+    .await
 }
 
 pub async fn new_tcp_raft_with_control(
@@ -2186,7 +2276,7 @@ pub async fn new_tcp_raft_with_control(
     nodes: BTreeMap<NodeId, Node>,
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, true, control).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, true, control, None).await
 }
 
 pub async fn new_tcp_raft_joiner(
@@ -2200,6 +2290,7 @@ pub async fn new_tcp_raft_joiner(
         nodes,
         false,
         TcpNetworkControl::default(),
+        None,
     )
     .await
 }
@@ -2210,7 +2301,7 @@ pub async fn new_tcp_raft_joiner_with_control(
     nodes: BTreeMap<NodeId, Node>,
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, false, control).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, false, control, None).await
 }
 
 async fn new_tcp_raft_inner(
@@ -2219,6 +2310,7 @@ async fn new_tcp_raft_inner(
     nodes: BTreeMap<NodeId, Node>,
     bootstrap: bool,
     control: TcpNetworkControl,
+    tls_connector: Option<TlsConnector>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
@@ -2240,7 +2332,7 @@ async fn new_tcp_raft_inner(
     let raft = openraft::Raft::new(
         node_id,
         Arc::new(config),
-        TcpNetworkFactory::new(node_id, control),
+        TcpNetworkFactory::new(node_id, control, tls_connector),
         log_store,
         state_machine,
     )
@@ -2289,15 +2381,30 @@ pub async fn new_tcp_raft_for_server(
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
     bootstrap: bool,
+    tls_connector: Option<TlsConnector>,
 ) -> CacheResult<RaftHandle> {
     let raft = if bootstrap {
-        new_tcp_raft(node_id, data_dir, nodes)
-            .await
-            .map_err(|error| Error::server(format!("open bootstrap raft node: {error}")))?
+        new_tcp_raft_inner(
+            node_id,
+            data_dir,
+            nodes,
+            true,
+            TcpNetworkControl::default(),
+            tls_connector,
+        )
+        .await
+        .map_err(|error| Error::server(format!("open bootstrap raft node: {error}")))?
     } else {
-        new_tcp_raft_joiner(node_id, data_dir, nodes)
-            .await
-            .map_err(|error| Error::server(format!("open raft joiner: {error}")))?
+        new_tcp_raft_inner(
+            node_id,
+            data_dir,
+            nodes,
+            false,
+            TcpNetworkControl::default(),
+            tls_connector,
+        )
+        .await
+        .map_err(|error| Error::server(format!("open raft joiner: {error}")))?
     };
     Ok(raft)
 }
@@ -3256,6 +3363,7 @@ mod tests {
             vec![1_u8; SNAPSHOT_CHUNK_SIZE],
             async { ReplicationClosed::new("test cancellation") },
             &RPCOption::new(Duration::from_secs(1)),
+            None,
         )
         .await;
 
@@ -3323,6 +3431,7 @@ mod tests {
             vec![0x5a; expected_len],
             std::future::pending(),
             &RPCOption::new(Duration::from_secs(10)),
+            None,
         )
         .await
         .expect("large snapshot should be sent");
@@ -3452,6 +3561,7 @@ mod tests {
             data.clone(),
             std::future::pending(),
             &RPCOption::new(Duration::from_secs(2)),
+            None,
         )
         .await;
         assert!(first_result.is_err());
@@ -3462,6 +3572,7 @@ mod tests {
             data,
             std::future::pending(),
             &RPCOption::new(Duration::from_secs(2)),
+            None,
         )
         .await
         .expect("resumed snapshot should finish");
@@ -5502,6 +5613,7 @@ mod tests {
             request_id,
             rediscovery_request.clone(),
             &RPCOption::new(Duration::from_secs(1)),
+            None,
         )
         .await
         .expect("old leader redirect should be returned as a RESP error");
@@ -5515,6 +5627,7 @@ mod tests {
             request_id,
             rediscovery_request,
             &RPCOption::new(Duration::from_secs(1)),
+            None,
         )
         .await
         .expect("rediscovered leader should accept the request");
@@ -5529,6 +5642,7 @@ mod tests {
                 Bytes::from_static(b"second-value"),
             ]),
             &RPCOption::new(Duration::from_secs(1)),
+            None,
         )
         .await
         .expect("duplicate request should return the cached response");
