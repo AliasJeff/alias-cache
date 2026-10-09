@@ -74,6 +74,12 @@
   `WRONGTYPE`。
 - `StateMachine` 测试覆盖重复 field、确定性枚举、重放序列化、TTL 保留、
   HSETNX 和错误类型。
+- 已实现 List 状态类型和确定性 `VecDeque` 表示：
+  `LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LINDEX`、`LRANGE`、`LLEN`、
+  `LREM`、`LSET`、`LTRIM`。
+- List 操作进入统一 `Operation`、Raft apply、事务和快照序列化路径；
+  支持负索引、count 形式弹出、TTL 继承、空 key 清理、序列化重放和稳定
+  `WRONGTYPE`。
 - 已实现连接级 `MULTI`、`EXEC`、`DISCARD` 状态。
 - 已实现 `Operation::Transaction`，多个写子命令作为一个 Raft 日志操作提交。
 - 事务内子命令共享同一个逻辑写入时间，TTL 操作按入队顺序执行。

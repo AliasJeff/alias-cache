@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ const CLIENT_RESULT_CACHE_CAPACITY: usize = 4_096;
 pub enum Value {
     String(Bytes),
     Hash(BTreeMap<Bytes, Bytes>),
+    List(VecDeque<Bytes>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,6 +53,31 @@ pub enum Operation {
         key: Bytes,
         field: Bytes,
         value: Bytes,
+    },
+    ListPush {
+        key: Bytes,
+        elements: Vec<Bytes>,
+        left: bool,
+    },
+    ListPop {
+        key: Bytes,
+        count: Option<u64>,
+        left: bool,
+    },
+    ListRemove {
+        key: Bytes,
+        count: i64,
+        element: Bytes,
+    },
+    ListSet {
+        key: Bytes,
+        index: i64,
+        value: Bytes,
+    },
+    ListTrim {
+        key: Bytes,
+        start: i64,
+        stop: i64,
     },
     Delete {
         keys: Vec<Bytes>,
@@ -96,6 +122,11 @@ impl Operation {
             | Self::HashSet { .. }
             | Self::HashDelete { .. }
             | Self::HashSetNx { .. }
+            | Self::ListPush { .. }
+            | Self::ListPop { .. }
+            | Self::ListRemove { .. }
+            | Self::ListSet { .. }
+            | Self::ListTrim { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -113,6 +144,11 @@ impl Operation {
             | Self::HashSet { .. }
             | Self::HashDelete { .. }
             | Self::HashSetNx { .. }
+            | Self::ListPush { .. }
+            | Self::ListPop { .. }
+            | Self::ListRemove { .. }
+            | Self::ListSet { .. }
+            | Self::ListTrim { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -155,6 +191,11 @@ impl StateMachine {
             | Operation::HashSet { .. }
             | Operation::HashDelete { .. }
             | Operation::HashSetNx { .. }
+            | Operation::ListPush { .. }
+            | Operation::ListPop { .. }
+            | Operation::ListRemove { .. }
+            | Operation::ListSet { .. }
+            | Operation::ListTrim { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -257,7 +298,7 @@ impl StateMachine {
                 let mut hash = match existing.map(|entry| entry.value) {
                     None => BTreeMap::new(),
                     Some(Value::Hash(hash)) => hash,
-                    Some(Value::String(_)) => return ApplyResult::Response(wrong_type_frame()),
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
                 };
                 let mut added = 0_i64;
                 for (field, value) in fields {
@@ -319,7 +360,7 @@ impl StateMachine {
                 let mut hash = match existing.map(|entry| entry.value) {
                     None => BTreeMap::new(),
                     Some(Value::Hash(hash)) => hash,
-                    Some(Value::String(_)) => return ApplyResult::Response(wrong_type_frame()),
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
                 };
                 if hash.contains_key(&field) {
                     return ApplyResult::Response(Frame::Integer(0));
@@ -333,6 +374,175 @@ impl StateMachine {
                     },
                 );
                 ApplyResult::Response(Frame::Integer(1))
+            }
+            Operation::ListPush {
+                key,
+                elements,
+                left,
+            } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut list = match existing.map(|entry| entry.value) {
+                    None => VecDeque::new(),
+                    Some(Value::List(list)) => list,
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                if left {
+                    for element in elements {
+                        list.push_front(element);
+                    }
+                } else {
+                    list.extend(elements);
+                }
+                let length = list.len();
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::List(list),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::Integer(length as i64))
+            }
+            Operation::ListPop { key, count, left } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(match count {
+                        Some(_) => Frame::Array(Vec::new()),
+                        None => Frame::Null,
+                    });
+                };
+                let Value::List(mut list) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                if count == Some(0) {
+                    return ApplyResult::Response(Frame::Array(Vec::new()));
+                }
+                let response = match count {
+                    Some(count) => {
+                        let count = count.min(list.len() as u64) as usize;
+                        let values: Vec<Bytes> = if left {
+                            list.drain(..count).collect()
+                        } else {
+                            let start = list.len().saturating_sub(count);
+                            list.drain(start..).collect()
+                        };
+                        Frame::Array(values.into_iter().map(Frame::BulkString).collect())
+                    }
+                    None => {
+                        let value = if left {
+                            list.pop_front()
+                        } else {
+                            list.pop_back()
+                        };
+                        value.map_or(Frame::Null, Frame::BulkString)
+                    }
+                };
+                if list.is_empty() {
+                    self.values.remove(&key);
+                } else {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::List(list),
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(response)
+            }
+            Operation::ListRemove {
+                key,
+                count,
+                element,
+            } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::Integer(0));
+                };
+                let Value::List(mut list) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let removed = remove_list_elements(&mut list, count, &element);
+                if list.is_empty() {
+                    self.values.remove(&key);
+                } else if removed > 0 {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::List(list),
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(removed))
+            }
+            Operation::ListSet { key, index, value } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::error("ERR no such key"));
+                };
+                let Value::List(mut list) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let Some(index) = normalize_list_index(index, list.len()) else {
+                    return ApplyResult::Response(Frame::error("ERR index out of range"));
+                };
+                list[index] = value;
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::List(list),
+                        expire_at: existing.expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::simple_string("OK"))
+            }
+            Operation::ListTrim { key, start, stop } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::simple_string("OK"));
+                };
+                let Value::List(list) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let Some((start, stop)) = normalize_list_range(start, stop, list.len()) else {
+                    self.values.remove(&key);
+                    return ApplyResult::Response(Frame::simple_string("OK"));
+                };
+                let retained = list
+                    .into_iter()
+                    .skip(start)
+                    .take(stop - start + 1)
+                    .collect::<VecDeque<_>>();
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::List(retained),
+                        expire_at: existing.expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::Delete { keys } => {
                 let mut removed = 0;
@@ -528,6 +738,36 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"HEXISTS") {
             return self.execute_hash_exists(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"LPUSH") {
+            return self.execute_list_push(arguments, true);
+        }
+        if command.eq_ignore_ascii_case(b"RPUSH") {
+            return self.execute_list_push(arguments, false);
+        }
+        if command.eq_ignore_ascii_case(b"LPOP") {
+            return self.execute_list_pop(arguments, true);
+        }
+        if command.eq_ignore_ascii_case(b"RPOP") {
+            return self.execute_list_pop(arguments, false);
+        }
+        if command.eq_ignore_ascii_case(b"LINDEX") {
+            return self.execute_list_index(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"LRANGE") {
+            return self.execute_list_range(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"LLEN") {
+            return self.execute_list_len(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"LREM") {
+            return self.execute_list_remove(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"LSET") {
+            return self.execute_list_set(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"LTRIM") {
+            return self.execute_list_trim(arguments);
         }
         if command.eq_ignore_ascii_case(b"TYPE") {
             return self.execute_type(arguments);
@@ -852,6 +1092,7 @@ impl StateMachine {
             Some(entry) if !self.is_expired(entry) => match entry.value {
                 Value::String(_) => "string",
                 Value::Hash(_) => "hash",
+                Value::List(_) => "list",
             },
             _ => "none",
         };
@@ -996,7 +1237,7 @@ impl StateMachine {
         let hash = match existing.map(|entry| &entry.value) {
             None => None,
             Some(Value::Hash(hash)) => Some(hash),
-            Some(Value::String(_)) => return Err(wrong_type_error()),
+            Some(_) => return Err(wrong_type_error()),
         };
         let mut fields = Vec::with_capacity((arguments.len() - 2) / 2);
         let mut seen = BTreeSet::new();
@@ -1088,7 +1329,7 @@ impl StateMachine {
         };
         match &entry.value {
             Value::Hash(hash) => Ok(Some(hash)),
-            Value::String(_) => Err(wrong_type_error()),
+            _ => Err(wrong_type_error()),
         }
     }
 
@@ -1165,12 +1406,215 @@ impl StateMachine {
             .is_some_and(|hash| hash.contains_key(&arguments[2]));
         Ok((None, Frame::Integer(i64::from(exists))))
     }
+
+    fn list_for_key(&self, key: &Bytes) -> Result<Option<&VecDeque<Bytes>>> {
+        let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
+            return Ok(None);
+        };
+        match &entry.value {
+            Value::List(list) => Ok(Some(list)),
+            _ => Err(wrong_type_error()),
+        }
+    }
+
+    fn execute_list_push(
+        &self,
+        arguments: Vec<Bytes>,
+        left: bool,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let command = if left { "LPUSH" } else { "RPUSH" };
+        expect_min_arity(command, &arguments, 3)?;
+        let key = arguments[1].clone();
+        if let Some(entry) = self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry))
+            && !matches!(entry.value, Value::List(_))
+        {
+            return Err(wrong_type_error());
+        }
+        let elements = arguments[2..].to_vec();
+        let current_length = self.list_for_key(&key)?.map_or(0, VecDeque::len);
+        let length = current_length
+            .checked_add(elements.len())
+            .ok_or_else(|| Error::protocol("list length exceeds maximum"))?;
+        Ok((
+            Some(Operation::ListPush {
+                key,
+                elements,
+                left,
+            }),
+            Frame::Integer(length as i64),
+        ))
+    }
+
+    fn execute_list_pop(
+        &self,
+        arguments: Vec<Bytes>,
+        left: bool,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let command = if left { "LPOP" } else { "RPOP" };
+        if arguments.len() < 2 || arguments.len() > 3 {
+            return Err(Error::protocol(format!(
+                "wrong number of arguments for '{command}'"
+            )));
+        }
+        let key = arguments[1].clone();
+        let count = match arguments.get(2) {
+            None => None,
+            Some(value) => Some(parse_non_negative_u64(value, command)?),
+        };
+        let Some(list) = self.list_for_key(&key)? else {
+            return Ok((
+                None,
+                if count.is_some() {
+                    Frame::Array(Vec::new())
+                } else {
+                    Frame::Null
+                },
+            ));
+        };
+        if count == Some(0) {
+            return Ok((None, Frame::Array(Vec::new())));
+        }
+        let response = match count {
+            None => {
+                let value = if left { list.front() } else { list.back() };
+                value.map_or(Frame::Null, |value| Frame::BulkString(value.clone()))
+            }
+            Some(count) => {
+                let count = (count as usize).min(list.len());
+                Frame::Array(if left {
+                    list.iter()
+                        .take(count)
+                        .cloned()
+                        .map(Frame::BulkString)
+                        .collect()
+                } else {
+                    list.iter()
+                        .rev()
+                        .take(count)
+                        .cloned()
+                        .map(Frame::BulkString)
+                        .collect()
+                })
+            }
+        };
+        Ok((Some(Operation::ListPop { key, count, left }), response))
+    }
+
+    fn execute_list_index(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("LINDEX", &arguments, 3)?;
+        let index = parse_signed_i64(&arguments[2], "LINDEX")?;
+        let value = self
+            .list_for_key(&arguments[1])?
+            .and_then(|list| {
+                normalize_list_index(index, list.len()).and_then(|index| list.get(index))
+            })
+            .cloned()
+            .map_or(Frame::Null, Frame::BulkString);
+        Ok((None, value))
+    }
+
+    fn execute_list_range(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("LRANGE", &arguments, 4)?;
+        let start = parse_signed_i64(&arguments[2], "LRANGE")?;
+        let stop = parse_signed_i64(&arguments[3], "LRANGE")?;
+        let values = self
+            .list_for_key(&arguments[1])?
+            .and_then(|list| {
+                normalize_list_range(start, stop, list.len()).map(|(start, stop)| {
+                    list.iter()
+                        .skip(start)
+                        .take(stop - start + 1)
+                        .cloned()
+                        .map(Frame::BulkString)
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        Ok((None, Frame::Array(values)))
+    }
+
+    fn execute_list_len(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("LLEN", &arguments, 2)?;
+        Ok((
+            None,
+            Frame::Integer(self.list_for_key(&arguments[1])?.map_or(0, VecDeque::len) as i64),
+        ))
+    }
+
+    fn execute_list_remove(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("LREM", &arguments, 4)?;
+        let count = parse_signed_i64(&arguments[2], "LREM")?;
+        let Some(list) = self.list_for_key(&arguments[1])? else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        let removed = count_list_matches(list, count, &arguments[3]);
+        if removed == 0 {
+            return Ok((None, Frame::Integer(0)));
+        }
+        Ok((
+            Some(Operation::ListRemove {
+                key: arguments[1].clone(),
+                count,
+                element: arguments[3].clone(),
+            }),
+            Frame::Integer(removed),
+        ))
+    }
+
+    fn execute_list_set(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("LSET", &arguments, 4)?;
+        let index = parse_signed_i64(&arguments[2], "LSET")?;
+        let Some(list) = self.list_for_key(&arguments[1])? else {
+            return Err(Error::protocol("no such key"));
+        };
+        if normalize_list_index(index, list.len()).is_none() {
+            return Err(Error::protocol("index out of range"));
+        }
+        Ok((
+            Some(Operation::ListSet {
+                key: arguments[1].clone(),
+                index,
+                value: arguments[3].clone(),
+            }),
+            Frame::simple_string("OK"),
+        ))
+    }
+
+    fn execute_list_trim(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("LTRIM", &arguments, 4)?;
+        let start = parse_signed_i64(&arguments[2], "LTRIM")?;
+        let stop = parse_signed_i64(&arguments[3], "LTRIM")?;
+        let Some(list) = self.list_for_key(&arguments[1])? else {
+            return Ok((None, Frame::simple_string("OK")));
+        };
+        if normalize_list_range(start, stop, list.len()).is_none() {
+            return Ok((
+                Some(Operation::ListTrim {
+                    key: arguments[1].clone(),
+                    start,
+                    stop,
+                }),
+                Frame::simple_string("OK"),
+            ));
+        }
+        Ok((
+            Some(Operation::ListTrim {
+                key: arguments[1].clone(),
+                start,
+                stop,
+            }),
+            Frame::simple_string("OK"),
+        ))
+    }
 }
 
 fn value_to_frame(value: Option<&Value>) -> Frame {
     match value {
         Some(Value::String(value)) => Frame::BulkString(value.clone()),
-        Some(Value::Hash(_)) => wrong_type_frame(),
+        Some(_) => wrong_type_frame(),
         None => Frame::Null,
     }
 }
@@ -1178,7 +1622,7 @@ fn value_to_frame(value: Option<&Value>) -> Frame {
 fn string_value_to_frame(value: Option<&Value>) -> Result<Frame> {
     match value {
         Some(Value::String(value)) => Ok(Frame::BulkString(value.clone())),
-        Some(Value::Hash(_)) => Err(wrong_type_error()),
+        Some(_) => Err(wrong_type_error()),
         None => Ok(Frame::Null),
     }
 }
@@ -1233,6 +1677,91 @@ fn parse_signed_i64(value: &Bytes, command: &str) -> Result<i64> {
     value
         .parse::<i64>()
         .map_err(|_| Error::protocol(format!("{command} ttl is invalid")))
+}
+
+fn normalize_list_index(index: i64, length: usize) -> Option<usize> {
+    let length = i64::try_from(length).ok()?;
+    let index = if index < 0 {
+        length.checked_add(index)?
+    } else {
+        index
+    };
+    usize::try_from(index)
+        .ok()
+        .filter(|index| *index < length as usize)
+}
+
+fn normalize_list_range(start: i64, stop: i64, length: usize) -> Option<(usize, usize)> {
+    let length = i64::try_from(length).ok()?;
+    if length == 0 {
+        return None;
+    }
+    if start >= length || stop < -length {
+        return None;
+    }
+    let start = if start < -length {
+        0
+    } else if start < 0 {
+        length + start
+    } else {
+        start
+    };
+    let stop = if stop < 0 {
+        length + stop
+    } else {
+        stop.min(length - 1)
+    };
+    (start <= stop).then_some((start as usize, stop as usize))
+}
+
+fn count_list_matches(list: &VecDeque<Bytes>, count: i64, element: &Bytes) -> i64 {
+    if count > 0 {
+        list.iter()
+            .filter(|value| *value == element)
+            .take(count as usize)
+            .count() as i64
+    } else if count < 0 {
+        list.iter()
+            .rev()
+            .filter(|value| *value == element)
+            .take(count.unsigned_abs() as usize)
+            .count() as i64
+    } else {
+        list.iter().filter(|value| *value == element).count() as i64
+    }
+}
+
+fn remove_list_elements(list: &mut VecDeque<Bytes>, count: i64, element: &Bytes) -> i64 {
+    let mut remaining = if count == 0 {
+        usize::MAX
+    } else {
+        count.unsigned_abs() as usize
+    };
+    let mut removed = 0_i64;
+    if count >= 0 {
+        let mut kept = VecDeque::with_capacity(list.len());
+        while let Some(value) = list.pop_front() {
+            if value == *element && remaining > 0 {
+                remaining -= 1;
+                removed += 1;
+            } else {
+                kept.push_back(value);
+            }
+        }
+        *list = kept;
+    } else {
+        let mut kept = VecDeque::with_capacity(list.len());
+        while let Some(value) = list.pop_back() {
+            if value == *element && remaining > 0 {
+                remaining -= 1;
+                removed += 1;
+            } else {
+                kept.push_front(value);
+            }
+        }
+        *list = kept;
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -1471,6 +2000,149 @@ mod tests {
                 .unwrap()
                 .1,
             Frame::bulk_string("first")
+        );
+    }
+
+    #[test]
+    fn list_commands_preserve_order_and_support_negative_indexes() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LPUSH", b"list", b"a", b"b", b"c"]))
+                .unwrap()
+                .1,
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LRANGE", b"list", b"0", b"-1"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![
+                Frame::bulk_string("c"),
+                Frame::bulk_string("b"),
+                Frame::bulk_string("a"),
+            ])
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"RPUSH", b"list", b"d", b"e"]))
+                .unwrap()
+                .1,
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LINDEX", b"list", b"-1"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("e")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LLEN", b"list"]))
+                .unwrap()
+                .1,
+            Frame::Integer(5)
+        );
+    }
+
+    #[test]
+    fn list_mutations_replay_keep_ttl_and_remove_empty_keys() {
+        let mut first = StateMachine::default();
+        first.advance_logical_time(1_000);
+        first
+            .execute_request(command(&[b"RPUSH", b"list", b"a", b"b", b"c"]))
+            .unwrap();
+        first
+            .execute_request(command(&[b"PEXPIRE", b"list", b"500"]))
+            .unwrap();
+
+        let (operation, response) = first
+            .prepare_request(command(&[b"LPOP", b"list", b"2"]))
+            .unwrap();
+        assert_eq!(
+            response,
+            Frame::Array(vec![Frame::bulk_string("a"), Frame::bulk_string("b")])
+        );
+        let encoded = bincode::serialize(&operation.clone().unwrap()).unwrap();
+        let decoded: Operation = bincode::deserialize(&encoded).unwrap();
+        let mut second = first.clone();
+        assert_eq!(
+            second.apply(decoded),
+            ApplyResult::Response(Frame::Array(vec![
+                Frame::bulk_string("a"),
+                Frame::bulk_string("b")
+            ]))
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"PTTL", b"list"]))
+                .unwrap()
+                .1,
+            Frame::Integer(500)
+        );
+
+        assert_eq!(
+            second
+                .execute_request(command(&[b"RPOP", b"list"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("c")
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"EXISTS", b"list"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn list_remove_set_trim_and_wrong_type_are_deterministic() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"RPUSH", b"list", b"a", b"b", b"a", b"c", b"a"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LREM", b"list", b"2", b"a"]))
+                .unwrap()
+                .1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LSET", b"list", b"-1", b"z"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LTRIM", b"list", b"0", b"0"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"LRANGE", b"list", b"0", b"-1"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![Frame::bulk_string("b")])
+        );
+
+        state
+            .execute_request(command(&[b"SET", b"string", b"value"]))
+            .unwrap();
+        assert!(
+            state
+                .execute_request(command(&[b"LLEN", b"string"]))
+                .unwrap_err()
+                .to_string()
+                .contains("WRONGTYPE")
         );
     }
 
