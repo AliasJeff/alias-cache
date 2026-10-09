@@ -29,6 +29,8 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
   `HKEYS`、`HVALS`、`HLEN`、`HEXISTS`；
 - List：`LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LINDEX`、`LRANGE`、`LLEN`、
   `LREM`、`LSET`、`LTRIM`；
+- Set：`SADD`、`SREM`、`SMEMBERS`、`SISMEMBER`、`SCARD`、`SDIFF`、
+  `SINTER`、`SUNION`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
 - 事务：`MULTI`、`EXEC`、`DISCARD`；
 - Pipeline：复用普通请求顺序，不引入额外语义。
@@ -59,6 +61,14 @@ List 当前约束：
 - `LPOP/RPOP` 的 count 形式返回数组，无 count 时返回单值或 Null；
 - List 写入继承 key 的 TTL，删除最后一个元素后删除整个 key；
 - `BLPOP`、`BRPOP`、`LMOVE` 和 List blocking 语义尚未纳入稳定兼容范围。
+
+Set 当前约束：
+
+- Set member 使用二进制安全的 bulk string；
+- 内部使用确定性有序集合，集合返回结果按字节序排列；
+- `SDIFF`、`SINTER`、`SUNION` 支持多 Key 只读计算，并检查所有存在 Key 的类型；
+- Set 写入继承 key 的 TTL，删除最后一个 member 后删除整个 key；
+- `SPOP`、`SRANDMEMBER`、`SSCAN` 和 `*STORE` 写入变体尚未纳入稳定兼容范围。
 
 Sentinel 风格命令只能作为后续客户端发现适配层，不能成为 Raft 状态来源。
 

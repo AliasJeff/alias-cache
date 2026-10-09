@@ -15,6 +15,7 @@ pub enum Value {
     String(Bytes),
     Hash(BTreeMap<Bytes, Bytes>),
     List(VecDeque<Bytes>),
+    Set(BTreeSet<Bytes>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,6 +80,14 @@ pub enum Operation {
         start: i64,
         stop: i64,
     },
+    SetAdd {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    SetRemove {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
     Delete {
         keys: Vec<Bytes>,
     },
@@ -127,6 +136,8 @@ impl Operation {
             | Self::ListRemove { .. }
             | Self::ListSet { .. }
             | Self::ListTrim { .. }
+            | Self::SetAdd { .. }
+            | Self::SetRemove { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -149,6 +160,8 @@ impl Operation {
             | Self::ListRemove { .. }
             | Self::ListSet { .. }
             | Self::ListTrim { .. }
+            | Self::SetAdd { .. }
+            | Self::SetRemove { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -196,6 +209,8 @@ impl StateMachine {
             | Operation::ListRemove { .. }
             | Operation::ListSet { .. }
             | Operation::ListTrim { .. }
+            | Operation::SetAdd { .. }
+            | Operation::SetRemove { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -544,6 +559,60 @@ impl StateMachine {
                 );
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
+            Operation::SetAdd { key, members } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut set = match existing.map(|entry| entry.value) {
+                    None => BTreeSet::new(),
+                    Some(Value::Set(set)) => set,
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let added = members
+                    .into_iter()
+                    .filter(|member| set.insert(member.clone()))
+                    .count() as i64;
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::Set(set),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::Integer(added))
+            }
+            Operation::SetRemove { key, members } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::Integer(0));
+                };
+                let Value::Set(mut set) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let removed = members
+                    .into_iter()
+                    .filter(|member| set.remove(member))
+                    .count() as i64;
+                if set.is_empty() {
+                    self.values.remove(&key);
+                } else if removed > 0 {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::Set(set),
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(removed))
+            }
             Operation::Delete { keys } => {
                 let mut removed = 0;
                 for key in keys {
@@ -768,6 +837,30 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"LTRIM") {
             return self.execute_list_trim(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SADD") {
+            return self.execute_set_add(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SREM") {
+            return self.execute_set_remove(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SMEMBERS") {
+            return self.execute_set_members(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SISMEMBER") {
+            return self.execute_set_is_member(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SCARD") {
+            return self.execute_set_cardinality(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SDIFF") {
+            return self.execute_set_difference(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SINTER") {
+            return self.execute_set_intersection(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SUNION") {
+            return self.execute_set_union(arguments);
         }
         if command.eq_ignore_ascii_case(b"TYPE") {
             return self.execute_type(arguments);
@@ -1093,6 +1186,7 @@ impl StateMachine {
                 Value::String(_) => "string",
                 Value::Hash(_) => "hash",
                 Value::List(_) => "list",
+                Value::Set(_) => "set",
             },
             _ => "none",
         };
@@ -1609,6 +1703,126 @@ impl StateMachine {
             Frame::simple_string("OK"),
         ))
     }
+
+    fn set_for_key(&self, key: &Bytes) -> Result<Option<&BTreeSet<Bytes>>> {
+        let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
+            return Ok(None);
+        };
+        match &entry.value {
+            Value::Set(set) => Ok(Some(set)),
+            _ => Err(wrong_type_error()),
+        }
+    }
+
+    fn execute_set_add(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("SADD", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let existing = self.set_for_key(&key)?;
+        let mut seen = BTreeSet::new();
+        let added = arguments[2..]
+            .iter()
+            .filter(|member| seen.insert((*member).clone()))
+            .filter(|member| existing.is_none_or(|set| !set.contains(*member)))
+            .count() as i64;
+        Ok((
+            Some(Operation::SetAdd {
+                key,
+                members: arguments[2..].to_vec(),
+            }),
+            Frame::Integer(added),
+        ))
+    }
+
+    fn execute_set_remove(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("SREM", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let Some(set) = self.set_for_key(&key)? else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        let mut seen = BTreeSet::new();
+        let members = arguments[2..]
+            .iter()
+            .filter(|member| seen.insert((*member).clone()))
+            .filter(|member| set.contains(*member))
+            .cloned()
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return Ok((None, Frame::Integer(0)));
+        }
+        let removed = members.len() as i64;
+        Ok((
+            Some(Operation::SetRemove { key, members }),
+            Frame::Integer(removed),
+        ))
+    }
+
+    fn execute_set_members(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("SMEMBERS", &arguments, 2)?;
+        let members = self
+            .set_for_key(&arguments[1])?
+            .map(|set| set.iter().cloned().map(Frame::BulkString).collect())
+            .unwrap_or_default();
+        Ok((None, Frame::Set(members)))
+    }
+
+    fn execute_set_is_member(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("SISMEMBER", &arguments, 3)?;
+        let member = self
+            .set_for_key(&arguments[1])?
+            .is_some_and(|set| set.contains(&arguments[2]));
+        Ok((None, Frame::Integer(i64::from(member))))
+    }
+
+    fn execute_set_cardinality(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("SCARD", &arguments, 2)?;
+        Ok((
+            None,
+            Frame::Integer(self.set_for_key(&arguments[1])?.map_or(0, BTreeSet::len) as i64),
+        ))
+    }
+
+    fn execute_set_difference(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("SDIFF", &arguments, 2)?;
+        let mut result = self
+            .set_for_key(&arguments[1])?
+            .cloned()
+            .unwrap_or_default();
+        for key in &arguments[2..] {
+            if let Some(set) = self.set_for_key(key)? {
+                result.retain(|member| !set.contains(member));
+            }
+        }
+        Ok((None, set_frame(result)))
+    }
+
+    fn execute_set_intersection(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("SINTER", &arguments, 2)?;
+        let mut result = self
+            .set_for_key(&arguments[1])?
+            .cloned()
+            .unwrap_or_default();
+        for key in &arguments[2..] {
+            match self.set_for_key(key)? {
+                Some(set) => result.retain(|member| set.contains(member)),
+                None => result.clear(),
+            }
+        }
+        Ok((None, set_frame(result)))
+    }
+
+    fn execute_set_union(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("SUNION", &arguments, 2)?;
+        let mut result = BTreeSet::new();
+        for key in &arguments[1..] {
+            if let Some(set) = self.set_for_key(key)? {
+                result.extend(set.iter().cloned());
+            }
+        }
+        Ok((None, set_frame(result)))
+    }
 }
 
 fn value_to_frame(value: Option<&Value>) -> Frame {
@@ -1625,6 +1839,10 @@ fn string_value_to_frame(value: Option<&Value>) -> Result<Frame> {
         Some(_) => Err(wrong_type_error()),
         None => Ok(Frame::Null),
     }
+}
+
+fn set_frame(set: BTreeSet<Bytes>) -> Frame {
+    Frame::Set(set.into_iter().map(Frame::BulkString).collect())
 }
 
 fn wrong_type_error() -> Error {
@@ -2143,6 +2361,147 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("WRONGTYPE")
+        );
+    }
+
+    #[test]
+    fn set_commands_are_deduplicated_and_sorted_deterministically() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SADD", b"one", b"b", b"a", b"b"]))
+                .unwrap()
+                .1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SMEMBERS", b"one"]))
+                .unwrap()
+                .1,
+            Frame::Set(vec![Frame::bulk_string("a"), Frame::bulk_string("b")])
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SISMEMBER", b"one", b"a"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SCARD", b"one"]))
+                .unwrap()
+                .1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SREM", b"one", b"b", b"b"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SCARD", b"one"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn set_operations_replay_keep_ttl_and_compute_cross_key_results() {
+        let mut first = StateMachine::default();
+        first.advance_logical_time(1_000);
+        first
+            .execute_request(command(&[b"SADD", b"left", b"a", b"b", b"c"]))
+            .unwrap();
+        first
+            .execute_request(command(&[b"SADD", b"right", b"b", b"c", b"d"]))
+            .unwrap();
+        first
+            .execute_request(command(&[b"PEXPIRE", b"left", b"500"]))
+            .unwrap();
+
+        assert_eq!(
+            first
+                .execute_request(command(&[b"SDIFF", b"left", b"right"]))
+                .unwrap()
+                .1,
+            Frame::Set(vec![Frame::bulk_string("a")])
+        );
+        assert_eq!(
+            first
+                .execute_request(command(&[b"SINTER", b"left", b"right"]))
+                .unwrap()
+                .1,
+            Frame::Set(vec![Frame::bulk_string("b"), Frame::bulk_string("c")])
+        );
+        assert_eq!(
+            first
+                .execute_request(command(&[b"SUNION", b"left", b"right"]))
+                .unwrap()
+                .1,
+            Frame::Set(vec![
+                Frame::bulk_string("a"),
+                Frame::bulk_string("b"),
+                Frame::bulk_string("c"),
+                Frame::bulk_string("d")
+            ])
+        );
+
+        let (operation, response) = first
+            .prepare_request(command(&[b"SADD", b"left", b"d"]))
+            .unwrap();
+        assert_eq!(response, Frame::Integer(1));
+        let encoded = bincode::serialize(&operation.clone().unwrap()).unwrap();
+        let decoded: Operation = bincode::deserialize(&encoded).unwrap();
+        let mut second = first.clone();
+        assert_eq!(
+            second.apply(decoded),
+            ApplyResult::Response(Frame::Integer(1))
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"PTTL", b"left"]))
+                .unwrap()
+                .1,
+            Frame::Integer(500)
+        );
+    }
+
+    #[test]
+    fn set_commands_enforce_wrong_type_and_remove_empty_keys() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"string", b"value"]))
+            .unwrap();
+        assert!(
+            state
+                .execute_request(command(&[b"SADD", b"string", b"member"]))
+                .unwrap_err()
+                .to_string()
+                .contains("WRONGTYPE")
+        );
+
+        state
+            .execute_request(command(&[b"SADD", b"set", b"member"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SREM", b"set", b"member"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"TYPE", b"set"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("none")
         );
     }
 

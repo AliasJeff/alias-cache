@@ -80,6 +80,12 @@
 - List 操作进入统一 `Operation`、Raft apply、事务和快照序列化路径；
   支持负索引、count 形式弹出、TTL 继承、空 key 清理、序列化重放和稳定
   `WRONGTYPE`。
+- 已实现 Set 状态类型和确定性 `BTreeSet` 表示：
+  `SADD`、`SREM`、`SMEMBERS`、`SISMEMBER`、`SCARD`、`SDIFF`、`SINTER`、
+  `SUNION`。
+- Set 写操作进入统一 `Operation`、Raft apply、事务和快照序列化路径；
+  集合计算结果按字节序稳定返回，更新继承 TTL，删除最后 member 自动删除 key。
+- `SPOP`、`SRANDMEMBER` 等随机命令暂缓到确定性随机种子和响应上限设计完成后实现。
 - 已实现连接级 `MULTI`、`EXEC`、`DISCARD` 状态。
 - 已实现 `Operation::Transaction`，多个写子命令作为一个 Raft 日志操作提交。
 - 事务内子命令共享同一个逻辑写入时间，TTL 操作按入队顺序执行。
