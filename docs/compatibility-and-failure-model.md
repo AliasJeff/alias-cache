@@ -23,7 +23,7 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 
 第一版建议支持：
 
-- 连接：`PING`、`ECHO`、`QUIT`、`SELECT`、`HELLO`；
+- 连接：`PING`、`ECHO`、`QUIT`、`AUTH`、`SELECT`、`HELLO`；
 - 字符串：`GET`、`SET`、`DEL`、`EXISTS`、`MGET`、`MSET`、`INCRBY`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
 - 事务：`MULTI`、`EXEC`、`DISCARD`；

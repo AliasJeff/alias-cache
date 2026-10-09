@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use alias_cache::config::{Config, PeerSpec};
 use alias_cache::server::Server;
 use alias_cache::{Error, Result};
+use bytes::Bytes;
 use clap::Parser;
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -33,6 +34,11 @@ struct Args {
     #[arg(long, default_value = "alias-cache")]
     sentinel_master_name: String,
 
+    /// Password required by client connections. ALIAS_CACHE_PASSWORD is also
+    /// accepted so credentials do not need to appear in the process command line.
+    #[arg(long, env = "ALIAS_CACHE_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+
     /// Cluster member as <NODE_ID=RAFT_ADDR[/CLIENT_ADDR]>. Repeat for every
     /// voter including this node. Omit all peers to run a single-node store.
     #[arg(long = "peer", value_name = "SPEC")]
@@ -58,6 +64,10 @@ fn build_config(args: &Args) -> Result<Config> {
         client_addr: args.client_addr,
         raft_addr: args.raft_addr,
         sentinel_master_name: args.sentinel_master_name.clone(),
+        password: args
+            .password
+            .as_ref()
+            .map(|value| Bytes::copy_from_slice(value.as_bytes())),
         bootstrap: args.bootstrap,
         data_dir,
         ..Config::default()
@@ -153,5 +163,12 @@ mod tests {
     #[test]
     fn node_id_is_required() {
         assert!(args(&[]).is_err());
+    }
+
+    #[test]
+    fn password_can_be_loaded_from_cli() {
+        let config =
+            build_config(&args(&["--node-id", "1", "--password", "secret"]).unwrap()).unwrap();
+        assert_eq!(config.password, Some(Bytes::from_static(b"secret")));
     }
 }

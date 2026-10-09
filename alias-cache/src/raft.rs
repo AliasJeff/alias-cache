@@ -2446,8 +2446,6 @@ pub async fn purge_raft_log(raft: &RaftHandle, upto: u64) -> CacheResult<()> {
 }
 
 pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
-    const MAX_ATTEMPTS: usize = 40;
-
     for attempt in 0..MAX_ATTEMPTS {
         wait_for_membership_commit(
             raft,
@@ -2474,31 +2472,45 @@ pub async fn promote_raft_learner(raft: &RaftHandle, node_id: NodeId) -> CacheRe
         }
         voters.sort_unstable();
 
-        match raft.change_membership(voters, false).await {
-            Ok(_) => return Ok(()),
-            Err(openraft::error::RaftError::APIError(
-                openraft::error::ClientWriteError::ForwardToLeader(_),
-            )) => {}
-            Err(openraft::error::RaftError::APIError(
-                openraft::error::ClientWriteError::ChangeMembershipError(
-                    openraft::error::ChangeMembershipError::InProgress(_),
-                ),
-            )) => {}
+        match submit_membership_change(raft, voters, false).await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_membership_error(&error) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    tokio::time::sleep(MEMBERSHIP_RETRY_DELAY).await;
+                }
+            }
             Err(error) => {
                 return Err(Error::server(format!(
                     "promote raft learner {node_id}: {error}"
                 )));
             }
         }
-
-        if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
     }
 
     Err(Error::server(format!(
         "promote raft learner {node_id} timed out while waiting for a stable leader"
     )))
+}
+
+const MAX_ATTEMPTS: usize = 40;
+const MEMBERSHIP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+async fn submit_membership_change(
+    raft: &RaftHandle,
+    voters: Vec<NodeId>,
+    retain: bool,
+) -> CacheResult<()> {
+    raft.change_membership(voters, retain)
+        .await
+        .map(|_| ())
+        .map_err(|error| Error::server(error.to_string()))
+}
+
+fn is_retryable_membership_error(error: &Error) -> bool {
+    let Error::Server(message) = error else {
+        return false;
+    };
+    message.contains("has to forward request to") || message.contains("in progress")
 }
 
 pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
@@ -2517,10 +2529,24 @@ pub async fn remove_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResul
             "refuse to remove the last raft voter",
         ));
     }
-    raft.change_membership(voters, false)
-        .await
-        .map_err(|error| Error::server(format!("remove raft voter {node_id}: {error}")))?;
-    Ok(())
+    for attempt in 0..MAX_ATTEMPTS {
+        match submit_membership_change(raft, voters.clone(), false).await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_membership_error(&error) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    tokio::time::sleep(MEMBERSHIP_RETRY_DELAY).await;
+                }
+            }
+            Err(error) => {
+                return Err(Error::server(format!(
+                    "remove raft voter {node_id}: {error}"
+                )));
+            }
+        }
+    }
+    Err(Error::server(format!(
+        "remove raft voter {node_id} timed out while waiting for a stable leader"
+    )))
 }
 
 pub async fn drain_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult<()> {
@@ -2536,9 +2562,24 @@ pub async fn drain_raft_voter(raft: &RaftHandle, node_id: NodeId) -> CacheResult
     if remaining.is_empty() {
         return Err(Error::invalid_config("refuse to drain the last raft voter"));
     }
-    raft.change_membership(remaining, true)
-        .await
-        .map_err(|error| Error::server(format!("drain raft voter {node_id}: {error}")))?;
+    for attempt in 0..MAX_ATTEMPTS {
+        match submit_membership_change(raft, remaining.clone(), true).await {
+            Ok(()) => break,
+            Err(error) if is_retryable_membership_error(&error) => {
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(Error::server(format!(
+                        "drain raft voter {node_id} timed out while waiting for a stable leader"
+                    )));
+                }
+                tokio::time::sleep(MEMBERSHIP_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                return Err(Error::server(format!(
+                    "drain raft voter {node_id}: {error}"
+                )));
+            }
+        }
+    }
     raft.wait(None)
         .metrics(
             |metrics| {

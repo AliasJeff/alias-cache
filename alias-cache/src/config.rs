@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
+
 use crate::error::{Error, Result};
 use crate::protocol::ProtocolLimits;
 use crate::raft::{Node, NodeId};
@@ -67,6 +69,7 @@ pub struct Config {
     pub node_id: u64,
     pub bootstrap: bool,
     pub sentinel_master_name: String,
+    pub password: Option<Bytes>,
     pub cluster_nodes: BTreeMap<NodeId, Node>,
     pub cluster_client_addrs: BTreeMap<NodeId, SocketAddr>,
     pub data_dir: PathBuf,
@@ -84,6 +87,7 @@ impl Default for Config {
             node_id: 1,
             bootstrap: false,
             sentinel_master_name: "alias-cache".to_string(),
+            password: None,
             cluster_nodes: BTreeMap::new(),
             cluster_client_addrs: BTreeMap::new(),
             data_dir: PathBuf::from("data/node-1"),
@@ -104,6 +108,9 @@ impl Config {
             return Err(Error::invalid_config(
                 "sentinel_master_name must not be empty",
             ));
+        }
+        if self.password.as_ref().is_some_and(Bytes::is_empty) {
+            return Err(Error::invalid_config("password must not be empty"));
         }
         if !self.cluster_nodes.is_empty() && !self.cluster_nodes.contains_key(&self.node_id) {
             return Err(Error::invalid_config(
@@ -163,6 +170,11 @@ impl Config {
 
     pub fn with_sentinel_master_name(mut self, name: impl Into<String>) -> Self {
         self.sentinel_master_name = name.into();
+        self
+    }
+
+    pub fn with_password(mut self, password: Option<Bytes>) -> Self {
+        self.password = password;
         self
     }
 
@@ -247,6 +259,12 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn empty_password_is_rejected() {
+        let config = Config::default().with_password(Some(Bytes::new()));
+        assert!(config.validate().is_err());
     }
 
     #[test]

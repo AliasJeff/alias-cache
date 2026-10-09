@@ -30,6 +30,7 @@ name = "alias-cache-cli"
 version = "0.1.0"
 dependencies = [
  "alias-cache",
+ "bytes",
  "clap",
  "tokio",
  "tracing",

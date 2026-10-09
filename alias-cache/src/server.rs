@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -117,6 +117,7 @@ impl Server {
                     let limits = self.config.protocol_limits();
                     let child_raft = raft.clone();
                     let sentinel_context = sentinel_context.clone();
+                    let password = self.config.password.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
                             handle_raft_connection(
@@ -125,6 +126,7 @@ impl Server {
                                 child_raft,
                                 limits,
                                 sentinel_context.clone(),
+                                password,
                             )
                             .await
                         {
@@ -160,9 +162,11 @@ async fn handle_connection(
     shutdown: Arc<watch::Receiver<bool>>,
     node_state: SharedNodeState,
     limits: crate::protocol::ProtocolLimits,
+    password: Option<Bytes>,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut resp_version = RespVersion::Resp2;
+    let mut authenticated = password.is_none();
     let mut input = [0_u8; 8 * 1024];
     loop {
         tokio::select! {
@@ -186,7 +190,12 @@ async fn handle_connection(
                 for frame in frames {
                     let response = match command_from_frame(frame) {
                         Ok(request) => {
-                            if let Some(response) = connection_command(&request, &mut resp_version) {
+                            if let Some(response) = connection_command(
+                                &request,
+                                &mut resp_version,
+                                &mut authenticated,
+                                password.as_deref(),
+                            ) {
                                 response
                             } else {
                                 let mut state = node_state.lock().await;
@@ -217,11 +226,13 @@ async fn handle_raft_connection(
     raft: Arc<RaftHandle>,
     limits: crate::protocol::ProtocolLimits,
     sentinel_context: SentinelContext,
+    password: Option<Bytes>,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
     let mut transaction = None;
     let mut resp_version = RespVersion::Resp2;
+    let mut authenticated = password.is_none();
     loop {
         tokio::select! {
             result = stream.read(&mut input) => {
@@ -250,6 +261,8 @@ async fn handle_raft_connection(
                                 request,
                                 &sentinel_context,
                                 &mut resp_version,
+                                &mut authenticated,
+                                password.as_deref(),
                             )
                             .await
                         }
@@ -275,11 +288,27 @@ async fn handle_raft_connection(
 fn connection_command(
     request: &crate::protocol::Request,
     resp_version: &mut RespVersion,
+    authenticated: &mut bool,
+    configured_password: Option<&[u8]>,
 ) -> Option<Frame> {
     let crate::protocol::Request::Command(arguments) = request;
     let command = arguments.first()?;
     if command.eq_ignore_ascii_case(b"HELLO") {
-        return Some(hello_command(arguments, resp_version));
+        return Some(hello_command(
+            arguments,
+            resp_version,
+            authenticated,
+            configured_password,
+        ));
+    }
+    if command.eq_ignore_ascii_case(b"AUTH") {
+        return Some(auth_command(arguments, authenticated, configured_password));
+    }
+    if command.eq_ignore_ascii_case(b"QUIT") {
+        return Some(Frame::simple_string("OK"));
+    }
+    if configured_password.is_some() && !*authenticated {
+        return Some(Frame::error("NOAUTH Authentication required."));
     }
     if command.eq_ignore_ascii_case(b"PING") {
         return Some(match arguments.len() {
@@ -297,7 +326,43 @@ fn connection_command(
     None
 }
 
-fn hello_command(arguments: &[bytes::Bytes], resp_version: &mut RespVersion) -> Frame {
+fn auth_command(
+    arguments: &[Bytes],
+    authenticated: &mut bool,
+    configured_password: Option<&[u8]>,
+) -> Frame {
+    let password = match arguments {
+        [command, password] if command.eq_ignore_ascii_case(b"AUTH") => password.as_ref(),
+        [command, username, password]
+            if command.eq_ignore_ascii_case(b"AUTH")
+                && username.eq_ignore_ascii_case(b"default") =>
+        {
+            password.as_ref()
+        }
+        [command, _, _] if command.eq_ignore_ascii_case(b"AUTH") => {
+            return Frame::error("WRONGPASS invalid username-password pair");
+        }
+        _ => return Frame::error("ERR wrong number of arguments for 'auth' command"),
+    };
+    let Some(configured_password) = configured_password else {
+        return Frame::error(
+            "ERR AUTH <password> called without any password configured for the default user.",
+        );
+    };
+    if password == configured_password {
+        *authenticated = true;
+        Frame::simple_string("OK")
+    } else {
+        Frame::error("WRONGPASS invalid username-password pair")
+    }
+}
+
+fn hello_command(
+    arguments: &[Bytes],
+    resp_version: &mut RespVersion,
+    authenticated: &mut bool,
+    configured_password: Option<&[u8]>,
+) -> Frame {
     let requested = match arguments.get(1) {
         None => *resp_version,
         Some(value) => match value.as_ref() {
@@ -314,10 +379,27 @@ fn hello_command(arguments: &[bytes::Bytes], resp_version: &mut RespVersion) -> 
             }
             index += 2;
         } else if arguments[index].eq_ignore_ascii_case(b"AUTH") {
-            return Frame::error("ERR AUTH is not configured");
+            if index + 2 >= arguments.len()
+                || !arguments[index + 1].eq_ignore_ascii_case(b"default")
+            {
+                return Frame::error("WRONGPASS invalid username-password pair");
+            }
+            let Some(configured_password) = configured_password else {
+                return Frame::error("ERR AUTH is not configured");
+            };
+            if arguments[index + 2].as_ref() != configured_password {
+                return Frame::error("WRONGPASS invalid username-password pair");
+            }
+            *authenticated = true;
+            index += 3;
         } else {
             return Frame::error("ERR Syntax error");
         }
+    }
+    if configured_password.is_some() && !*authenticated {
+        return Frame::error(
+            "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO AUTH <user> <pass> option can be used",
+        );
     }
     *resp_version = requested;
     Frame::Map(vec![
@@ -350,9 +432,28 @@ async fn handle_transaction_command(
     request: crate::protocol::Request,
     sentinel_context: &SentinelContext,
     resp_version: &mut RespVersion,
+    authenticated: &mut bool,
+    configured_password: Option<&[u8]>,
 ) -> Frame {
+    let command = match &request {
+        crate::protocol::Request::Command(arguments) => {
+            arguments.first().map(|argument| argument.as_ref())
+        }
+    };
+    if configured_password.is_some()
+        && !*authenticated
+        && !command.is_some_and(|command| {
+            command.eq_ignore_ascii_case(b"AUTH")
+                || command.eq_ignore_ascii_case(b"HELLO")
+                || command.eq_ignore_ascii_case(b"QUIT")
+        })
+    {
+        return Frame::error("NOAUTH Authentication required.");
+    }
     if transaction.is_none() {
-        if let Some(response) = connection_command(&request, resp_version) {
+        if let Some(response) =
+            connection_command(&request, resp_version, authenticated, configured_password)
+        {
             return response;
         }
         if let Some(response) = sentinel::execute(raft, sentinel_context, &request).await {
@@ -581,6 +682,7 @@ mod tests {
                             let raft = connection_raft.clone();
                             let shutdown = connection_shutdown.clone();
                             let sentinel_context = sentinel_context.clone();
+                            let password = config.password.clone();
                             tokio::spawn(async move {
                                 let _ = handle_raft_connection(
                                     stream,
@@ -588,6 +690,7 @@ mod tests {
                                     raft,
                                     limits,
                                     sentinel_context,
+                                    password,
                                 )
                                 .await;
                             });
@@ -698,7 +801,7 @@ mod tests {
             let state = Arc::new(tokio::sync::Mutex::new(
                 NodeState::open(&config.data_dir).unwrap(),
             ));
-            handle_connection(stream, shutdown, state, limits).await
+            handle_connection(stream, shutdown, state, limits, None).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -747,7 +850,7 @@ mod tests {
             let state = Arc::new(tokio::sync::Mutex::new(
                 NodeState::open(&config.data_dir).unwrap(),
             ));
-            handle_connection(stream, shutdown, state, limits).await
+            handle_connection(stream, shutdown, state, limits, None).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -803,7 +906,7 @@ mod tests {
         let sentinel_context = SentinelContext::from_config(&config);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context).await
+            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -847,12 +950,15 @@ mod tests {
     #[test]
     fn hello_negotiates_resp3_and_can_switch_back_to_resp2() {
         let mut version = RespVersion::Resp2;
+        let mut authenticated = true;
         let response = hello_command(
             &[
                 bytes::Bytes::from_static(b"HELLO"),
                 bytes::Bytes::from_static(b"3"),
             ],
             &mut version,
+            &mut authenticated,
+            None,
         );
         assert_eq!(version, RespVersion::Resp3);
         assert!(matches!(response, Frame::Map(_)));
@@ -867,6 +973,8 @@ mod tests {
                 bytes::Bytes::from_static(b"2"),
             ],
             &mut version,
+            &mut authenticated,
+            None,
         );
         assert_eq!(version, RespVersion::Resp2);
         assert!(matches!(response, Frame::Map(_)));
@@ -878,6 +986,7 @@ mod tests {
     #[test]
     fn hello_rejects_unsupported_versions_and_auth_without_configuration() {
         let mut version = RespVersion::Resp2;
+        let mut authenticated = true;
         assert_eq!(
             hello_command(
                 &[
@@ -885,6 +994,8 @@ mod tests {
                     bytes::Bytes::from_static(b"4"),
                 ],
                 &mut version,
+                &mut authenticated,
+                None,
             ),
             Frame::error("NOPROTO unsupported protocol version")
         );
@@ -898,10 +1009,108 @@ mod tests {
                     bytes::Bytes::from_static(b"secret"),
                 ],
                 &mut version,
+                &mut authenticated,
+                None,
             ),
             Frame::error("ERR AUTH is not configured")
         );
         assert_eq!(version, RespVersion::Resp2);
+    }
+
+    #[tokio::test]
+    async fn password_protects_client_commands_and_supports_hello_auth() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: unique_server_dir("password-auth"),
+            ..Config::default()
+        };
+        config.password = Some(Bytes::from_static(b"secret"));
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_dir = config.data_dir.clone();
+        let password = config.password.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                config.protocol_limits(),
+                SentinelContext::from_config(&config),
+                password,
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut frames = FrameReader::new();
+        client
+            .write_all(
+                b"*1\r\n$5\r\nMULTI\r\n\
+*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n\
+*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n\
+*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n\
+*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n\
+*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::error("NOAUTH Authentication required.")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::error("NOAUTH Authentication required.")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::error("WRONGPASS invalid username-password pair")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::bulk_string("value")
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+
+        let mut version = RespVersion::Resp2;
+        let response = hello_command(
+            &[
+                Bytes::from_static(b"HELLO"),
+                Bytes::from_static(b"3"),
+                Bytes::from_static(b"AUTH"),
+                Bytes::from_static(b"default"),
+                Bytes::from_static(b"secret"),
+            ],
+            &mut version,
+            &mut false,
+            Some(b"secret"),
+        );
+        assert_eq!(version, RespVersion::Resp3);
+        assert!(matches!(response, Frame::Map(_)));
     }
 
     #[tokio::test]
@@ -937,6 +1146,7 @@ mod tests {
                 raft,
                 config.protocol_limits(),
                 SentinelContext::from_config(&config),
+                None,
             )
             .await
         });
@@ -1031,6 +1241,7 @@ mod tests {
                 raft,
                 config.protocol_limits(),
                 SentinelContext::from_config(&config),
+                None,
             )
             .await
         });
@@ -1096,6 +1307,7 @@ mod tests {
                 raft,
                 config.protocol_limits(),
                 sentinel_context,
+                None,
             )
             .await
         });
