@@ -70,6 +70,10 @@ pub struct Config {
     pub bootstrap: bool,
     pub sentinel_master_name: String,
     pub password: Option<Bytes>,
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
+    pub tls_ca_file: Option<PathBuf>,
+    pub tls_auth_clients: bool,
     pub cluster_nodes: BTreeMap<NodeId, Node>,
     pub cluster_client_addrs: BTreeMap<NodeId, SocketAddr>,
     pub data_dir: PathBuf,
@@ -88,6 +92,10 @@ impl Default for Config {
             bootstrap: false,
             sentinel_master_name: "alias-cache".to_string(),
             password: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            tls_ca_file: None,
+            tls_auth_clients: false,
             cluster_nodes: BTreeMap::new(),
             cluster_client_addrs: BTreeMap::new(),
             data_dir: PathBuf::from("data/node-1"),
@@ -111,6 +119,24 @@ impl Config {
         }
         if self.password.as_ref().is_some_and(Bytes::is_empty) {
             return Err(Error::invalid_config("password must not be empty"));
+        }
+        match (&self.tls_cert_file, &self.tls_key_file) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                return Err(Error::invalid_config(
+                    "tls_cert_file and tls_key_file must both be specified",
+                ));
+            }
+        }
+        if self.tls_auth_clients && self.tls_ca_file.is_none() {
+            return Err(Error::invalid_config(
+                "tls_ca_file is required when tls_auth_clients is enabled",
+            ));
+        }
+        if self.tls_ca_file.is_some() && self.tls_cert_file.is_none() {
+            return Err(Error::invalid_config(
+                "tls_ca_file requires tls_cert_file and tls_key_file",
+            ));
         }
         if !self.cluster_nodes.is_empty() && !self.cluster_nodes.contains_key(&self.node_id) {
             return Err(Error::invalid_config(
@@ -175,6 +201,20 @@ impl Config {
 
     pub fn with_password(mut self, password: Option<Bytes>) -> Self {
         self.password = password;
+        self
+    }
+
+    pub fn with_tls(
+        mut self,
+        cert_file: Option<PathBuf>,
+        key_file: Option<PathBuf>,
+        ca_file: Option<PathBuf>,
+        auth_clients: bool,
+    ) -> Self {
+        self.tls_cert_file = cert_file;
+        self.tls_key_file = key_file;
+        self.tls_ca_file = ca_file;
+        self.tls_auth_clients = auth_clients;
         self
     }
 
@@ -265,6 +305,26 @@ mod tests {
     fn empty_password_is_rejected() {
         let config = Config::default().with_password(Some(Bytes::new()));
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn tls_requires_a_complete_server_identity() {
+        let config = Config {
+            tls_cert_file: Some("server.crt".into()),
+            ..Config::default()
+        };
+        assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn tls_client_auth_requires_a_ca_file() {
+        let config = Config {
+            tls_cert_file: Some("server.crt".into()),
+            tls_key_file: Some("server.key".into()),
+            tls_auth_clients: true,
+            ..Config::default()
+        };
+        assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
     }
 
     #[test]

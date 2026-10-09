@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -18,6 +18,7 @@ use crate::raft::{
     send_transaction_request_with_id, serve_raft_rpc, wait_for_any_leader,
 };
 use crate::sentinel::{self, SentinelContext};
+use crate::tls::client_acceptor;
 
 pub struct Server {
     config: Config,
@@ -61,6 +62,7 @@ impl Server {
 
     pub async fn run(self) -> Result<()> {
         self.config.ensure_data_dir()?;
+        let tls_acceptor = client_acceptor(&self.config)?;
         let listener = TcpListener::bind(self.config.client_addr)
             .await
             .map_err(|source| Error::io("bind client listener", source))?;
@@ -118,18 +120,38 @@ impl Server {
                     let child_raft = raft.clone();
                     let sentinel_context = sentinel_context.clone();
                     let password = self.config.password.clone();
+                    let tls_acceptor = tls_acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_raft_connection(
-                                stream,
-                                child_shutdown,
-                                child_raft,
-                                limits,
-                                sentinel_context.clone(),
-                                password,
-                            )
-                            .await
-                        {
+                        let result = match tls_acceptor {
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(stream) => {
+                                    handle_raft_connection(
+                                        stream,
+                                        child_shutdown,
+                                        child_raft,
+                                        limits,
+                                        sentinel_context,
+                                        password,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(Error::server(format!(
+                                    "TLS client handshake failed: {error}"
+                                ))),
+                            },
+                            None => {
+                                handle_raft_connection(
+                                    stream,
+                                    child_shutdown,
+                                    child_raft,
+                                    limits,
+                                    sentinel_context,
+                                    password,
+                                )
+                                .await
+                            }
+                        };
+                        if let Err(error) = result {
                             warn!(%peer, %error, "client connection failed");
                         }
                     });
@@ -158,7 +180,7 @@ async fn wait_for_shutdown(shutdown: Arc<watch::Receiver<bool>>) -> Result<()> {
 
 #[cfg(test)]
 async fn handle_connection(
-    mut stream: TcpStream,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     shutdown: Arc<watch::Receiver<bool>>,
     node_state: SharedNodeState,
     limits: crate::protocol::ProtocolLimits,
@@ -221,7 +243,7 @@ async fn handle_connection(
 }
 
 async fn handle_raft_connection(
-    mut stream: TcpStream,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     shutdown: Arc<watch::Receiver<bool>>,
     raft: Arc<RaftHandle>,
     limits: crate::protocol::ProtocolLimits,
@@ -539,7 +561,7 @@ async fn execute_client_command(raft: &RaftHandle, request: crate::protocol::Req
 }
 
 async fn write_frame(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     frame: Frame,
     resp_version: RespVersion,
 ) -> Result<()> {

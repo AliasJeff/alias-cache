@@ -100,7 +100,8 @@ redis-cli -p 6379 GET hello
 
 ## 当前状态
 
-已实现并由测试覆盖（当前 `cargo test --workspace --locked`：105 个测试全部通过）：
+已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 109 个测试、
+CLI 6 个测试全部通过）：
 
 - RESP2 协议、PING/ECHO、Pipeline、MULTI/EXEC/DISCARD 事务
 - 确定性状态机：String 类型全套 SET 选项、TTL 家族命令
@@ -111,10 +112,16 @@ redis-cli -p 6379 GET hello
 - 只读 Sentinel 风格主节点发现
 - CLI 配置化（单节点/集群拓扑/种子引导）
 
-进行中 / 未完成：TLS、指标与健康检查、Hash/List/Set/ZSet 数据结构、benchmark 与发布工程。
+进行中 / 未完成：Raft 节点间 TLS、指标与健康检查、Hash/List/Set/ZSet 数据结构、
+benchmark 与发布工程。
 RESP3 基础类型、`HELLO 2/3` 协商和密码认证已实现。密码可通过
 `--password` 或 `ALIAS_CACHE_PASSWORD` 配置；启用后客户端必须先执行 `AUTH` 或
 `HELLO ... AUTH default <password>`。
+
+客户端连接也支持 TLS：同时指定 `--tls-cert-file` 和 `--tls-key-file` 即可启用
+TLS listener；额外指定 `--tls-ca-file --tls-auth-clients` 可要求客户端证书并执行
+mTLS 校验。当前 TLS 只保护客户端入口，Raft 节点间 TLS 仍在后续计划中，避免把
+明文节点间通信误认为已完成全链路加密。
 
 ## 许可证
 

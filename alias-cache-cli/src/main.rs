@@ -39,6 +39,22 @@ struct Args {
     #[arg(long, env = "ALIAS_CACHE_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
+    /// PEM certificate chain for the client-facing TLS listener.
+    #[arg(long, value_name = "FILE")]
+    tls_cert_file: Option<PathBuf>,
+
+    /// PEM private key for the client-facing TLS listener.
+    #[arg(long, value_name = "FILE")]
+    tls_key_file: Option<PathBuf>,
+
+    /// PEM CA bundle used to verify client certificates.
+    #[arg(long, value_name = "FILE")]
+    tls_ca_file: Option<PathBuf>,
+
+    /// Require and verify a client certificate against --tls-ca-file.
+    #[arg(long)]
+    tls_auth_clients: bool,
+
     /// Cluster member as <NODE_ID=RAFT_ADDR[/CLIENT_ADDR]>. Repeat for every
     /// voter including this node. Omit all peers to run a single-node store.
     #[arg(long = "peer", value_name = "SPEC")]
@@ -68,6 +84,10 @@ fn build_config(args: &Args) -> Result<Config> {
             .password
             .as_ref()
             .map(|value| Bytes::copy_from_slice(value.as_bytes())),
+        tls_cert_file: args.tls_cert_file.clone(),
+        tls_key_file: args.tls_key_file.clone(),
+        tls_ca_file: args.tls_ca_file.clone(),
+        tls_auth_clients: args.tls_auth_clients,
         bootstrap: args.bootstrap,
         data_dir,
         ..Config::default()
@@ -170,5 +190,27 @@ mod tests {
         let config =
             build_config(&args(&["--node-id", "1", "--password", "secret"]).unwrap()).unwrap();
         assert_eq!(config.password, Some(Bytes::from_static(b"secret")));
+    }
+
+    #[test]
+    fn tls_options_can_be_loaded_from_cli() {
+        let config = build_config(
+            &args(&[
+                "--node-id",
+                "1",
+                "--tls-cert-file",
+                "server.crt",
+                "--tls-key-file",
+                "server.key",
+                "--tls-ca-file",
+                "clients.crt",
+                "--tls-auth-clients",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.tls_cert_file, Some(PathBuf::from("server.crt")));
+        assert_eq!(config.tls_key_file, Some(PathBuf::from("server.key")));
+        assert!(config.tls_auth_clients);
     }
 }

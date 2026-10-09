@@ -8,6 +8,7 @@ pub mod server;
 pub mod snapshot;
 pub mod state_machine;
 pub mod time;
+pub mod tls;
 pub mod wal;
 
 pub use config::Config;

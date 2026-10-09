@@ -9,6 +9,10 @@
 - 已实现按连接隔离的密码认证。
 - 支持 `AUTH <password>` 和 `AUTH default <password>`。
 - 支持 `HELLO 2/3 AUTH default <password>` 在协商协议的同时认证。
+- 支持客户端入口 TLS，以及基于 CA 的可选 mTLS 客户端证书校验；启动时加载并校验
+  PEM 证书链和 PKCS#8/RSA/EC 私钥。
+- 当前客户端 TLS 与 Raft 节点间 TLS 分开演进；节点间 TLS 尚未启用，不能把当前
+  实现描述为全链路加密。
 - 配置密码时，未认证连接只能执行认证、HELLO 和 QUIT；普通命令返回 `NOAUTH`。
 - 密码按原始字节比较，不写入启动日志；空密码配置会在启动校验阶段拒绝。
 - 已覆盖未认证请求、错误密码、认证后读写和 HELLO 内联认证测试。
