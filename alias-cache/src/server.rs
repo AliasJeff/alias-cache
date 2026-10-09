@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::node_state::{NodeState, SharedNodeState};
-use crate::protocol::{Decoder, Frame, command_from_frame};
+use crate::protocol::{Decoder, Frame, RespVersion, command_from_frame};
 use crate::raft::{
     ClientRequestOutcome, RaftHandle, enable_raft_runtime, execute_client_request_with_id,
     execute_transaction_request_with_id, new_client_request_id, new_tcp_raft_for_server,
@@ -162,6 +162,7 @@ async fn handle_connection(
     limits: crate::protocol::ProtocolLimits,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
+    let mut resp_version = RespVersion::Resp2;
     let mut input = [0_u8; 8 * 1024];
     loop {
         tokio::select! {
@@ -173,14 +174,19 @@ async fn handle_connection(
                 let frames = match decoder.push(&input[..read]) {
                     Ok(frames) => frames,
                     Err(error) => {
-                        write_frame(&mut stream, Frame::error(format!("ERR {error}"))).await?;
+                        write_frame(
+                            &mut stream,
+                            Frame::error(format!("ERR {error}")),
+                            resp_version,
+                        )
+                        .await?;
                         return Err(error);
                     }
                 };
                 for frame in frames {
                     let response = match command_from_frame(frame) {
                         Ok(request) => {
-                            if let Some(response) = connection_command(&request) {
+                            if let Some(response) = connection_command(&request, &mut resp_version) {
                                 response
                             } else {
                                 let mut state = node_state.lock().await;
@@ -192,7 +198,7 @@ async fn handle_connection(
                         }
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
-                    write_frame(&mut stream, response).await?;
+                    write_frame(&mut stream, response, resp_version).await?;
                 }
             }
             result = wait_for_shutdown(shutdown.clone()) => {
@@ -215,6 +221,7 @@ async fn handle_raft_connection(
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
     let mut transaction = None;
+    let mut resp_version = RespVersion::Resp2;
     loop {
         tokio::select! {
             result = stream.read(&mut input) => {
@@ -225,7 +232,12 @@ async fn handle_raft_connection(
                 let frames = match decoder.push(&input[..read]) {
                     Ok(frames) => frames,
                     Err(error) => {
-                        write_frame(&mut stream, Frame::error(format!("ERR {error}"))).await?;
+                        write_frame(
+                            &mut stream,
+                            Frame::error(format!("ERR {error}")),
+                            resp_version,
+                        )
+                        .await?;
                         return Err(error);
                     }
                 };
@@ -237,12 +249,13 @@ async fn handle_raft_connection(
                                 &mut transaction,
                                 request,
                                 &sentinel_context,
+                                &mut resp_version,
                             )
                             .await
                         }
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
-                    write_frame(&mut stream, response).await?;
+                    write_frame(&mut stream, response, resp_version).await?;
                 }
             }
             result = wait_for_shutdown(shutdown.clone()) => {
@@ -259,9 +272,15 @@ async fn handle_raft_connection(
 ///
 /// PING and ECHO observe no state, so any node answers them locally without
 /// leader redirection; a follower must stay usable as a liveness endpoint.
-fn connection_command(request: &crate::protocol::Request) -> Option<Frame> {
+fn connection_command(
+    request: &crate::protocol::Request,
+    resp_version: &mut RespVersion,
+) -> Option<Frame> {
     let crate::protocol::Request::Command(arguments) = request;
     let command = arguments.first()?;
+    if command.eq_ignore_ascii_case(b"HELLO") {
+        return Some(hello_command(arguments, resp_version));
+    }
     if command.eq_ignore_ascii_case(b"PING") {
         return Some(match arguments.len() {
             1 => Frame::simple_string("PONG"),
@@ -278,14 +297,62 @@ fn connection_command(request: &crate::protocol::Request) -> Option<Frame> {
     None
 }
 
+fn hello_command(arguments: &[bytes::Bytes], resp_version: &mut RespVersion) -> Frame {
+    let requested = match arguments.get(1) {
+        None => *resp_version,
+        Some(value) => match value.as_ref() {
+            b"2" => RespVersion::Resp2,
+            b"3" => RespVersion::Resp3,
+            _ => return Frame::error("NOPROTO unsupported protocol version"),
+        },
+    };
+    let mut index = usize::from(arguments.len() > 1) + 1;
+    while index < arguments.len() {
+        if arguments[index].eq_ignore_ascii_case(b"SETNAME") {
+            if index + 1 >= arguments.len() {
+                return Frame::error("ERR syntax error");
+            }
+            index += 2;
+        } else if arguments[index].eq_ignore_ascii_case(b"AUTH") {
+            return Frame::error("ERR AUTH is not configured");
+        } else {
+            return Frame::error("ERR Syntax error");
+        }
+    }
+    *resp_version = requested;
+    Frame::Map(vec![
+        (
+            Frame::bulk_string("server"),
+            Frame::bulk_string("alias-cache"),
+        ),
+        (
+            Frame::bulk_string("version"),
+            Frame::bulk_string(env!("CARGO_PKG_VERSION")),
+        ),
+        (
+            Frame::bulk_string("proto"),
+            Frame::Integer(if requested == RespVersion::Resp3 {
+                3
+            } else {
+                2
+            }),
+        ),
+        (Frame::bulk_string("id"), Frame::Integer(0)),
+        (Frame::bulk_string("mode"), Frame::bulk_string("standalone")),
+        (Frame::bulk_string("role"), Frame::bulk_string("master")),
+        (Frame::bulk_string("modules"), Frame::Array(Vec::new())),
+    ])
+}
+
 async fn handle_transaction_command(
     raft: &RaftHandle,
     transaction: &mut Option<Vec<crate::protocol::Request>>,
     request: crate::protocol::Request,
     sentinel_context: &SentinelContext,
+    resp_version: &mut RespVersion,
 ) -> Frame {
     if transaction.is_none() {
-        if let Some(response) = connection_command(&request) {
+        if let Some(response) = connection_command(&request, resp_version) {
             return response;
         }
         if let Some(response) = sentinel::execute(raft, sentinel_context, &request).await {
@@ -370,9 +437,13 @@ async fn execute_client_command(raft: &RaftHandle, request: crate::protocol::Req
     }
 }
 
-async fn write_frame(stream: &mut TcpStream, frame: Frame) -> Result<()> {
+async fn write_frame(
+    stream: &mut TcpStream,
+    frame: Frame,
+    resp_version: RespVersion,
+) -> Result<()> {
     let mut output = BytesMut::new();
-    frame.encode(&mut output)?;
+    frame.encode_for(resp_version, &mut output)?;
     stream
         .write_all(&output)
         .await
@@ -771,6 +842,66 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         let _ = task.await;
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn hello_negotiates_resp3_and_can_switch_back_to_resp2() {
+        let mut version = RespVersion::Resp2;
+        let response = hello_command(
+            &[
+                bytes::Bytes::from_static(b"HELLO"),
+                bytes::Bytes::from_static(b"3"),
+            ],
+            &mut version,
+        );
+        assert_eq!(version, RespVersion::Resp3);
+        assert!(matches!(response, Frame::Map(_)));
+
+        let mut output = BytesMut::new();
+        response.encode_for(version, &mut output).unwrap();
+        assert!(output.starts_with(b"%7\r\n"));
+
+        let response = hello_command(
+            &[
+                bytes::Bytes::from_static(b"HELLO"),
+                bytes::Bytes::from_static(b"2"),
+            ],
+            &mut version,
+        );
+        assert_eq!(version, RespVersion::Resp2);
+        assert!(matches!(response, Frame::Map(_)));
+        let mut output = BytesMut::new();
+        response.encode_for(version, &mut output).unwrap();
+        assert!(output.starts_with(b"*14\r\n"));
+    }
+
+    #[test]
+    fn hello_rejects_unsupported_versions_and_auth_without_configuration() {
+        let mut version = RespVersion::Resp2;
+        assert_eq!(
+            hello_command(
+                &[
+                    bytes::Bytes::from_static(b"HELLO"),
+                    bytes::Bytes::from_static(b"4"),
+                ],
+                &mut version,
+            ),
+            Frame::error("NOPROTO unsupported protocol version")
+        );
+        assert_eq!(
+            hello_command(
+                &[
+                    bytes::Bytes::from_static(b"HELLO"),
+                    bytes::Bytes::from_static(b"3"),
+                    bytes::Bytes::from_static(b"AUTH"),
+                    bytes::Bytes::from_static(b"default"),
+                    bytes::Bytes::from_static(b"secret"),
+                ],
+                &mut version,
+            ),
+            Frame::error("ERR AUTH is not configured")
+        );
+        assert_eq!(version, RespVersion::Resp2);
     }
 
     #[tokio::test]

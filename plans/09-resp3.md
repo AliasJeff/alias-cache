@@ -25,6 +25,15 @@
 
 cache-cat 当前代码中部分 RESP3 能力可能与具体命令绑定。alias-cache 必须先定义内部响应类型，再由 RESP2/RESP3 编码器分别转换。
 
+## 当前实现进度
+
+- 已实现 RESP3 语义 Frame：Null、Boolean、Double、Map、Set、Push、Big Number、
+  Verbatim String、Bulk Error 和 Attribute。
+- 已实现 RESP2/RESP3 双向编码降级规则；未协商时连接仍只发送 RESP2。
+- 已实现连接级 `HELLO 2`、`HELLO 3` 和重复协商。
+- `HELLO AUTH` 当前明确返回未配置错误；AUTH 本身属于安全阶段，不在本阶段伪造支持。
+- 已覆盖 RESP3 编解码边界、RESP2 降级、协议切换和非法版本测试。
+
 ## 测试任务
 
 - 未协商 RESP3 时绝不发送 RESP3 类型。

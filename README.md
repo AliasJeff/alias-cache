@@ -111,7 +111,8 @@ redis-cli -p 6379 GET hello
 - 只读 Sentinel 风格主节点发现
 - CLI 配置化（单节点/集群拓扑/种子引导）
 
-进行中 / 未完成：RESP3（HELLO 协商）、AUTH/TLS、指标与健康检查、Hash/List/Set/ZSet 数据结构、benchmark 与发布工程。当前阶段边界见各 plans 文档的完成标准。
+进行中 / 未完成：AUTH/TLS、指标与健康检查、Hash/List/Set/ZSet 数据结构、benchmark 与发布工程。
+RESP3 基础类型和 `HELLO 2/3` 协商已实现，当前阶段边界见各 plans 文档的完成标准。
 
 ## 许可证
 
