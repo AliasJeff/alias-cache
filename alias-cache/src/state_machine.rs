@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ const CLIENT_RESULT_CACHE_CAPACITY: usize = 4_096;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(Bytes),
+    Hash(BTreeMap<Bytes, Bytes>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -37,6 +38,20 @@ pub enum Operation {
     },
     MultiSet {
         pairs: Vec<(Bytes, Bytes)>,
+    },
+    HashSet {
+        key: Bytes,
+        fields: Vec<(Bytes, Bytes)>,
+        return_simple: bool,
+    },
+    HashDelete {
+        key: Bytes,
+        fields: Vec<Bytes>,
+    },
+    HashSetNx {
+        key: Bytes,
+        field: Bytes,
+        value: Bytes,
     },
     Delete {
         keys: Vec<Bytes>,
@@ -78,6 +93,9 @@ impl Operation {
             | Self::Persist { write_time, .. } => *write_time,
             Self::Set { .. }
             | Self::MultiSet { .. }
+            | Self::HashSet { .. }
+            | Self::HashDelete { .. }
+            | Self::HashSetNx { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -92,6 +110,9 @@ impl Operation {
             | Self::Set { .. }
             | Self::SetWithExpiration { .. }
             | Self::MultiSet { .. }
+            | Self::HashSet { .. }
+            | Self::HashDelete { .. }
+            | Self::HashSetNx { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -131,6 +152,9 @@ impl StateMachine {
             | Operation::Persist { write_time, .. } => Some(*write_time),
             Operation::Set { .. }
             | Operation::MultiSet { .. }
+            | Operation::HashSet { .. }
+            | Operation::HashDelete { .. }
+            | Operation::HashSetNx { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -218,6 +242,97 @@ impl StateMachine {
                     );
                 }
                 ApplyResult::Response(Frame::simple_string("OK"))
+            }
+            Operation::HashSet {
+                key,
+                fields,
+                return_simple,
+            } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut hash = match existing.map(|entry| entry.value) {
+                    None => BTreeMap::new(),
+                    Some(Value::Hash(hash)) => hash,
+                    Some(Value::String(_)) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let mut added = 0_i64;
+                for (field, value) in fields {
+                    if hash.insert(field, value).is_none() {
+                        added += 1;
+                    }
+                }
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::Hash(hash),
+                        expire_at,
+                    },
+                );
+                if return_simple {
+                    ApplyResult::Response(Frame::simple_string("OK"))
+                } else {
+                    ApplyResult::Response(Frame::Integer(added))
+                }
+            }
+            Operation::HashDelete { key, fields } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::Integer(0));
+                };
+                let Value::Hash(mut hash) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let mut removed = 0_i64;
+                for field in fields {
+                    if hash.remove(&field).is_some() {
+                        removed += 1;
+                    }
+                }
+                if hash.is_empty() {
+                    self.values.remove(&key);
+                } else {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::Hash(hash),
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(removed))
+            }
+            Operation::HashSetNx { key, field, value } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut hash = match existing.map(|entry| entry.value) {
+                    None => BTreeMap::new(),
+                    Some(Value::Hash(hash)) => hash,
+                    Some(Value::String(_)) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                if hash.contains_key(&field) {
+                    return ApplyResult::Response(Frame::Integer(0));
+                }
+                hash.insert(field, value);
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::Hash(hash),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::Integer(1))
             }
             Operation::Delete { keys } => {
                 let mut removed = 0;
@@ -381,6 +496,39 @@ impl StateMachine {
         if command.eq_ignore_ascii_case(b"MSET") {
             return self.execute_mset(arguments);
         }
+        if command.eq_ignore_ascii_case(b"HSET") {
+            return self.execute_hash_set(arguments, false);
+        }
+        if command.eq_ignore_ascii_case(b"HMSET") {
+            return self.execute_hash_set(arguments, true);
+        }
+        if command.eq_ignore_ascii_case(b"HSETNX") {
+            return self.execute_hash_set_nx(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HDEL") {
+            return self.execute_hash_delete(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HGET") {
+            return self.execute_hash_get(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HMGET") {
+            return self.execute_hash_mget(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HGETALL") {
+            return self.execute_hash_getall(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HKEYS") {
+            return self.execute_hash_keys(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HVALS") {
+            return self.execute_hash_values(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HLEN") {
+            return self.execute_hash_len(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HEXISTS") {
+            return self.execute_hash_exists(arguments);
+        }
         if command.eq_ignore_ascii_case(b"TYPE") {
             return self.execute_type(arguments);
         }
@@ -521,7 +669,7 @@ impl StateMachine {
             .get(&arguments[1])
             .filter(|entry| !self.is_expired(entry))
             .map(|entry| &entry.value);
-        Ok((None, value_to_frame(value)))
+        Ok((None, string_value_to_frame(value)?))
     }
 
     fn execute_set(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -673,17 +821,15 @@ impl StateMachine {
 
     fn execute_mget(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("MGET", &arguments, 2)?;
-        let values = arguments[1..]
-            .iter()
-            .map(|key| {
-                value_to_frame(
-                    self.values
-                        .get(key)
-                        .filter(|entry| !self.is_expired(entry))
-                        .map(|entry| &entry.value),
-                )
-            })
-            .collect();
+        let mut values = Vec::with_capacity(arguments.len() - 1);
+        for key in &arguments[1..] {
+            values.push(string_value_to_frame(
+                self.values
+                    .get(key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .map(|entry| &entry.value),
+            )?);
+        }
         Ok((None, Frame::Array(values)))
     }
 
@@ -703,9 +849,11 @@ impl StateMachine {
     fn execute_type(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("TYPE", &arguments, 2)?;
         let value = match self.values.get(&arguments[1]) {
-            Some(entry) if !self.is_expired(entry) => "string",
-            None => "none",
-            Some(_) => "none",
+            Some(entry) if !self.is_expired(entry) => match entry.value {
+                Value::String(_) => "string",
+                Value::Hash(_) => "hash",
+            },
+            _ => "none",
         };
         Ok((None, Frame::simple_string(value)))
     }
@@ -827,13 +975,220 @@ impl StateMachine {
             Frame::Integer(1),
         ))
     }
+
+    fn execute_hash_set(
+        &self,
+        arguments: Vec<Bytes>,
+        return_simple: bool,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let command = if return_simple { "HMSET" } else { "HSET" };
+        expect_min_arity(command, &arguments, 4)?;
+        if !(arguments.len() - 2).is_multiple_of(2) {
+            return Err(Error::protocol(format!(
+                "{command} requires field/value pairs"
+            )));
+        }
+        let key = arguments[1].clone();
+        let existing = self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry));
+        let hash = match existing.map(|entry| &entry.value) {
+            None => None,
+            Some(Value::Hash(hash)) => Some(hash),
+            Some(Value::String(_)) => return Err(wrong_type_error()),
+        };
+        let mut fields = Vec::with_capacity((arguments.len() - 2) / 2);
+        let mut seen = BTreeSet::new();
+        let mut added = 0_i64;
+        for pair in arguments[2..].chunks_exact(2) {
+            if seen.insert(pair[0].clone()) && !hash.is_some_and(|hash| hash.contains_key(&pair[0]))
+            {
+                added += 1;
+            }
+            fields.push((pair[0].clone(), pair[1].clone()));
+        }
+        Ok((
+            Some(Operation::HashSet {
+                key,
+                fields,
+                return_simple,
+            }),
+            if return_simple {
+                Frame::simple_string("OK")
+            } else {
+                Frame::Integer(added)
+            },
+        ))
+    }
+
+    fn execute_hash_set_nx(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HSETNX", &arguments, 4)?;
+        let key = arguments[1].clone();
+        let existing = self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry));
+        let Some(existing) = existing else {
+            return Ok((
+                Some(Operation::HashSetNx {
+                    key,
+                    field: arguments[2].clone(),
+                    value: arguments[3].clone(),
+                }),
+                Frame::Integer(1),
+            ));
+        };
+        let Value::Hash(hash) = &existing.value else {
+            return Err(wrong_type_error());
+        };
+        if hash.contains_key(&arguments[2]) {
+            return Ok((None, Frame::Integer(0)));
+        }
+        Ok((
+            Some(Operation::HashSetNx {
+                key,
+                field: arguments[2].clone(),
+                value: arguments[3].clone(),
+            }),
+            Frame::Integer(1),
+        ))
+    }
+
+    fn execute_hash_delete(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("HDEL", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let existing = self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry));
+        let Some(existing) = existing else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        let Value::Hash(hash) = &existing.value else {
+            return Err(wrong_type_error());
+        };
+        let fields = unique_keys(&arguments[2..]);
+        let removed = fields
+            .iter()
+            .filter(|field| hash.contains_key(*field))
+            .count();
+        if removed == 0 {
+            return Ok((None, Frame::Integer(0)));
+        }
+        Ok((
+            Some(Operation::HashDelete { key, fields }),
+            Frame::Integer(removed as i64),
+        ))
+    }
+
+    fn hash_for_key(&self, key: &Bytes) -> Result<Option<&BTreeMap<Bytes, Bytes>>> {
+        let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
+            return Ok(None);
+        };
+        match &entry.value {
+            Value::Hash(hash) => Ok(Some(hash)),
+            Value::String(_) => Err(wrong_type_error()),
+        }
+    }
+
+    fn execute_hash_get(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HGET", &arguments, 3)?;
+        let value = self
+            .hash_for_key(&arguments[1])?
+            .and_then(|hash| hash.get(&arguments[2]));
+        Ok((
+            None,
+            value.map_or(Frame::Null, |value| Frame::BulkString(value.clone())),
+        ))
+    }
+
+    fn execute_hash_mget(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("HMGET", &arguments, 3)?;
+        let hash = self.hash_for_key(&arguments[1])?;
+        let values = arguments[2..]
+            .iter()
+            .map(|field| {
+                hash.and_then(|hash| hash.get(field))
+                    .map_or(Frame::Null, |value| Frame::BulkString(value.clone()))
+            })
+            .collect();
+        Ok((None, Frame::Array(values)))
+    }
+
+    fn execute_hash_getall(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HGETALL", &arguments, 2)?;
+        let values = self
+            .hash_for_key(&arguments[1])?
+            .map(|hash| {
+                hash.iter()
+                    .map(|(field, value)| {
+                        (
+                            Frame::BulkString(field.clone()),
+                            Frame::BulkString(value.clone()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((None, Frame::Map(values)))
+    }
+
+    fn execute_hash_keys(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HKEYS", &arguments, 2)?;
+        let values = self
+            .hash_for_key(&arguments[1])?
+            .map(|hash| hash.keys().cloned().map(Frame::BulkString).collect())
+            .unwrap_or_default();
+        Ok((None, Frame::Array(values)))
+    }
+
+    fn execute_hash_values(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HVALS", &arguments, 2)?;
+        let values = self
+            .hash_for_key(&arguments[1])?
+            .map(|hash| hash.values().cloned().map(Frame::BulkString).collect())
+            .unwrap_or_default();
+        Ok((None, Frame::Array(values)))
+    }
+
+    fn execute_hash_len(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HLEN", &arguments, 2)?;
+        let length = self.hash_for_key(&arguments[1])?.map_or(0, BTreeMap::len);
+        Ok((None, Frame::Integer(length as i64)))
+    }
+
+    fn execute_hash_exists(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("HEXISTS", &arguments, 3)?;
+        let exists = self
+            .hash_for_key(&arguments[1])?
+            .is_some_and(|hash| hash.contains_key(&arguments[2]));
+        Ok((None, Frame::Integer(i64::from(exists))))
+    }
 }
 
 fn value_to_frame(value: Option<&Value>) -> Frame {
     match value {
         Some(Value::String(value)) => Frame::BulkString(value.clone()),
+        Some(Value::Hash(_)) => wrong_type_frame(),
         None => Frame::Null,
     }
+}
+
+fn string_value_to_frame(value: Option<&Value>) -> Result<Frame> {
+    match value {
+        Some(Value::String(value)) => Ok(Frame::BulkString(value.clone())),
+        Some(Value::Hash(_)) => Err(wrong_type_error()),
+        None => Ok(Frame::Null),
+    }
+}
+
+fn wrong_type_error() -> Error {
+    Error::protocol("WRONGTYPE Operation against a key holding the wrong kind of value")
+}
+
+fn wrong_type_frame() -> Frame {
+    Frame::error("WRONGTYPE Operation against a key holding the wrong kind of value")
 }
 
 fn unique_keys(keys: &[Bytes]) -> Vec<Bytes> {
@@ -962,6 +1317,161 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.snapshot().len(), 0);
+    }
+
+    #[test]
+    fn hash_commands_are_deterministic_and_preserve_field_order() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[
+                    b"HSET", b"h", b"b", b"two", b"a", b"one", b"b", b"updated"
+                ]))
+                .unwrap()
+                .1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HGET", b"h", b"b"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("updated")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HMGET", b"h", b"a", b"missing", b"b"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![
+                Frame::bulk_string("one"),
+                Frame::Null,
+                Frame::bulk_string("updated")
+            ])
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HGETALL", b"h"]))
+                .unwrap()
+                .1,
+            Frame::Map(vec![
+                (Frame::bulk_string("a"), Frame::bulk_string("one")),
+                (Frame::bulk_string("b"), Frame::bulk_string("updated"))
+            ])
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"HKEYS", b"h"])).unwrap().1,
+            Frame::Array(vec![Frame::bulk_string("a"), Frame::bulk_string("b")])
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"HVALS", b"h"])).unwrap().1,
+            Frame::Array(vec![
+                Frame::bulk_string("one"),
+                Frame::bulk_string("updated")
+            ])
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"HLEN", b"h"])).unwrap().1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HEXISTS", b"h", b"a"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"TYPE", b"h"])).unwrap().1,
+            Frame::simple_string("hash")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HMSET", b"h", b"c", b"three"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+    }
+
+    #[test]
+    fn hash_mutations_replay_and_keep_ttl() {
+        let mut first = StateMachine::default();
+        first.advance_logical_time(1_000);
+        first
+            .execute_request(command(&[b"HSET", b"h", b"field", b"value"]))
+            .unwrap();
+        first
+            .execute_request(command(&[b"PEXPIRE", b"h", b"500"]))
+            .unwrap();
+        let (operation, response) = first
+            .prepare_request(command(&[b"HSET", b"h", b"next", b"value2"]))
+            .unwrap();
+        assert_eq!(response, Frame::Integer(1));
+        let operation = operation.unwrap();
+        let encoded = bincode::serialize(&operation).unwrap();
+        let decoded: Operation = bincode::deserialize(&encoded).unwrap();
+        let mut second = first.clone();
+        assert_eq!(
+            second.apply(decoded),
+            ApplyResult::Response(Frame::Integer(1))
+        );
+        assert_eq!(
+            first.execute_request(command(&[b"PTTL", b"h"])).unwrap().1,
+            Frame::Integer(500)
+        );
+        assert_eq!(
+            second.execute_request(command(&[b"PTTL", b"h"])).unwrap().1,
+            Frame::Integer(500)
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"HDEL", b"h", b"field", b"field"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            second.execute_request(command(&[b"HLEN", b"h"])).unwrap().1,
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn hash_commands_enforce_wrong_type_and_hsetnx_semantics() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        assert!(
+            state
+                .execute_request(command(&[b"HGET", b"key", b"field"]))
+                .unwrap_err()
+                .to_string()
+                .contains("WRONGTYPE")
+        );
+
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HSETNX", b"h", b"field", b"first"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HSETNX", b"h", b"field", b"second"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HGET", b"h", b"field"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("first")
+        );
     }
 
     #[test]

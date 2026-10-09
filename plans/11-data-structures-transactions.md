@@ -66,6 +66,14 @@
 
 ### 当前实现进度
 
+- 已实现 Hash 状态类型和确定性 `BTreeMap` 表示：
+  `HSET`、`HMSET`、`HSETNX`、`HDEL`、`HGET`、`HMGET`、`HGETALL`、
+  `HKEYS`、`HVALS`、`HLEN`、`HEXISTS`。
+- Hash 操作进入统一 `Operation`、Raft apply、事务和快照序列化路径；
+  更新字段继承 key TTL，删除最后字段移除 key，String/Hash 类型错误返回稳定
+  `WRONGTYPE`。
+- `StateMachine` 测试覆盖重复 field、确定性枚举、重放序列化、TTL 保留、
+  HSETNX 和错误类型。
 - 已实现连接级 `MULTI`、`EXEC`、`DISCARD` 状态。
 - 已实现 `Operation::Transaction`，多个写子命令作为一个 Raft 日志操作提交。
 - 事务内子命令共享同一个逻辑写入时间，TTL 操作按入队顺序执行。

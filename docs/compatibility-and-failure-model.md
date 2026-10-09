@@ -25,6 +25,8 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 
 - 连接：`PING`、`ECHO`、`QUIT`、`AUTH`、`SELECT`、`HELLO`；
 - 字符串：`GET`、`SET`、`DEL`、`EXISTS`、`MGET`、`MSET`、`INCRBY`；
+- Hash：`HSET`、`HMSET`、`HSETNX`、`HDEL`、`HGET`、`HMGET`、`HGETALL`、
+  `HKEYS`、`HVALS`、`HLEN`、`HEXISTS`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
 - 事务：`MULTI`、`EXEC`、`DISCARD`；
 - Pipeline：复用普通请求顺序，不引入额外语义。
@@ -39,6 +41,14 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - Stream；
 - LRU/LFU 淘汰；
 - Redis RDB/AOF 文件兼容。
+
+Hash 当前约束：
+
+- Hash field/value 使用二进制安全的 bulk string；
+- `HGETALL` 返回 RESP3 Map，RESP2 客户端按数组降级；
+- `HKEYS`、`HVALS` 和 `HMGET` 保持确定性顺序或请求顺序；
+- Hash 写入继承 key 的 TTL，删除最后一个 field 后删除整个 key；
+- `HINCRBY`、`HSCAN` 和 Hash 过期策略扩展尚未纳入稳定兼容范围。
 
 Sentinel 风格命令只能作为后续客户端发现适配层，不能成为 Raft 状态来源。
 
