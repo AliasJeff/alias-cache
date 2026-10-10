@@ -34,6 +34,7 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - Sorted Set：`ZADD`、`ZINCRBY`、`ZREM`、`ZSCORE`、`ZCARD`、`ZRANGE`、
   `ZREVRANGE`、`ZRANK`、`ZREVRANK`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
+- 遍历：`SCAN`、`HSCAN`、`SSCAN`、`ZSCAN`（游标 + `COUNT`）；
 - 可观测：`INFO [server|replication|cluster]`，输出取自单一 openraft metrics
   快照；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级 bulk
   string；`replication_lag_node_<id>` 仅在 Leader 上报告（-1 表示未知）；
@@ -50,6 +51,15 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - Stream；
 - LRU/LFU 淘汰；
 - Redis RDB/AOF 文件兼容。
+
+遍历当前约束：
+
+- 游标是已返回成员数的十进制文本，语义为快照内偏移：同一批数据反复迭代
+  得到确定顺序（key/field/member 字节序），游标遍历完快照后归零；
+- `SCAN` 只返回未过期 key；`ZSCAN` 每成员返回 member/score 两帧；
+- `COUNT` 缺省 10，必须为正；`MATCH`、`TYPE`、`NOVALUES` 等其余选项
+  尚未纳入稳定兼容范围；
+- 游标不是数据库版本号：遍历期间的写入不保证可见或不可见（与 Redis 一致）。
 
 String 当前约束：
 
@@ -69,7 +79,7 @@ Hash 当前约束：
   返回 `hash value is not an integer`；加减溢出返回
   `increment or decrement would overflow`；对不存在的 field 从 0 开始；
   保持 key 的既有 TTL；
-- `HSCAN` 和 Hash 过期策略扩展尚未纳入稳定兼容范围。
+- Hash 过期策略扩展尚未纳入稳定兼容范围。
 
 List 当前约束：
 
@@ -100,7 +110,7 @@ Sorted Set 当前约束：
 - `ZINCRBY` 沿用 ZADD 的 score 语义（f64，以位模式确定性存储），member 不
   存在时先按 increment 添加，返回新 score 的 bulk string；结果非有限时返回
   溢出错误；
-- `ZRANGEBYSCORE`、`ZREMRANGEBY*`、`ZSCAN` 和 `WITHSCORES` 之外的
+- `ZRANGEBYSCORE`、`ZREMRANGEBY*` 和 `WITHSCORES` 之外的
   选项（`GT`/`LT`/`CH`/`INCR`）尚未纳入稳定兼容范围。
 
 Sentinel 风格命令只能作为后续客户端发现适配层，不能成为 Raft 状态来源。

@@ -29,6 +29,10 @@ pub fn is_replicated_write(command: &[u8]) -> bool {
 /// Replicated read commands, mirroring the read arms of
 /// `prepare_request_inner` one-to-one.
 const READS: &[&[u8]] = &[
+    b"SCAN",
+    b"HSCAN",
+    b"SSCAN",
+    b"ZSCAN",
     b"GET",
     b"EXISTS",
     b"MGET",
@@ -1161,6 +1165,18 @@ impl StateMachine {
         if command.eq_ignore_ascii_case(b"DBSIZE") {
             return self.execute_dbsize(arguments);
         }
+        if command.eq_ignore_ascii_case(b"SCAN") {
+            return self.execute_scan(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HSCAN") {
+            return self.execute_collection_scan(arguments, ScanTarget::Hash);
+        }
+        if command.eq_ignore_ascii_case(b"SSCAN") {
+            return self.execute_collection_scan(arguments, ScanTarget::Set);
+        }
+        if command.eq_ignore_ascii_case(b"ZSCAN") {
+            return self.execute_collection_scan(arguments, ScanTarget::SortedSet);
+        }
         if command.eq_ignore_ascii_case(b"PEXPIRE") {
             return self.execute_pexpire(arguments);
         }
@@ -1594,6 +1610,98 @@ impl StateMachine {
                     .count() as i64,
             ),
         ))
+    }
+
+    /// Cursor over all live keys in byte order.
+    ///
+    /// The cursor is the number of keys already returned, encoded as decimal
+    /// text so integer-cursor clients can pass it back verbatim.
+    fn execute_scan(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("SCAN", &arguments, 2)?;
+        let cursor = parse_scan_cursor(&arguments[1], "SCAN")?;
+        let count = parse_scan_count(&arguments[2..], "SCAN")?;
+        let live_keys = self
+            .values
+            .iter()
+            .filter(|(_, entry)| !self.is_expired(entry))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let live_count = live_keys.len();
+        let taken: Vec<Frame> = live_keys
+            .into_iter()
+            .skip(cursor)
+            .take(count)
+            .map(Frame::bulk_string)
+            .collect();
+        let returned = taken.len();
+        Ok((None, scan_reply(cursor, taken, returned, live_count)))
+    }
+
+    /// Cursor over the deterministic member order of one collection.
+    ///
+    /// HSCAN and SSCAN reply with members; ZSCAN replies with member/score
+    /// pairs and counts members in the cursor, matching Redis.
+    fn execute_collection_scan(
+        &self,
+        arguments: Vec<Bytes>,
+        target: ScanTarget,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let (name, value_type) = match target {
+            ScanTarget::Hash => ("HSCAN", "hash"),
+            ScanTarget::Set => ("SSCAN", "set"),
+            ScanTarget::SortedSet => ("ZSCAN", "zset"),
+        };
+        expect_min_arity(name, &arguments, 3)?;
+        let cursor = parse_scan_cursor(&arguments[2], name)?;
+        let count = parse_scan_count(&arguments[3..], name)?;
+        let key = arguments[1].clone();
+        let members: Vec<Bytes> = match self.values.get(&key) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::Hash(hash) => {
+                    if value_type != "hash" {
+                        return Err(Error::protocol(WRONG_TYPE.to_string()));
+                    }
+                    hash.keys().cloned().collect()
+                }
+                Value::Set(set) => {
+                    if value_type != "set" {
+                        return Err(Error::protocol(WRONG_TYPE.to_string()));
+                    }
+                    set.iter().cloned().collect()
+                }
+                Value::SortedSet(sorted_set) => {
+                    if value_type != "zset" {
+                        return Err(Error::protocol(WRONG_TYPE.to_string()));
+                    }
+                    sorted_set.keys().cloned().collect()
+                }
+                Value::String(_) | Value::List(_) => {
+                    return Err(Error::protocol(WRONG_TYPE.to_string()));
+                }
+            },
+            _ => Vec::new(),
+        };
+        let members_total = members.len();
+        let mut taken: Vec<Frame> = Vec::new();
+        let mut returned = 0_usize;
+        for member in members.into_iter().skip(cursor).take(count) {
+            if value_type == "zset" {
+                let score = self
+                    .values
+                    .get(&key)
+                    .and_then(|entry| match &entry.value {
+                        Value::SortedSet(sorted_set) => sorted_set.get(&member).copied(),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                taken.push(Frame::bulk_string(member.clone()));
+                taken.push(Frame::bulk_string(format_score(score)));
+            } else {
+                taken.push(Frame::bulk_string(member));
+            }
+            returned += 1;
+        }
+        Ok((None, scan_reply(cursor, taken, returned, members_total)))
     }
 
     fn execute_pexpire(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -2429,6 +2537,65 @@ fn wrong_type_error() -> Error {
     Error::protocol("WRONGTYPE Operation against a key holding the wrong kind of value")
 }
 
+/// Which collection shape a SCAN-family command walks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanTarget {
+    Hash,
+    Set,
+    SortedSet,
+}
+
+/// Decode a scan cursor: how many elements were already returned.
+fn parse_scan_cursor(value: &Bytes, name: &str) -> Result<usize> {
+    let text = std::str::from_utf8(value)
+        .map_err(|_| Error::protocol(format!("{name} cursor is not a valid integer")))?;
+    text.parse::<usize>()
+        .map_err(|_| Error::protocol(format!("{name} cursor is not a valid integer")))
+}
+
+/// Decode the optional `COUNT <n>` argument; defaults to 10 like Redis.
+fn parse_scan_count(options: &[Bytes], name: &str) -> Result<usize> {
+    let mut count = 10;
+    let mut index = 0;
+    while index < options.len() {
+        if options[index].eq_ignore_ascii_case(b"COUNT") {
+            if index + 1 >= options.len() {
+                return Err(Error::protocol(format!("{name} COUNT requires a number")));
+            }
+            count = std::str::from_utf8(&options[index + 1])
+                .map_err(|_| Error::protocol(format!("{name} COUNT is not a valid integer")))?
+                .parse::<usize>()
+                .map_err(|_| Error::protocol(format!("{name} COUNT is not a valid integer")))?;
+            if count == 0 {
+                return Err(Error::protocol(format!("{name} COUNT must be positive")));
+            }
+            index += 2;
+        } else {
+            return Err(Error::protocol(format!(
+                "{name} supports only the COUNT option"
+            )));
+        }
+    }
+    Ok(count)
+}
+
+/// Shape a scan reply: the next cursor followed by the returned elements.
+///
+/// `returned` counts logical members, which is one frame for SCAN/HSCAN/SSCAN
+/// but two frames (member and score) for ZSCAN. The cursor reaches zero once
+/// every member of the snapshot has been visited.
+fn scan_reply(cursor: usize, taken: Vec<Frame>, returned: usize, total: usize) -> Frame {
+    let next = if cursor + returned >= total {
+        0
+    } else {
+        cursor + returned
+    };
+    Frame::Array(vec![
+        Frame::bulk_string(next.to_string()),
+        Frame::Array(taken),
+    ])
+}
+
 fn wrong_type_frame() -> Frame {
     Frame::error(WRONG_TYPE)
 }
@@ -2969,6 +3136,138 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(wrong_type.contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn scan_family_iterates_deterministically_with_cursors() {
+        let mut state = StateMachine::default();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            state
+                .execute_request(command(&[b"SET", name.as_bytes(), b"v"]))
+                .unwrap();
+        }
+        // Byte order: alpha, beta, delta, gamma.
+        let reply = state
+            .execute_request(command(&[b"SCAN", b"0", b"COUNT", b"2"]))
+            .unwrap()
+            .1;
+        let (first_cursor, first_batch) = scan_parts(reply);
+        assert_eq!(first_cursor, 2);
+        assert_eq!(
+            first_batch,
+            vec![Frame::bulk_string("alpha"), Frame::bulk_string("beta")]
+        );
+
+        let reply = state
+            .execute_request(command(&[
+                b"SCAN",
+                first_cursor.to_string().as_bytes(),
+                b"COUNT",
+                b"10",
+            ]))
+            .unwrap()
+            .1;
+        let (second_cursor, second_batch) = scan_parts(reply);
+        assert_eq!(second_cursor, 0, "iteration ends with cursor zero");
+        assert_eq!(
+            second_batch,
+            vec![Frame::bulk_string("delta"), Frame::bulk_string("gamma")]
+        );
+
+        // Expired keys never appear.
+        state
+            .execute_request(command(&[b"SET", b"ephemeral", b"v", b"PX", b"1"]))
+            .unwrap();
+        state.advance_logical_time(1_000);
+        let (_, keys) = scan_parts(state.execute_request(command(&[b"SCAN", b"0"])).unwrap().1);
+        assert!(
+            !keys
+                .iter()
+                .any(|key| *key == Frame::bulk_string("ephemeral")),
+            "expired keys must not be scanned"
+        );
+
+        // HSCAN walks fields in byte order and terminates.
+        state
+            .execute_request(command(&[b"HSET", b"h", b"z", b"1", b"a", b"2"]))
+            .unwrap();
+        let (_, fields) = scan_parts(
+            state
+                .execute_request(command(&[b"HSCAN", b"h", b"0"]))
+                .unwrap()
+                .1,
+        );
+        assert_eq!(
+            fields,
+            vec![Frame::bulk_string("a"), Frame::bulk_string("z")]
+        );
+
+        // ZSCAN returns member/score pairs and counts members in the cursor.
+        state
+            .execute_request(command(&[b"ZADD", b"z", b"1", b"one", b"2", b"two"]))
+            .unwrap();
+        let (cursor, pairs) = scan_parts(
+            state
+                .execute_request(command(&[b"ZSCAN", b"z", b"0", b"COUNT", b"1"]))
+                .unwrap()
+                .1,
+        );
+        assert_eq!(cursor, 1);
+        assert_eq!(
+            pairs,
+            vec![Frame::bulk_string("one"), Frame::bulk_string("1")]
+        );
+        let (cursor, pairs) = scan_parts(
+            state
+                .execute_request(command(&[b"ZSCAN", b"z", b"1"]))
+                .unwrap()
+                .1,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(
+            pairs,
+            vec![Frame::bulk_string("two"), Frame::bulk_string("2")]
+        );
+
+        // SSCAN on a set; wrong-type scans fail on other shapes.
+        state
+            .execute_request(command(&[b"SADD", b"s", b"x", b"y"]))
+            .unwrap();
+        let (_, members) = scan_parts(
+            state
+                .execute_request(command(&[b"SSCAN", b"s", b"0"]))
+                .unwrap()
+                .1,
+        );
+        assert_eq!(
+            members,
+            vec![Frame::bulk_string("x"), Frame::bulk_string("y")]
+        );
+        let wrong_type = state
+            .execute_request(command(&[b"HSCAN", b"s", b"0"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
+        let unknown_option = state
+            .execute_request(command(&[b"SCAN", b"0", b"MATCH", b"*"]))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown_option.contains("COUNT"));
+    }
+
+    /// Split a scan reply into (cursor, elements).
+    fn scan_parts(reply: Frame) -> (usize, Vec<Frame>) {
+        let Frame::Array(elements) = reply else {
+            panic!("scan reply must be an array");
+        };
+        let Frame::BulkString(cursor) = &elements[0] else {
+            panic!("scan cursor must be a bulk string");
+        };
+        let cursor: usize = std::str::from_utf8(cursor).unwrap().parse().unwrap();
+        let Frame::Array(items) = elements[1].clone() else {
+            panic!("scan elements must be an array");
+        };
+        (cursor, items)
     }
 
     #[test]
