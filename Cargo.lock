@@ -30,6 +30,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "alias-cache-benchmark"
+version = "0.1.0"
+dependencies = [
+ "alias-cache",
+ "clap",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "alias-cache-cli"
 version = "0.1.0"
 dependencies = [

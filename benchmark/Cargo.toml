@@ -1,0 +1,16 @@
+[package]
+name = "alias-cache-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "alias-cache-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+alias-cache = { path = "../alias-cache" }
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

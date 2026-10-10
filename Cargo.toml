@@ -2,6 +2,7 @@
 members = [
     "alias-cache",
     "alias-cache-cli",
+    "benchmark",
 ]
 resolver = "3"
 

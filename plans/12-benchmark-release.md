@@ -83,3 +83,37 @@ cache-cat 的历史 benchmark 数字和硬件假设不能作为 alias-cache 的�
 - 每个重要兼容承诺都有测试证据。
 - README 明确系统优势、代价和不适用场景。
 - 发布包在干净环境中可以启动、恢复和升级检查。
+
+### Benchmark 基线（2026-10-10）
+
+工具：`alias-cache-benchmark`（本仓库自带，RESP2 pipeline 客户端 + 延迟分位数）。
+环境：Apple Silicon MacBook（darwin 25.2.0），release 构建，`--clients 8 --pipeline 16
+--time 5 --value-size 64 --key-space 100000`，数据目录为空目录，raft election 150-300ms。
+
+| 场景 | 吞吐 | p50 | p99 | 错误率 |
+| --- | --- | --- | --- | --- |
+| 单节点 PING（连接级，不进 Raft） | 1,030,014 ops/s | 112µs | 265µs | 0% |
+| 单节点 GET（ReadIndex 线性一致读） | 335,606 ops/s | 343µs | 706µs | 0% |
+| 单节点 SET（每写 fsync 提交） | 589 ops/s | 219ms | 248ms | 0% |
+| 三节点 GET（Leader 线性一致读） | 4,378 ops/s | 27.5ms | 50ms | 0% |
+| 三节点 SET（多数派提交 + 3×fsync） | 461 ops/s | 274ms | 345ms | 0% |
+
+解读：
+
+- 读路径（ReadIndex barrier + 内存读）在单节点上保持亚毫秒 p99；
+  PING 不经过状态机，代表纯协议/网络上限。
+- 写路径吞吐受每次提交一次 WAL fsync 串行化约束：延迟≈in-flight/吞吐
+  （Little's law），p50 与 p99 趋同证实排队为瓶颈。已知优化路径：group
+  commit、openraft 批量 append、生产 snapshot policy。
+- 三节点 GET 的 leadership 确认（AppendEntries round）在复制压力下偶发
+  50ms 超时；此前观测到约 0.04% 的 barrier 超时错误，本组干净运行无错误。
+  宁可返回错误也不放宽一致性，是刻意的取舍。
+- 复现命令：见 README 快速开始 + `alias-cache-benchmark --help`。
+
+### Benchmark 工具进度（2026-10）
+
+- `benchmark/` crate 已入库：可配置命令（set/get/ping）、并发、pipeline、
+  时长、value 大小、key space、延迟采样率；输出吞吐与 p50/p95/p99/max。
+- 帧解析有单元测试（完整/截断/错误帧计数）。
+- 首次实跑即暴露服务端 decoder 的 pipeline 限制误用连接级累计的缺陷
+  （长连接超过 1024 条命令后拒绝服务），已修复并加回归测试。

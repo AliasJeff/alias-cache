@@ -100,25 +100,29 @@ redis-cli -p 6379 GET hello
 
 ## 当前状态
 
-已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 119 个测试、
-CLI 6 个测试全部通过）：
+已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 129 个测试、
+CLI 6 个、benchmark 2 个测试全部通过）：
 
-- RESP2 协议、PING/ECHO、Pipeline、MULTI/EXEC/DISCARD 事务
-- 确定性状态机：String 类型全套 SET 选项、TTL 家族命令
-- Hash：HSET/HMSET/HSETNX/HDEL/HGET/HMGET/HGETALL/HKEYS/HVALS/HLEN/HEXISTS
-- List：LPUSH/RPUSH/LPOP/RPOP/LINDEX/LRANGE/LLEN/LREM/LSET/LTRIM
-- Set：SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SDIFF/SINTER/SUNION
+- RESP2/RESP3：`HELLO 2/3` 协商、Pipeline、MULTI/EXEC/DISCARD 事务
+- 安全：`--password`/`ALIAS_CACHE_PASSWORD` 密码认证（AUTH/HELLO AUTH）、
+  客户端 TLS、Raft 复制 mTLS
+- 确定性状态机：String 类型全套 SET 选项、TTL 家族、INCRBY（i64 溢出保护）
+- Hash/List/Set/Sorted Set（ZSet score 用 i64 保证跨副本确定性）
 - OpenRaft 三节点集群：选举、复制、ReadIndex 线性一致读、Leader 转发
 - Learner 加入/提升/移除、网络分区、旧 Leader 冲突恢复
 - 分块快照传输、快照安装/持久化、落后节点追赶、重启恢复
 - 复制逻辑时钟 TTL：跨节点重放、故障切换、重启后语义一致
+- 可观测：`INFO server|replication|cluster`（term/leader/commit/复制滞后/membership）
 - 只读 Sentinel 风格主节点发现
-- CLI 配置化（单节点/集群拓扑/种子引导）
+- CLI 配置化（单节点/集群拓扑/种子引导）、Dockerfile + docker-compose 三节点编排
+- 自带 `alias-cache-benchmark` 压测工具与基线数据（见 plans/12）
 
-进行中 / 未完成：ZSet 数据结构、指标与健康检查、benchmark 与发布工程。
-RESP3 基础类型、`HELLO 2/3` 协商和密码认证已实现。密码可通过
-`--password` 或 `ALIAS_CACHE_PASSWORD` 配置；启用后客户端必须先执行 `AUTH` 或
-`HELLO ... AUTH default <password>`。
+单节点基线（Apple Silicon，release，8 客户端 × pipeline 16）：
+PING 103 万 ops/s；线性一致 GET 33.6 万 ops/s（p99 706µs）；
+SET 589 ops/s（每写 fsync 的强一致代价，group commit 为已知优化方向）。
+
+进行中 / 未完成：Watcher 事务隔离（WATCH）、HINCRBY/ZINCRBY、SCAN 系列、
+写路径 group commit、生产 snapshot policy 调优。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
 `--tls-key-file` 即可启用客户端 TLS listener；额外指定

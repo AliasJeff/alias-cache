@@ -294,7 +294,6 @@ impl Default for ProtocolLimits {
 pub struct Decoder {
     buffer: BytesMut,
     limits: ProtocolLimits,
-    frames_decoded: usize,
 }
 
 impl Decoder {
@@ -302,7 +301,6 @@ impl Decoder {
         Self {
             buffer: BytesMut::new(),
             limits,
-            frames_decoded: 0,
         }
     }
 
@@ -312,6 +310,10 @@ impl Decoder {
         }
         self.buffer.extend_from_slice(input);
 
+        // The pipeline limit bounds the commands decoded from one read, not
+        // the connection lifetime total: a long-lived session can stream any
+        // number of commands as long as each segment stays bounded.
+        let mut segment_frames = 0;
         let mut frames = Vec::new();
         loop {
             let mut cursor = 0;
@@ -321,14 +323,11 @@ impl Decoder {
                 break;
             };
             self.buffer.advance(cursor);
-            self.frames_decoded = self.frames_decoded.saturating_add(1);
-            if self.frames_decoded > self.limits.max_pipeline_len {
+            segment_frames += 1;
+            if segment_frames > self.limits.max_pipeline_len {
                 return Err(Error::protocol("pipeline exceeds configured limit"));
             }
             frames.push(frame);
-        }
-        if frames.is_empty() {
-            self.frames_decoded = 0;
         }
         Ok(frames)
     }
@@ -788,6 +787,27 @@ mod tests {
                 Frame::Integer(42)
             ]
         );
+    }
+
+    #[test]
+    fn pipeline_limit_bounds_one_segment_not_the_connection() {
+        let limits = ProtocolLimits {
+            max_pipeline_len: 8,
+            ..Default::default()
+        };
+        let mut decoder = Decoder::new(limits);
+        let one_ping = b"*1\r\n$4\r\nPING\r\n".as_slice();
+
+        // A single segment above the limit is rejected outright.
+        let burst = one_ping.repeat(9);
+        assert!(decoder.push(&burst).is_err());
+
+        // A long-lived connection may stream unbounded segments.
+        let mut decoded = 0;
+        for _ in 0..64 {
+            decoded += decoder.push(one_ping).unwrap().len();
+        }
+        assert_eq!(decoded, 64);
     }
 
     #[test]
