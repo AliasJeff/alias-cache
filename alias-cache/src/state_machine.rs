@@ -11,6 +11,8 @@ pub type ClientRequestId = u128;
 
 const CLIENT_RESULT_CACHE_CAPACITY: usize = 4_096;
 
+const WRONG_TYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(Bytes),
@@ -98,6 +100,10 @@ pub enum Operation {
         key: Bytes,
         members: Vec<Bytes>,
     },
+    Increment {
+        key: Bytes,
+        increment: i64,
+    },
     Delete {
         keys: Vec<Bytes>,
     },
@@ -150,6 +156,7 @@ impl Operation {
             | Self::SetRemove { .. }
             | Self::SortedSetAdd { .. }
             | Self::SortedSetRemove { .. }
+            | Self::Increment { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -176,6 +183,7 @@ impl Operation {
             | Self::SetRemove { .. }
             | Self::SortedSetAdd { .. }
             | Self::SortedSetRemove { .. }
+            | Self::Increment { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -227,6 +235,7 @@ impl StateMachine {
             | Operation::SetRemove { .. }
             | Operation::SortedSetAdd { .. }
             | Operation::SortedSetRemove { .. }
+            | Operation::Increment { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -687,6 +696,39 @@ impl StateMachine {
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
+            Operation::Increment { key, increment } => {
+                const NOT_INTEGER: &str = "ERR value is not an integer or out of range";
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let current = match existing.map(|entry| entry.value) {
+                    None => 0,
+                    Some(Value::String(bytes)) => match std::str::from_utf8(&bytes)
+                        .map_err(|_| NOT_INTEGER)
+                        .and_then(|text| text.parse::<i64>().map_err(|_| NOT_INTEGER))
+                    {
+                        Ok(value) => value,
+                        Err(message) => {
+                            return ApplyResult::Response(Frame::error(message));
+                        }
+                    },
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let Some(total) = current.checked_add(increment) else {
+                    return ApplyResult::Response(Frame::error(NOT_INTEGER));
+                };
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::String(Bytes::from(total.to_string())),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::Integer(total))
+            }
             Operation::Delete { keys } => {
                 let mut removed = 0;
                 for key in keys {
@@ -848,6 +890,9 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"MSET") {
             return self.execute_mset(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"INCRBY") {
+            return self.execute_increment(arguments);
         }
         if command.eq_ignore_ascii_case(b"HSET") {
             return self.execute_hash_set(arguments, false);
@@ -1275,6 +1320,36 @@ impl StateMachine {
         }
         let operation = Operation::MultiSet { pairs };
         Ok((Some(operation), Frame::simple_string("OK")))
+    }
+
+    fn execute_increment(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        const NOT_INTEGER: &str = "value is not an integer or out of range";
+        expect_arity("INCRBY", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let increment = std::str::from_utf8(&arguments[2])
+            .map_err(|_| Error::protocol(NOT_INTEGER))?
+            .parse::<i64>()
+            .map_err(|_| Error::protocol(NOT_INTEGER))?;
+        let current = match self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry))
+            .map(|entry| &entry.value)
+        {
+            None => 0,
+            Some(Value::String(bytes)) => std::str::from_utf8(bytes)
+                .map_err(|_| Error::protocol(NOT_INTEGER))?
+                .parse::<i64>()
+                .map_err(|_| Error::protocol(NOT_INTEGER))?,
+            Some(_) => return Err(Error::protocol(WRONG_TYPE)),
+        };
+        let total = current
+            .checked_add(increment)
+            .ok_or_else(|| Error::protocol(NOT_INTEGER))?;
+        Ok((
+            Some(Operation::Increment { key, increment }),
+            Frame::Integer(total),
+        ))
     }
 
     fn execute_type(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -2135,7 +2210,7 @@ fn wrong_type_error() -> Error {
 }
 
 fn wrong_type_frame() -> Frame {
-    Frame::error("WRONGTYPE Operation against a key holding the wrong kind of value")
+    Frame::error(WRONG_TYPE)
 }
 
 fn unique_keys(keys: &[Bytes]) -> Vec<Bytes> {
@@ -2349,6 +2424,91 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.snapshot().len(), 0);
+    }
+
+    #[test]
+    fn incrby_creates_counts_from_zero_and_keeps_ttl() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"INCRBY", b"hits", b"5"]))
+                .unwrap()
+                .1,
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"INCRBY", b"hits", b"-2"]))
+                .unwrap()
+                .1,
+            Frame::Integer(3)
+        );
+        // A prepared operation replays to the same result on a fresh replica.
+        let (operation, response) = state
+            .prepare_request(command(&[b"INCRBY", b"hits", b"1"]))
+            .unwrap();
+        let mut replay = StateMachine::default();
+        replay.apply(Operation::Set {
+            key: Bytes::from_static(b"hits"),
+            value: Bytes::from_static(b"3"),
+        });
+        assert_eq!(
+            replay.apply(operation.expect("INCRBY must replicate")),
+            ApplyResult::Response(response.clone())
+        );
+        assert_eq!(response, Frame::Integer(4));
+
+        // INCRBY must not reset an existing TTL.
+        state
+            .execute_request(command(&[b"SET", b"counter", b"10", b"PX", b"5000"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"INCRBY", b"counter", b"5"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"counter"]))
+                .unwrap()
+                .1,
+            Frame::Integer(5000)
+        );
+    }
+
+    #[test]
+    fn incrby_rejects_non_integers_overflow_and_wrong_types() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"text", b"abc"]))
+            .unwrap();
+        let not_integer = state
+            .execute_request(command(&[b"INCRBY", b"text", b"1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(not_integer.contains("not an integer"));
+
+        state
+            .execute_request(command(&[b"INCRBY", b"big", b"9223372036854775807"]))
+            .unwrap();
+        let overflow = state
+            .execute_request(command(&[b"INCRBY", b"big", b"1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(overflow.contains("not an integer"));
+
+        state
+            .execute_request(command(&[b"HSET", b"hash", b"field", b"value"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"INCRBY", b"hash", b"1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
+
+        assert!(
+            state
+                .execute_request(command(&[b"INCRBY", b"key", b"nope"]))
+                .is_err()
+        );
     }
 
     #[test]

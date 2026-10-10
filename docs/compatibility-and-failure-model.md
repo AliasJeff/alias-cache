@@ -48,6 +48,14 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - LRU/LFU 淘汰；
 - Redis RDB/AOF 文件兼容。
 
+String 当前约束：
+
+- `INCRBY` 使用 `i64` 饱和算术：目标值必须是可解析的 64 位整数，否则返回
+  `value is not an integer or out of range`；加减溢出同样返回该错误；
+- `INCRBY` 保持 key 的既有 TTL；对不存在的 key 从 0 开始计数；
+- Hash/List/Set/Sorted Set 类型的 key 上执行返回 WRONGTYPE；
+- `INCR`、`DECR`、`INCRBYFLOAT`、`APPEND`、`STRLEN` 尚未纳入稳定兼容范围。
+
 Hash 当前约束：
 
 - Hash field/value 使用二进制安全的 bulk string；

@@ -115,3 +115,16 @@
 - 多节点、重启、Leader 切换和 TTL 场景通过。
 - 事务在提交、恢复和快照安装后保持原子性。
 - 不支持的高级功能返回稳定错误，不伪造兼容性。
+
+## 完成记录
+
+- 2026-10：String、Hash、List、Set、Sorted Set 五种结构已实现，均沿用统一的
+  prepare/apply 路径：prepare 在当前状态上校验参数并生成可序列化 `Operation`，
+  apply 重放且结果与 prepare 响应一致；写入继承 key TTL，删空即删 key。
+- 确定性取舍：Set 用 `BTreeSet` 按字节序返回；Sorted Set 的 score 用 `i64`
+  而非 double，避免浮点跨副本分歧；集合内乱序输入的返回顺序全部确定。
+- 测试：`state_machine::tests` 覆盖每种结构的命令语义、重放、TTL 继承、
+  WRONGTYPE 拒绝和 INCRBY 的溢出/非整数边界；兼容矩阵见
+  `docs/compatibility-and-failure-model.md` 的各结构约束段。
+- 待完成：数据结构命令的多节点 TCP 集成回归（当前多节点测试集中在 String/TTL）、
+  `WATCH`、事务内读命令、HINCRBY/ZINCRBY、SCAN 系列。
