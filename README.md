@@ -133,7 +133,10 @@ PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
 PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s
 对比 Redis 单机 AOF-always 559K ops/s——这是"每笔写入三节点多数派 fsync"
 的可解释代价，两者保证不同层级（Redis 副本为异步复制，failover 有丢失
-窗口）。进行中：快照增量 CAS 精细化、写吞吐进一步合并优化。
+窗口）。测试与发布：SET 全选项兼容矩阵、EXPIRE/PEXPIRE 协议边界测试、三处存储
+格式的版本拒绝门禁与迁移策略文档（docs/storage-format-migration.md）、
+CHANGELOG、依赖 SPDX 许可证白名单门禁。进行中：写吞吐进一步合并优化
+（批量 append 粒度、follower fsync 策略）。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
 `--tls-key-file` 即可启用客户端 TLS listener；额外指定
