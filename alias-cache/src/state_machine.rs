@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
@@ -16,6 +17,7 @@ pub enum Value {
     Hash(BTreeMap<Bytes, Bytes>),
     List(VecDeque<Bytes>),
     Set(BTreeSet<Bytes>),
+    SortedSet(BTreeMap<Bytes, i64>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,6 +90,14 @@ pub enum Operation {
         key: Bytes,
         members: Vec<Bytes>,
     },
+    SortedSetAdd {
+        key: Bytes,
+        entries: Vec<(Bytes, i64)>,
+    },
+    SortedSetRemove {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
     Delete {
         keys: Vec<Bytes>,
     },
@@ -138,6 +148,8 @@ impl Operation {
             | Self::ListTrim { .. }
             | Self::SetAdd { .. }
             | Self::SetRemove { .. }
+            | Self::SortedSetAdd { .. }
+            | Self::SortedSetRemove { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -162,6 +174,8 @@ impl Operation {
             | Self::ListTrim { .. }
             | Self::SetAdd { .. }
             | Self::SetRemove { .. }
+            | Self::SortedSetAdd { .. }
+            | Self::SortedSetRemove { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -211,6 +225,8 @@ impl StateMachine {
             | Operation::ListTrim { .. }
             | Operation::SetAdd { .. }
             | Operation::SetRemove { .. }
+            | Operation::SortedSetAdd { .. }
+            | Operation::SortedSetRemove { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -613,6 +629,64 @@ impl StateMachine {
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
+            Operation::SortedSetAdd { key, entries } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut sorted_set = match existing.map(|entry| entry.value) {
+                    None => BTreeMap::new(),
+                    Some(Value::SortedSet(sorted_set)) => sorted_set,
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let added = entries
+                    .into_iter()
+                    .filter(|(member, score)| {
+                        let was_missing = !sorted_set.contains_key(member);
+                        sorted_set.insert(member.clone(), *score);
+                        was_missing
+                    })
+                    .count() as i64;
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::SortedSet(sorted_set),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::Integer(added))
+            }
+            Operation::SortedSetRemove { key, members } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::Integer(0));
+                };
+                let Value::SortedSet(mut sorted_set) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let removed = members
+                    .into_iter()
+                    .filter(|member| sorted_set.remove(member).is_some())
+                    .count() as i64;
+                if sorted_set.is_empty() {
+                    self.values.remove(&key);
+                } else if removed > 0 {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::SortedSet(sorted_set),
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(removed))
+            }
             Operation::Delete { keys } => {
                 let mut removed = 0;
                 for key in keys {
@@ -861,6 +935,30 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"SUNION") {
             return self.execute_set_union(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"ZADD") {
+            return self.execute_sorted_set_add(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"ZREM") {
+            return self.execute_sorted_set_remove(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"ZSCORE") {
+            return self.execute_sorted_set_score(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"ZCARD") {
+            return self.execute_sorted_set_cardinality(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"ZRANGE") {
+            return self.execute_sorted_set_range(arguments, false);
+        }
+        if command.eq_ignore_ascii_case(b"ZREVRANGE") {
+            return self.execute_sorted_set_range(arguments, true);
+        }
+        if command.eq_ignore_ascii_case(b"ZRANK") {
+            return self.execute_sorted_set_rank(arguments, false);
+        }
+        if command.eq_ignore_ascii_case(b"ZREVRANK") {
+            return self.execute_sorted_set_rank(arguments, true);
         }
         if command.eq_ignore_ascii_case(b"TYPE") {
             return self.execute_type(arguments);
@@ -1187,6 +1285,7 @@ impl StateMachine {
                 Value::Hash(_) => "hash",
                 Value::List(_) => "list",
                 Value::Set(_) => "set",
+                Value::SortedSet(_) => "zset",
             },
             _ => "none",
         };
@@ -1823,6 +1922,147 @@ impl StateMachine {
         }
         Ok((None, set_frame(result)))
     }
+
+    fn sorted_set_for_key(&self, key: &Bytes) -> Result<Option<&BTreeMap<Bytes, i64>>> {
+        let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
+            return Ok(None);
+        };
+        match &entry.value {
+            Value::SortedSet(sorted_set) => Ok(Some(sorted_set)),
+            _ => Err(wrong_type_error()),
+        }
+    }
+
+    fn execute_sorted_set_add(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("ZADD", &arguments, 4)?;
+        if !(arguments.len() - 2).is_multiple_of(2) {
+            return Err(Error::protocol("ZADD requires score/member pairs"));
+        }
+        let key = arguments[1].clone();
+        let existing = self.sorted_set_for_key(&key)?;
+        let mut entries = Vec::with_capacity((arguments.len() - 2) / 2);
+        let mut seen = BTreeSet::new();
+        let mut added = 0_i64;
+        for pair in arguments[2..].chunks_exact(2) {
+            let score = parse_score(&pair[0])?;
+            let member = pair[1].clone();
+            let first = seen.insert(member.clone());
+            if first && !existing.is_some_and(|set| set.contains_key(&member)) {
+                added += 1;
+            }
+            entries.push((member, score));
+        }
+        Ok((
+            Some(Operation::SortedSetAdd { key, entries }),
+            Frame::Integer(added),
+        ))
+    }
+
+    fn execute_sorted_set_remove(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("ZREM", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let Some(sorted_set) = self.sorted_set_for_key(&key)? else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        let mut seen = BTreeSet::new();
+        let members = arguments[2..]
+            .iter()
+            .filter(|member| seen.insert((*member).clone()))
+            .filter(|member| sorted_set.contains_key(*member))
+            .cloned()
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return Ok((None, Frame::Integer(0)));
+        }
+        let removed = members.len() as i64;
+        Ok((
+            Some(Operation::SortedSetRemove { key, members }),
+            Frame::Integer(removed),
+        ))
+    }
+
+    fn execute_sorted_set_score(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("ZSCORE", &arguments, 3)?;
+        let score = self
+            .sorted_set_for_key(&arguments[1])?
+            .and_then(|set| set.get(&arguments[2]))
+            .map(|score| Frame::bulk_string(format_score(*score)));
+        Ok((None, score.unwrap_or(Frame::Null)))
+    }
+
+    fn execute_sorted_set_cardinality(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("ZCARD", &arguments, 2)?;
+        Ok((
+            None,
+            Frame::Integer(
+                self.sorted_set_for_key(&arguments[1])?
+                    .map_or(0, BTreeMap::len) as i64,
+            ),
+        ))
+    }
+
+    fn execute_sorted_set_range(
+        &self,
+        arguments: Vec<Bytes>,
+        reverse: bool,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let command = if reverse { "ZREVRANGE" } else { "ZRANGE" };
+        if arguments.len() != 4 && arguments.len() != 5 {
+            return Err(Error::protocol(format!(
+                "wrong number of arguments for '{command}'"
+            )));
+        }
+        let start = parse_signed_i64(&arguments[2], command)?;
+        let stop = parse_signed_i64(&arguments[3], command)?;
+        let with_scores = arguments
+            .get(4)
+            .is_some_and(|value| value.eq_ignore_ascii_case(b"WITHSCORES"));
+        if arguments.len() == 5 && !with_scores {
+            return Err(Error::protocol("syntax error"));
+        }
+        let values = self
+            .sorted_set_for_key(&arguments[1])?
+            .map(|set| sorted_set_entries(set, reverse))
+            .unwrap_or_default();
+        let Some((start, stop)) = normalize_list_range(start, stop, values.len()) else {
+            return Ok((None, Frame::Array(Vec::new())));
+        };
+        let mut response = Vec::new();
+        for (member, score) in values.into_iter().skip(start).take(stop - start + 1) {
+            response.push(Frame::bulk_string(member));
+            if with_scores {
+                response.push(Frame::bulk_string(format_score(score)));
+            }
+        }
+        Ok((None, Frame::Array(response)))
+    }
+
+    fn execute_sorted_set_rank(
+        &self,
+        arguments: Vec<Bytes>,
+        reverse: bool,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let command = if reverse { "ZREVRANK" } else { "ZRANK" };
+        expect_arity(command, &arguments, 3)?;
+        let Some(set) = self.sorted_set_for_key(&arguments[1])? else {
+            return Ok((None, Frame::Null));
+        };
+        let rank = sorted_set_entries(set, reverse)
+            .into_iter()
+            .position(|(member, _)| member == arguments[2])
+            .map(|rank| Frame::Integer(rank as i64))
+            .unwrap_or(Frame::Null);
+        Ok((None, rank))
+    }
 }
 
 fn value_to_frame(value: Option<&Value>) -> Frame {
@@ -1843,6 +2083,51 @@ fn string_value_to_frame(value: Option<&Value>) -> Result<Frame> {
 
 fn set_frame(set: BTreeSet<Bytes>) -> Frame {
     Frame::Set(set.into_iter().map(Frame::BulkString).collect())
+}
+
+fn parse_score(value: &Bytes) -> Result<i64> {
+    let text = std::str::from_utf8(value)
+        .map_err(|_| Error::protocol("value is not a valid floating point number"))?;
+    let score = text
+        .parse::<f64>()
+        .map_err(|_| Error::protocol("value is not a valid floating point number"))?;
+    if !score.is_finite() {
+        return Err(Error::protocol(
+            "value is not a valid floating point number",
+        ));
+    }
+    Ok(score.to_bits() as i64)
+}
+
+fn format_score(score: i64) -> Bytes {
+    Bytes::from(score_as_f64(score).to_string())
+}
+
+fn score_as_f64(score: i64) -> f64 {
+    f64::from_bits(u64::from_ne_bytes(score.to_ne_bytes()))
+}
+
+fn sorted_set_entries(set: &BTreeMap<Bytes, i64>, reverse: bool) -> Vec<(Bytes, i64)> {
+    let mut entries = set
+        .iter()
+        .map(|(member, score)| (member.clone(), *score))
+        .collect::<Vec<_>>();
+    entries.sort_by(|(left_member, left_score), (right_member, right_score)| {
+        let left = score_as_f64(*left_score);
+        let right = score_as_f64(*right_score);
+        let ordering = left.total_cmp(&right);
+        let ordering = if ordering == Ordering::Equal {
+            left_member.cmp(right_member)
+        } else {
+            ordering
+        };
+        if reverse {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    entries
 }
 
 fn wrong_type_error() -> Error {
@@ -2069,6 +2354,8 @@ mod tests {
     #[test]
     fn hash_commands_are_deterministic_and_preserve_field_order() {
         let mut state = StateMachine::default();
+        // HSET returns the number of newly created fields; the repeated "b"
+        // pair only updates an existing field and must not be counted.
         assert_eq!(
             state
                 .execute_request(command(&[
@@ -2502,6 +2789,148 @@ mod tests {
                 .unwrap()
                 .1,
             Frame::simple_string("none")
+        );
+    }
+
+    #[test]
+    fn sorted_set_commands_sort_by_score_then_member() {
+        let mut state = StateMachine::default();
+        // All three score/member pairs introduce new members, so ZADD must
+        // report three additions even though alpha and updated share a score.
+        assert_eq!(
+            state
+                .execute_request(command(&[
+                    b"ZADD", b"ranking", b"2", b"beta", b"1", b"alpha", b"1", b"updated"
+                ]))
+                .unwrap()
+                .1,
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZRANGE", b"ranking", b"0", b"-1"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![
+                Frame::bulk_string("alpha"),
+                Frame::bulk_string("updated"),
+                Frame::bulk_string("beta"),
+            ])
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[
+                    b"ZRANGE",
+                    b"ranking",
+                    b"0",
+                    b"-1",
+                    b"WITHSCORES"
+                ]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![
+                Frame::bulk_string("alpha"),
+                Frame::bulk_string("1"),
+                Frame::bulk_string("updated"),
+                Frame::bulk_string("1"),
+                Frame::bulk_string("beta"),
+                Frame::bulk_string("2"),
+            ])
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZREVRANGE", b"ranking", b"0", b"1"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![
+                Frame::bulk_string("beta"),
+                Frame::bulk_string("updated"),
+            ])
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZRANK", b"ranking", b"updated"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZREVRANK", b"ranking", b"updated"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZSCORE", b"ranking", b"beta"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("2")
+        );
+    }
+
+    #[test]
+    fn sorted_set_mutations_replay_keep_ttl_and_remove_empty_keys() {
+        let mut first = StateMachine::default();
+        first.advance_logical_time(1_000);
+        first
+            .execute_request(command(&[b"ZADD", b"ranking", b"1.5", b"member"]))
+            .unwrap();
+        first
+            .execute_request(command(&[b"PEXPIRE", b"ranking", b"500"]))
+            .unwrap();
+        let (operation, response) = first
+            .prepare_request(command(&[b"ZADD", b"ranking", b"3", b"other"]))
+            .unwrap();
+        assert_eq!(response, Frame::Integer(1));
+        let encoded = bincode::serialize(&operation.clone().unwrap()).unwrap();
+        let decoded: Operation = bincode::deserialize(&encoded).unwrap();
+        let mut second = first.clone();
+        assert_eq!(
+            second.apply(decoded),
+            ApplyResult::Response(Frame::Integer(1))
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"PTTL", b"ranking"]))
+                .unwrap()
+                .1,
+            Frame::Integer(500)
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"ZREM", b"ranking", b"member", b"other"]))
+                .unwrap()
+                .1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            second
+                .execute_request(command(&[b"TYPE", b"ranking"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("none")
+        );
+    }
+
+    #[test]
+    fn sorted_set_commands_reject_invalid_scores_and_wrong_types() {
+        let mut state = StateMachine::default();
+        assert!(
+            state
+                .execute_request(command(&[b"ZADD", b"ranking", b"NaN", b"member"]))
+                .is_err()
+        );
+        state
+            .execute_request(command(&[b"SET", b"string", b"value"]))
+            .unwrap();
+        assert!(
+            state
+                .execute_request(command(&[b"ZCARD", b"string"]))
+                .unwrap_err()
+                .to_string()
+                .contains("WRONGTYPE")
         );
     }
 

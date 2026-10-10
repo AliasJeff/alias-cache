@@ -31,6 +31,8 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
   `LREM`、`LSET`、`LTRIM`；
 - Set：`SADD`、`SREM`、`SMEMBERS`、`SISMEMBER`、`SCARD`、`SDIFF`、
   `SINTER`、`SUNION`；
+- Sorted Set：`ZADD`、`ZREM`、`ZSCORE`、`ZCARD`、`ZRANGE`、`ZREVRANGE`、
+  `ZRANK`、`ZREVRANK`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
 - 事务：`MULTI`、`EXEC`、`DISCARD`；
 - Pipeline：复用普通请求顺序，不引入额外语义。
@@ -69,6 +71,18 @@ Set 当前约束：
 - `SDIFF`、`SINTER`、`SUNION` 支持多 Key 只读计算，并检查所有存在 Key 的类型；
 - Set 写入继承 key 的 TTL，删除最后一个 member 后删除整个 key；
 - `SPOP`、`SRANDMEMBER`、`SSCAN` 和 `*STORE` 写入变体尚未纳入稳定兼容范围。
+
+Sorted Set 当前约束：
+
+- Sorted Set member 使用二进制安全的 bulk string；
+- score 使用 `i64` 整数。这不是 Redis 的 double 语义，是刻意的确定性取舍：
+  避免浮点比较和序列化在各副本间产生分歧；非整数 score 返回稳定错误；
+- `ZADD` 返回新增 member 数，重复 member 更新 score 不计数；
+- 同分 member 按 member 字节序稳定排序，`ZRANK`/`ZREVRANK` 与之一致；
+- `ZRANGE`/`ZREVRANGE` 支持负索引和 `WITHSCORES`；
+- Sorted Set 写入继承 key 的 TTL，删除最后一个 member 后删除整个 key；
+- `ZINCRBY`、`ZRANGEBYSCORE`、`ZREMRANGEBY*`、`ZSCAN` 和 `WITHSCORES` 之外的
+  选项（`GT`/`LT`/`CH`/`INCR`）尚未纳入稳定兼容范围。
 
 Sentinel 风格命令只能作为后续客户端发现适配层，不能成为 Raft 状态来源。
 
