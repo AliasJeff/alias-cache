@@ -127,8 +127,13 @@ PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
 多数派提交 SET 2,352 ops/s——写入经 group commit 与 pipeline 并发提交
 （相比初版 461 ops/s 提升 5 倍），剩余瓶颈为每批一次的三节点 fsync 往返。
 
-进行中 / 未完成：资源限制（max-memory/连接上限）、独立健康检查端点、
-快照断点续传、与 Redis 的同机对比基准、生产 snapshot policy 调优。
+已发布：三平台（linux/macos/windows）CI 构建矩阵与制品打包。
+
+与 Redis 6.2 的同机对比（同工具同负载，诚实口径）见 plans/12：
+PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s
+对比 Redis 单机 AOF-always 559K ops/s——这是"每笔写入三节点多数派 fsync"
+的可解释代价，两者保证不同层级（Redis 副本为异步复制，failover 有丢失
+窗口）。进行中：快照增量 CAS 精细化、写吞吐进一步合并优化。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
 `--tls-key-file` 即可启用客户端 TLS listener；额外指定

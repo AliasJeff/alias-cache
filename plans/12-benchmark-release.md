@@ -150,3 +150,32 @@ barrier 超时错误：宁可报错也不放宽一致性，是刻意取舍。
 SET 的剩余瓶颈是每批一次的三节点 fsync 往返（p50 ≈ 53ms，符合
 in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 的
 更积极合并与 follower 端 fsync 策略。
+
+### 与 Redis 的同机对比基线（2026-10-11）
+
+环境：同一台 Apple Silicon MacBook，release 构建，同一压测工具
+（8 客户端 × pipeline 16 × 5s，value 64B，key space 100K）。
+Redis 6.2.14 以两组配置运行：内存态（--save "" --appendonly no）与
+最接近的持久化档（AOF appendfsync always，单机 fsync）。
+alias-cache 以三节点集群（每批多数派 fsync + ReadIndex 线性一致读）运行。
+
+| 场景 | Redis 内存态 | Redis AOF always（单机持久化） | alias-cache 三节点（强一致） |
+| --- | --- | --- | --- |
+| PING | 3,149,997 ops/s | — | 1,441,066 ops/s |
+| SET | 1,523,299 ops/s | 558,973 ops/s | 2,355 ops/s |
+| GET | 2,072,083 ops/s | 2,014,019 ops/s | 17,651 ops/s（空闲集群） |
+
+诚实解读：
+
+- alias-cache 的定位不是替代 Redis，而是给出**可解释的强一致代价**：
+  每笔写入经三节点多数派 fsync 提交，延迟由复制往返与磁盘 fsync 主导；
+  Redis 单机即使用 AOF always 也只 fsync 一台机器，且其副本为异步复制
+  （failover 有丢数据窗口），两者保证不同层级，数字不可直接互换。
+- 协议/网络能力（PING）alias-cache 达 Redis 的 46%——RESP 解析与
+  连接层不是主要差距。
+- 线性一致读（ReadIndex barrier）与 Redis 普通读的本质差异：alias-cache
+  的读保证读到已提交的最新状态（跨故障切换不回退），Redis 单机读本身
+  线性，但其 Sentinel/集群副本读存在复制滞后。
+- 写吞吐的进一步方向见上文 group commit 分析（批量合并粒度、follower
+  fsync 策略）；强一致系统的正确宣传语是"可解释的代价"，而非"追平 Redis"。
+- 复现：README 快速开始 + `alias-cache-benchmark --help`；Redis 配置如上。
