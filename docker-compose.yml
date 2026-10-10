@@ -1,0 +1,48 @@
+# Three-node strongly consistent cluster. Node 1 seeds membership on first
+# start; nodes 2 and 3 join as voters immediately. Kill any container and the
+# surviving two elect a new leader without losing committed writes.
+services:
+  node-1:
+    build: .
+    command: >-
+      --node-id 1
+      --client-addr node-1:6379
+      --raft-addr node-1:16379
+      --data-dir /data
+      --bootstrap
+      --peer 1=node-1:16379/node-1:6379
+      --peer 2=node-2:16379/node-2:6379
+      --peer 3=node-3:16379/node-3:6379
+    volumes:
+      - node-1-data:/data
+    ports:
+      - "6379:6379"
+  node-2:
+    build: .
+    command: >-
+      --node-id 2
+      --client-addr node-2:6379
+      --raft-addr node-2:16379
+      --data-dir /data
+      --peer 1=node-1:16379/node-1:6379
+      --peer 2=node-2:16379/node-2:6379
+      --peer 3=node-3:16379/node-3:6379
+    volumes:
+      - node-2-data:/data
+  node-3:
+    build: .
+    command: >-
+      --node-id 3
+      --client-addr node-3:6379
+      --raft-addr node-3:16379
+      --data-dir /data
+      --peer 1=node-1:16379/node-1:6379
+      --peer 2=node-2:16379/node-2:6379
+      --peer 3=node-3:16379/node-3:6379
+    volumes:
+      - node-3-data:/data
+
+volumes:
+  node-1-data:
+  node-2-data:
+  node-3-data:
