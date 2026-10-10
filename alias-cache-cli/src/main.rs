@@ -76,6 +76,10 @@ struct Args {
     /// Refuse new client connections past this count. 0 disables the limit.
     #[arg(long, default_value_t = 0)]
     max_connections: u32,
+
+    /// Create a raft snapshot after this many appended log entries.
+    #[arg(long, default_value_t = 64)]
+    snapshot_policy: u64,
 }
 
 fn build_config(args: &Args) -> Result<Config> {
@@ -106,6 +110,7 @@ fn build_config(args: &Args) -> Result<Config> {
         data_dir,
         max_memory_bytes: args.max_memory,
         max_connections: args.max_connections,
+        snapshot_policy_logs: args.snapshot_policy,
         ..Config::default()
     }
     .with_peers(&peers)
@@ -210,6 +215,20 @@ mod tests {
         assert_eq!(config.max_memory_bytes, 0);
         assert_eq!(config.max_connections, 0);
         assert_eq!(config.max_memory_non_zero(), None);
+    }
+
+    #[test]
+    fn snapshot_policy_defaults_and_zero_falls_back() {
+        let parsed = args(&["--node-id", "1"]).unwrap();
+        assert_eq!(parsed.snapshot_policy, 64);
+        let config = build_config(&parsed).unwrap();
+        assert_eq!(config.snapshot_policy(), 64);
+        let zero =
+            build_config(&args(&["--node-id", "1", "--snapshot-policy", "0"]).unwrap()).unwrap();
+        assert_eq!(zero.snapshot_policy(), 64, "zero falls back to the default");
+        let custom =
+            build_config(&args(&["--node-id", "1", "--snapshot-policy", "128"]).unwrap()).unwrap();
+        assert_eq!(custom.snapshot_policy(), 128);
     }
 
     #[test]

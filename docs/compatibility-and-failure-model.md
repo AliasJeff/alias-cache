@@ -75,7 +75,8 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
   'maxmemory'`；替换写按新数据全额保守计费；读与删除不受限；
 - `--max-connections`：超限的新连接收到 `-ERR max number of clients
   reached` 后立即关闭；
-- 两项缺省 0（不限）；限制在重启后由配置恢复，不进复制状态机。
+- 两项缺省 0（不限）；限制在重启后由配置恢复，不进复制状态机；
+- `--snapshot-policy`：追加多少条日志后生成 raft 快照，缺省 64，0 回落默认。
 
 遍历当前约束：
 

@@ -63,6 +63,7 @@ impl Server {
             self.config.bootstrap,
             tls_connector,
             max_memory,
+            self.config.snapshot_policy(),
         )
         .await?;
         if !self.config.bootstrap {

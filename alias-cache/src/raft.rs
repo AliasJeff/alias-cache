@@ -2349,6 +2349,7 @@ pub async fn new_tcp_raft(
         TcpNetworkControl::default(),
         None,
         None,
+        64,
     )
     .await
 }
@@ -2359,7 +2360,7 @@ pub async fn new_tcp_raft_with_control(
     nodes: BTreeMap<NodeId, Node>,
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, true, control, None, None).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, true, control, None, None, 64).await
 }
 
 pub async fn new_tcp_raft_joiner(
@@ -2375,6 +2376,7 @@ pub async fn new_tcp_raft_joiner(
         TcpNetworkControl::default(),
         None,
         None,
+        64,
     )
     .await
 }
@@ -2385,9 +2387,10 @@ pub async fn new_tcp_raft_joiner_with_control(
     nodes: BTreeMap<NodeId, Node>,
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, false, control, None, None).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, false, control, None, None, 64).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn new_tcp_raft_inner(
     node_id: NodeId,
     data_dir: impl AsRef<Path>,
@@ -2396,13 +2399,14 @@ async fn new_tcp_raft_inner(
     control: TcpNetworkControl,
     tls_connector: Option<TlsConnector>,
     max_memory: Option<u64>,
+    snapshot_policy: u64,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
         heartbeat_interval: 50,
         election_timeout_min: 150,
         election_timeout_max: 300,
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(64),
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_policy.max(1)),
         enable_tick: bootstrap,
         ..Default::default()
     }
@@ -2474,6 +2478,7 @@ pub async fn new_tcp_raft_for_server(
     bootstrap: bool,
     tls_connector: Option<TlsConnector>,
     max_memory: Option<u64>,
+    snapshot_policy: u64,
 ) -> CacheResult<RaftHandle> {
     let raft = if bootstrap {
         new_tcp_raft_inner(
@@ -2484,6 +2489,7 @@ pub async fn new_tcp_raft_for_server(
             TcpNetworkControl::default(),
             tls_connector,
             max_memory,
+            snapshot_policy,
         )
         .await
         .map_err(|error| Error::server(format!("open bootstrap raft node: {error}")))?
@@ -2496,6 +2502,7 @@ pub async fn new_tcp_raft_for_server(
             TcpNetworkControl::default(),
             tls_connector,
             max_memory,
+            snapshot_policy,
         )
         .await
         .map_err(|error| Error::server(format!("open raft joiner: {error}")))?

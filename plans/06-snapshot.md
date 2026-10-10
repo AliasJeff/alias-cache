@@ -121,3 +121,17 @@
   - 快照失败不会替换最后一个有效快照；
   - 落后节点能安装快照并继续追赶；
   - 日志清理后重启不会出现旧尾部或状态机位置倒退。
+
+### 完成记录（2026-10 收尾核实）
+
+- 断点续传已实现并有端到端测试：传输协议以
+  `SnapshotStart { total_len, checksum, offset }` 请求握手，接收端按
+  `(total_len, checksum)` 命名保留临时文件并用 `prepare_snapshot_transfer`
+  返回已落盘偏移，发送端从 `data[offset..]` 续发，滚动 checksum 覆盖全量。
+  测试 `raft_snapshot_tcp_transport_resumes_after_connection_drop` 覆盖
+  "收一个 chunk 后断连 → 重连 → 从偏移续传 → 完整性校验"全流程。
+- 值级版本号/CAS 条件已具备等价实现：`StateMachine.versions` 为每个 key
+  维护修改计数，WATCH 事务在日志内按版本校验（见 plans/11），与快照增量
+  CAS 的语义目标一致。
+- 生产 snapshot policy 已配置化：`--snapshot-policy` 控制
+  `SnapshotPolicy::LogsSinceLast` 阈值（缺省 64，0 回落默认），不再硬编码。

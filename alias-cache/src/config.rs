@@ -87,6 +87,8 @@ pub struct Config {
     pub max_memory_bytes: u64,
     /// Refuse new client connections past this count; 0 disables the limit.
     pub max_connections: u32,
+    /// Create a raft snapshot after this many appended log entries.
+    pub snapshot_policy_logs: u64,
 }
 
 impl Default for Config {
@@ -112,6 +114,7 @@ impl Default for Config {
             max_pipeline_len: 1_024,
             max_memory_bytes: 0,
             max_connections: 0,
+            snapshot_policy_logs: 64,
         }
     }
 }
@@ -294,6 +297,16 @@ impl Config {
     pub fn ensure_data_dir(&self) -> Result<()> {
         std::fs::create_dir_all(Path::new(&self.data_dir))
             .map_err(|source| Error::io("create data directory", source))
+    }
+
+    /// Effective snapshot policy: log-count based, from the configured
+    /// threshold; zero falls back to the development default of 64.
+    pub fn snapshot_policy(&self) -> u64 {
+        if self.snapshot_policy_logs == 0 {
+            64
+        } else {
+            self.snapshot_policy_logs
+        }
     }
 
     /// Effective memory limit: `None` when the configured limit is zero.
