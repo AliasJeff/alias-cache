@@ -107,7 +107,10 @@ CLI 6 个、benchmark 2 个测试全部通过）：
 - 安全：`--password`/`ALIAS_CACHE_PASSWORD` 密码认证（AUTH/HELLO AUTH）、
   客户端 TLS、Raft 复制 mTLS
 - 确定性状态机：String 类型全套 SET 选项、TTL 家族、INCRBY（i64 溢出保护）
-- Hash/List/Set/Sorted Set（ZSet score 用 i64 保证跨副本确定性）
+- Hash/List/Set/Sorted Set：含 HINCRBY、ZINCRBY（f64 score 位模式确定性存储）
+- SCAN/HSCAN/SSCAN/ZSCAN 确定性游标遍历
+- WATCH/UNWATCH 乐观锁：版本随复制状态机，EXEC 时日志内 CAS 校验，
+  检查与写入原子提交、无竞态窗口，被 watch 的 key 变更则事务整体 abort
 - OpenRaft 三节点集群：选举、复制、ReadIndex 线性一致读、Leader 转发
 - Learner 加入/提升/移除、网络分区、旧 Leader 冲突恢复
 - 分块快照传输、快照安装/持久化、落后节点追赶、重启恢复
@@ -124,8 +127,8 @@ PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
 多数派提交 SET 2,352 ops/s——写入经 group commit 与 pipeline 并发提交
 （相比初版 461 ops/s 提升 5 倍），剩余瓶颈为每批一次的三节点 fsync 往返。
 
-进行中 / 未完成：Watcher 事务隔离（WATCH）、HINCRBY/ZINCRBY、SCAN 系列、
-写路径 group commit、生产 snapshot policy 调优。
+进行中 / 未完成：资源限制（max-memory/连接上限）、独立健康检查端点、
+快照断点续传、与 Redis 的同机对比基准、生产 snapshot policy 调优。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
 `--tls-key-file` 即可启用客户端 TLS listener；额外指定
