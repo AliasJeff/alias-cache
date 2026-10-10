@@ -15,3 +15,41 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  build:
+    # Release builds must compile on every supported platform; tests already
+    # run in the check job, so builds only gate compilation and packaging.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p alias-cache-cli --target ${{ matrix.target }}
+      - name: Package release artifact
+        shell: bash
+        run: |
+          dir="alias-cache-${{ matrix.target }}"
+          mkdir "$dir"
+          exe=""
+          case "${{ matrix.target }}" in
+            *windows*) exe=".exe" ;;
+          esac
+          cp "target/${{ matrix.target }}/release/alias-cache-cli$exe" "$dir/"
+          [ -f LICENSE ] && cp LICENSE "$dir/"
+          [ -f README.md ] && cp README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alias-cache-${{ matrix.target }}
+          path: alias-cache-*.tar.gz
