@@ -38,7 +38,7 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - 可观测：`INFO [server|replication|cluster]`，输出取自单一 openraft metrics
   快照；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级 bulk
   string；`replication_lag_node_<id>` 仅在 Leader 上报告（-1 表示未知）；
-- 事务：`MULTI`、`EXEC`、`DISCARD`；
+- 事务：`MULTI`、`EXEC`、`DISCARD`、`WATCH`、`UNWATCH`；
 - Pipeline：复用普通请求顺序，不引入额外语义。
 
 第一版明确不承诺：
@@ -51,6 +51,17 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - Stream；
 - LRU/LFU 淘汰；
 - Redis RDB/AOF 文件兼容。
+
+事务与 WATCH 当前约束：
+
+- 事务仍只接受 replicated write 子命令；`WATCH` 在 MULTI 之外对任意 key
+  建立乐观锁，`UNWATCH`/`DISCARD` 清除全部 watch；
+- watch 的版本检查随事务进入 Raft 日志，在 apply 时校验：任一被 watch 的
+  key 的版本与 WATCH 时不同（包括从不存在到存在），整个事务 abort 并返回
+  null 回复，队列内子命令全部不执行——检查与写入在所有副本上原子生效，
+  没有检查-提交竞态窗口；
+- key 版本是每次成功修改自增的计数器，key 删除后回到"不存在"态；
+- 事务内的读命令、事务嵌套仍不受支持，返回稳定错误。
 
 遍历当前约束：
 

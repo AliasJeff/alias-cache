@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -17,6 +18,7 @@ use crate::raft::{
     execute_transaction_request_with_id, new_client_request_id, new_tcp_raft_for_server,
     open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request_with_id,
     send_transaction_request_with_id, serve_raft_rpc_with_tls, wait_for_any_leader,
+    watch_key_versions,
 };
 use crate::sentinel::{self, SentinelContext};
 use crate::state_machine::is_replicated_write;
@@ -271,6 +273,7 @@ async fn handle_raft_connection(
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
     let mut transaction = None;
+    let mut watched: BTreeMap<Bytes, Option<u64>> = BTreeMap::new();
     let mut resp_version = RespVersion::Resp2;
     let mut authenticated = password.is_none();
     loop {
@@ -346,6 +349,7 @@ async fn handle_raft_connection(
                             handle_transaction_command(
                                 &raft,
                                 &mut transaction,
+                                &mut watched,
                                 request,
                                 &sentinel_context,
                                 &mut resp_version,
@@ -384,7 +388,7 @@ fn is_pipeline_safe(request: &crate::protocol::Request) -> bool {
     };
     !matches!(
         command.as_ref(),
-        b"MULTI" | b"EXEC" | b"DISCARD" | b"SENTINEL" | b"INFO"
+        b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"SENTINEL" | b"INFO"
     ) && !connection_command_names()
         .iter()
         .any(|name| command.eq_ignore_ascii_case(name))
@@ -551,6 +555,7 @@ fn hello_command(
 async fn handle_transaction_command(
     raft: &RaftHandle,
     transaction: &mut Option<Vec<crate::protocol::Request>>,
+    watched: &mut BTreeMap<Bytes, Option<u64>>,
     request: crate::protocol::Request,
     sentinel_context: &SentinelContext,
     resp_version: &mut RespVersion,
@@ -599,13 +604,40 @@ async fn handle_transaction_command(
         if transaction.take().is_none() {
             return Frame::error("ERR DISCARD without MULTI");
         }
+        watched.clear();
         return Frame::simple_string("OK");
     }
     if command.is_some_and(|command| command.eq_ignore_ascii_case(b"EXEC")) {
         let Some(requests) = transaction.take() else {
             return Frame::error("ERR EXEC without MULTI");
         };
-        return execute_transaction_with_tls(raft, requests, tls_connector).await;
+        let expectations = std::mem::take(watched).into_iter().collect();
+        return execute_transaction_with_tls(raft, requests, expectations, tls_connector).await;
+    }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"UNWATCH")) {
+        if arguments.len() != 1 {
+            return Frame::error("ERR wrong number of arguments for 'unwatch' command");
+        }
+        watched.clear();
+        return Frame::simple_string("OK");
+    }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"WATCH")) {
+        if arguments.len() < 2 {
+            return Frame::error("ERR wrong number of arguments for 'watch' command");
+        }
+        if transaction.is_some() {
+            return Frame::error("ERR WATCH inside MULTI is not allowed");
+        }
+        let keys: Vec<Bytes> = arguments[1..].to_vec();
+        return match watch_key_versions(raft, keys).await {
+            Ok(versions) => {
+                for (key, version) in versions {
+                    watched.insert(key, version);
+                }
+                Frame::simple_string("OK")
+            }
+            Err(error) => Frame::error(format!("ERR {error}")),
+        };
     }
     if let Some(requests) = transaction {
         if command.is_some_and(|command| {
@@ -627,10 +659,18 @@ async fn handle_transaction_command(
 async fn execute_transaction_with_tls(
     raft: &RaftHandle,
     requests: Vec<crate::protocol::Request>,
+    watch_expectations: Vec<(Bytes, Option<u64>)>,
     tls_connector: Option<TlsConnector>,
 ) -> Frame {
     let request_id = new_client_request_id();
-    match execute_transaction_request_with_id(raft, request_id, requests.clone()).await {
+    match execute_transaction_request_with_id(
+        raft,
+        request_id,
+        requests.clone(),
+        watch_expectations,
+    )
+    .await
+    {
         Ok(ClientRequestOutcome::Applied(response)) => response,
         Ok(ClientRequestOutcome::Redirect(address)) => match send_transaction_request_with_id(
             &address,
@@ -1416,6 +1456,108 @@ mod tests {
         );
         assert_eq!(version, RespVersion::Resp3);
         assert!(matches!(response, Frame::Map(_)));
+    }
+
+    #[tokio::test]
+    async fn watch_aborts_transaction_when_watched_key_changes() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: unique_server_dir("watch-abort"),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_dir = config.data_dir.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let limits = config.protocol_limits();
+        let sentinel_context = SentinelContext::from_config(&config);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None, None)
+                .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut frames = FrameReader::new();
+        // Seed, watch, then modify the watched key from the same server
+        // through a second write before EXEC: the transaction must abort
+        // with a null reply and the queued commands must not run.
+        for parts in [
+            encode_command(&[b"SET", b"acct", b"100"]),
+            encode_command(&[b"WATCH", b"acct"]),
+            encode_command(&[b"SET", b"acct", b"999"]),
+            encode_command(&[b"MULTI"]),
+            encode_command(&[b"SET", b"acct", b"0"]),
+            encode_command(&[b"SET", b"audit", b"stolen"]),
+            encode_command(&[b"EXEC"]),
+        ] {
+            client.write_all(&parts).await.unwrap();
+        }
+        let mut responses = Vec::new();
+        for _ in 0..7 {
+            responses.push(frames.next_frame(&mut client).await);
+        }
+        assert_eq!(responses[0], Frame::simple_string("OK"));
+        assert_eq!(responses[1], Frame::simple_string("OK"));
+        assert_eq!(responses[2], Frame::simple_string("OK"));
+        assert_eq!(responses[3], Frame::simple_string("OK"));
+        assert_eq!(responses[4], Frame::simple_string("QUEUED"));
+        assert_eq!(responses[5], Frame::simple_string("QUEUED"));
+        assert_eq!(
+            responses[6],
+            Frame::Null,
+            "EXEC must abort when a watched key changed"
+        );
+
+        // The abort left the account untouched.
+        client
+            .write_all(&encode_command(&[b"GET", b"acct"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::bulk_string("999")
+        );
+
+        // After UNWATCH the same flow commits.
+        for parts in [
+            encode_command(&[b"UNWATCH"]),
+            encode_command(&[b"MULTI"]),
+            encode_command(&[b"SET", b"audit", b"clean"]),
+            encode_command(&[b"EXEC"]),
+        ] {
+            client.write_all(&parts).await.unwrap();
+        }
+        let unwatch_reply = frames.next_frame(&mut client).await;
+        assert_eq!(unwatch_reply, Frame::simple_string("OK"));
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("QUEUED")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::Array(vec![Frame::simple_string("OK")]),
+            "without watches the transaction commits normally"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

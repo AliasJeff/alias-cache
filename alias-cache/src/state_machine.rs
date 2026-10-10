@@ -200,6 +200,10 @@ pub enum Operation {
     Transaction {
         operations: Vec<Operation>,
         write_time: u64,
+        /// WATCH optimistic-lock expectations: the per-key version the client
+        /// observed before queuing the transaction. Apply aborts the whole
+        /// transaction (replying Null) when any key's live version differs.
+        watch_expectations: Vec<(Bytes, Option<u64>)>,
     },
 }
 
@@ -276,6 +280,11 @@ pub enum ApplyResult {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateMachine {
     values: BTreeMap<Bytes, Entry>,
+    /// Per-key modification counters backing WATCH optimistic locking.
+    ///
+    /// Every committed change to a key increments its counter; removing the
+    /// key removes the counter, so an absent key reads as version zero.
+    versions: BTreeMap<Bytes, u64>,
     logical_time: u64,
     client_results: BTreeMap<ClientRequestId, Frame>,
 }
@@ -341,6 +350,7 @@ impl StateMachine {
                 result
             }
             Operation::Set { key, value } => {
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -374,6 +384,7 @@ impl StateMachine {
                 } else {
                     expire_at
                 };
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -389,6 +400,7 @@ impl StateMachine {
             }
             Operation::MultiSet { pairs } => {
                 for (key, value) in pairs {
+                    self.bump_version(&key.clone());
                     self.values.insert(
                         key,
                         Entry {
@@ -421,6 +433,7 @@ impl StateMachine {
                         added += 1;
                     }
                 }
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -454,7 +467,9 @@ impl StateMachine {
                 }
                 if hash.is_empty() {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                 } else {
+                    self.bump_version(&key.clone());
                     self.values.insert(
                         key,
                         Entry {
@@ -481,6 +496,7 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::Integer(0));
                 }
                 hash.insert(field, value);
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -523,6 +539,7 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error(NOT_INTEGER));
                 };
                 hash.insert(field, Bytes::from(total.to_string()));
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -554,6 +571,7 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error(OVERFLOW));
                 }
                 sorted_set.insert(member, total.to_bits() as i64);
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -587,6 +605,7 @@ impl StateMachine {
                     list.extend(elements);
                 }
                 let length = list.len();
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -636,7 +655,9 @@ impl StateMachine {
                 };
                 if list.is_empty() {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                 } else {
+                    self.bump_version(&key.clone());
                     self.values.insert(
                         key,
                         Entry {
@@ -666,7 +687,9 @@ impl StateMachine {
                 let removed = remove_list_elements(&mut list, count, &element);
                 if list.is_empty() {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                 } else if removed > 0 {
+                    self.bump_version(&key.clone());
                     self.values.insert(
                         key,
                         Entry {
@@ -693,6 +716,7 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error("ERR index out of range"));
                 };
                 list[index] = value;
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -716,6 +740,7 @@ impl StateMachine {
                 };
                 let Some((start, stop)) = normalize_list_range(start, stop, list.len()) else {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                     return ApplyResult::Response(Frame::simple_string("OK"));
                 };
                 let retained = list
@@ -723,6 +748,7 @@ impl StateMachine {
                     .skip(start)
                     .take(stop - start + 1)
                     .collect::<VecDeque<_>>();
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -748,6 +774,7 @@ impl StateMachine {
                     .into_iter()
                     .filter(|member| set.insert(member.clone()))
                     .count() as i64;
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -775,7 +802,9 @@ impl StateMachine {
                     .count() as i64;
                 if set.is_empty() {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                 } else if removed > 0 {
+                    self.bump_version(&key.clone());
                     self.values.insert(
                         key,
                         Entry {
@@ -806,6 +835,7 @@ impl StateMachine {
                         was_missing
                     })
                     .count() as i64;
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -833,7 +863,9 @@ impl StateMachine {
                     .count() as i64;
                 if sorted_set.is_empty() {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                 } else if removed > 0 {
+                    self.bump_version(&key.clone());
                     self.values.insert(
                         key,
                         Entry {
@@ -868,6 +900,7 @@ impl StateMachine {
                 let Some(total) = current.checked_add(increment) else {
                     return ApplyResult::Response(Frame::error(NOT_INTEGER));
                 };
+                self.bump_version(&key.clone());
                 self.values.insert(
                     key,
                     Entry {
@@ -885,6 +918,7 @@ impl StateMachine {
                         .get(&key)
                         .is_some_and(|entry| !self.is_expired(entry));
                     if should_remove && self.values.remove(&key).is_some() {
+                        self.versions.remove(&key);
                         removed += 1;
                     }
                 }
@@ -896,6 +930,7 @@ impl StateMachine {
                 });
                 if should_remove {
                     self.values.remove(&key);
+                    self.versions.remove(&key);
                 }
                 ApplyResult::NoResponse
             }
@@ -951,7 +986,18 @@ impl StateMachine {
             Operation::Transaction {
                 operations,
                 write_time,
+                watch_expectations,
             } => {
+                // WATCH optimistic locking: the queued sub-operations run
+                // only when every watched key still sits at the version the
+                // client observed. Validation happens inside the log, so the
+                // check and the writes commit atomically on every replica.
+                for (key, expected) in &watch_expectations {
+                    let live = self.versions.get(key).copied();
+                    if live != *expected {
+                        return ApplyResult::Response(Frame::Null);
+                    }
+                }
                 self.advance_logical_time(write_time);
                 let mut responses = Vec::with_capacity(operations.len());
                 for operation in operations {
@@ -1203,7 +1249,7 @@ impl StateMachine {
         requests: &[Request],
         write_time: u64,
     ) -> Result<(Operation, Frame)> {
-        self.prepare_transaction_with_id(requests, write_time, None)
+        self.prepare_transaction_with_id(requests, write_time, None, Vec::new())
     }
 
     pub fn prepare_transaction_with_id(
@@ -1211,6 +1257,7 @@ impl StateMachine {
         requests: &[Request],
         write_time: u64,
         request_id: Option<ClientRequestId>,
+        watch_expectations: Vec<(Bytes, Option<u64>)>,
     ) -> Result<(Operation, Frame)> {
         let mut state = self.clone();
         state.advance_logical_time(write_time);
@@ -1249,6 +1296,7 @@ impl StateMachine {
         let operation = Operation::Transaction {
             operations,
             write_time: state.logical_time,
+            watch_expectations,
         };
         let operation = request_id.map_or(operation.clone(), |request_id| Operation::Client {
             request_id,
@@ -1268,6 +1316,18 @@ impl StateMachine {
             }
         }
         Ok((operation, response))
+    }
+
+    /// Current WATCH version of each key; `None` means the key does not
+    /// exist, which is itself a version clients can watch for.
+    pub fn key_versions(&self, keys: &[Bytes]) -> Vec<(Bytes, Option<u64>)> {
+        keys.iter()
+            .map(|key| (key.clone(), self.versions.get(key).copied()))
+            .collect()
+    }
+
+    fn bump_version(&mut self, key: &Bytes) {
+        *self.versions.entry(key.clone()).or_insert(0) += 1;
     }
 
     pub fn snapshot(&self) -> BTreeMap<Bytes, Value> {
@@ -3139,6 +3199,88 @@ mod tests {
     }
 
     #[test]
+    fn watch_expectations_abort_stale_transactions_in_apply() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"account", b"100"]))
+            .unwrap();
+        let watched = state.key_versions(&[Bytes::from_static(b"account")]);
+        assert_eq!(watched, vec![(Bytes::from_static(b"account"), Some(1))]);
+
+        // Build a transaction carrying the observed versions.
+        let (operation, _) = state
+            .prepare_transaction_with_id(
+                &[
+                    command(&[b"SET", b"account", b"90"]),
+                    command(&[b"SET", b"audit", b"debit"]),
+                ],
+                1_000,
+                None,
+                watched,
+            )
+            .unwrap();
+
+        // No concurrent write: the transaction commits.
+        let result = state.apply(operation.clone());
+        assert_eq!(
+            result,
+            ApplyResult::Response(Frame::Array(vec![
+                Frame::simple_string("OK"),
+                Frame::simple_string("OK"),
+            ]))
+        );
+
+        // Another connection still holds the original watch (version 1);
+        // the committed transaction bumped the live version to 2.
+        let stale_watched = vec![(Bytes::from_static(b"account"), Some(1))];
+        state
+            .execute_request(command(&[b"SET", b"other", b"noise"]))
+            .unwrap();
+        let (stale, _) = state
+            .prepare_transaction_with_id(
+                &[command(&[b"SET", b"account", b"0"])],
+                2_000,
+                None,
+                stale_watched,
+            )
+            .unwrap();
+        assert_eq!(
+            state.apply(stale),
+            ApplyResult::Response(Frame::Null),
+            "a stale watch must abort the transaction"
+        );
+        // The aborted transaction must not have touched the key.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"GET", b"account"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("90")
+        );
+
+        // Watching a key that does not exist: version None aborts once the
+        // key appears.
+        let watched_missing = state.key_versions(&[Bytes::from_static(b"fresh")]);
+        assert_eq!(watched_missing, vec![(Bytes::from_static(b"fresh"), None)]);
+        let (pending, _) = state
+            .prepare_transaction_with_id(
+                &[command(&[b"SET", b"fresh", b"v"])],
+                3_000,
+                None,
+                watched_missing,
+            )
+            .unwrap();
+        state
+            .execute_request(command(&[b"SET", b"fresh", b"interloper"]))
+            .unwrap();
+        assert_eq!(
+            state.apply(pending),
+            ApplyResult::Response(Frame::Null),
+            "creation of a watched-missing key must abort"
+        );
+    }
+
+    #[test]
     fn scan_family_iterates_deterministically_with_cursors() {
         let mut state = StateMachine::default();
         for name in ["alpha", "beta", "gamma", "delta"] {
@@ -4276,6 +4418,7 @@ mod tests {
             Operation::Transaction {
                 operations,
                 write_time: 1_000,
+                ..
             } if operations.len() == 2
         ));
         assert_eq!(state.logical_time(), 0);
@@ -4306,6 +4449,7 @@ mod tests {
                 },
             ],
             write_time: 1_000,
+            watch_expectations: Vec::new(),
         };
         let encoded = bincode::serialize(&operation).unwrap();
         let decoded: Operation = bincode::deserialize(&encoded).unwrap();

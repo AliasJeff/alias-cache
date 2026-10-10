@@ -128,3 +128,12 @@
   `docs/compatibility-and-failure-model.md` 的各结构约束段。
 - 待完成：数据结构命令的多节点 TCP 集成回归（当前多节点测试集中在 String/TTL）、
   `WATCH`、事务内读命令、HINCRBY/ZINCRBY、SCAN 系列。
+
+- 2026-10（续）：`HINCRBY`/`ZINCRBY`、`SCAN`/`HSCAN`/`SSCAN`/`ZSCAN` 和
+  `WATCH`/`UNWATCH` 已实现。WATCH 采用日志内 CAS：key 版本随状态机保存，
+  事务携带 WATCH 时的版本快照，apply 时校验、不一致则整体 abort（null
+  回复、子命令不执行）——检查与写入原子提交，无竞态窗口。
+  状态机新增 `versions` map 与 `key_versions` 读取接口；WAL、本地快照和
+  Raft 快照载荷版本升至 3，旧版本数据启动时明确拒绝。
+  测试：状态机级 abort/replay 测试、RESP 连接级 WATCH→并发修改→EXEC
+  null 回复→UNWATCH 后正常提交的全流程测试，及每命令分类护栏更新。

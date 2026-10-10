@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::state_machine::{ApplyResult, Operation, StateMachine};
 
 const MAGIC: [u8; 4] = *b"ALOG";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LEN: usize = 4 + 2 + 8 + 4;
 const CHECKSUM_LEN: usize = 4;
 

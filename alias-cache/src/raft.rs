@@ -3,6 +3,7 @@
 use crate::error::{Error, Result as CacheResult};
 use crate::protocol::{Frame, Request};
 use crate::state_machine::{ClientRequestId, Operation, StateMachine};
+use bytes::Bytes;
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption};
 use openraft::raft::{
@@ -130,7 +131,7 @@ const SNAPSHOT_CHUNK_SIZE: usize = 256 * 1024;
 const NETWORK_MAX_SNAPSHOT_SIZE: u64 = 512 * 1024 * 1024;
 const SNAPSHOT_CHECKSUM_OFFSET: u64 = 0xcbf29ce484222325;
 const SNAPSHOT_CHECKSUM_PRIME: u64 = 0x100000001b3;
-const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 2;
+const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 3;
 const RAFT_SNAPSHOT_FILE_MAGIC: [u8; 4] = *b"ARSS";
 const RAFT_SNAPSHOT_FILE_VERSION: u16 = 1;
 const RAFT_SNAPSHOT_FILE_HEADER_LEN: usize = 4 + 2 + 8;
@@ -947,13 +948,14 @@ pub async fn execute_transaction_request(
     raft: &RaftHandle,
     requests: Vec<Request>,
 ) -> Result<ClientRequestOutcome, String> {
-    execute_transaction_request_with_id(raft, new_client_request_id(), requests).await
+    execute_transaction_request_with_id(raft, new_client_request_id(), requests, Vec::new()).await
 }
 
 pub async fn execute_transaction_request_with_id(
     raft: &RaftHandle,
     request_id: ClientRequestId,
     requests: Vec<Request>,
+    watch_expectations: Vec<(Bytes, Option<u64>)>,
 ) -> Result<ClientRequestOutcome, String> {
     let write_time = current_time_millis();
     let operation = raft
@@ -961,7 +963,12 @@ pub async fn execute_transaction_request_with_id(
             Box::pin(async move {
                 let state = state_machine.state().await;
                 state
-                    .prepare_transaction_with_id(&requests, write_time, Some(request_id))
+                    .prepare_transaction_with_id(
+                        &requests,
+                        write_time,
+                        Some(request_id),
+                        watch_expectations,
+                    )
                     .map(|(operation, _)| operation)
             })
         })
@@ -1891,14 +1898,15 @@ async fn handle_raft_rpc(
             request_id,
             requests,
         } => {
-            let response = execute_transaction_request_with_id(&raft, request_id, requests)
-                .await
-                .map(|outcome| match outcome {
-                    ClientRequestOutcome::Applied(frame) => frame,
-                    ClientRequestOutcome::Redirect(address) => {
-                        Frame::error(format!("MOVED {address}"))
-                    }
-                });
+            let response =
+                execute_transaction_request_with_id(&raft, request_id, requests, Vec::new())
+                    .await
+                    .map(|outcome| match outcome {
+                        ClientRequestOutcome::Applied(frame) => frame,
+                        ClientRequestOutcome::Redirect(address) => {
+                            Frame::error(format!("MOVED {address}"))
+                        }
+                    });
             NetworkResponse::Client(response)
         }
         NetworkRequest::Snapshot {
@@ -2784,6 +2792,22 @@ pub async fn wait_for_leader(raft: &RaftHandle, node_id: NodeId) -> CacheResult<
 /// Server startup must not wait for the local node to lead: voter members that
 /// did not seed the cluster would block forever even though the cluster is
 /// already serving through another leader.
+/// Snapshot the WATCH versions of the given keys.
+///
+/// The read goes through the state machine handle on this node; callers must
+/// hold the returned versions until EXEC, which validates them inside the log
+/// so the check and the writes commit atomically on every replica.
+pub async fn watch_key_versions(
+    raft: &RaftHandle,
+    keys: Vec<Bytes>,
+) -> CacheResult<Vec<(Bytes, Option<u64>)>> {
+    raft.with_state_machine(move |state_machine| {
+        Box::pin(async move { state_machine.state().await.key_versions(&keys) })
+    })
+    .await
+    .map_err(|error| Error::server(format!("read raft state machine: {error}")))
+}
+
 pub async fn wait_for_any_leader(raft: &RaftHandle) -> CacheResult<()> {
     raft.wait(None)
         .metrics(
