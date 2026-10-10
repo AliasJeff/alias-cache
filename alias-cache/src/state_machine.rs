@@ -13,6 +13,8 @@ const CLIENT_RESULT_CACHE_CAPACITY: usize = 4_096;
 
 const WRONG_TYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
+const OVERFLOW: &str = "ERR increment or decrement would overflow";
+
 /// Commands whose execution only reads replicated state.
 ///
 /// The pipeline layer uses this to order reads after preceding writes on the
@@ -61,9 +63,9 @@ const READS: &[&[u8]] = &[
 /// Replicated write commands, mirroring the write arms of
 /// `prepare_request_inner` one-to-one.
 const WRITES: &[&[u8]] = &[
-    b"SET", b"DEL", b"MSET", b"INCRBY", b"HSET", b"HMSET", b"HSETNX", b"HDEL", b"LPUSH", b"RPUSH",
-    b"LPOP", b"RPOP", b"LREM", b"LSET", b"LTRIM", b"SADD", b"SREM", b"ZADD", b"ZREM", b"EXPIRE",
-    b"PEXPIRE", b"PERSIST",
+    b"SET", b"DEL", b"MSET", b"INCRBY", b"HSET", b"HMSET", b"HSETNX", b"HINCRBY", b"HDEL",
+    b"LPUSH", b"RPUSH", b"LPOP", b"RPOP", b"LREM", b"LSET", b"LTRIM", b"SADD", b"SREM", b"ZADD",
+    b"ZINCRBY", b"ZREM", b"EXPIRE", b"PEXPIRE", b"PERSIST",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -111,6 +113,16 @@ pub enum Operation {
         key: Bytes,
         field: Bytes,
         value: Bytes,
+    },
+    HashIncrement {
+        key: Bytes,
+        field: Bytes,
+        increment: i64,
+    },
+    SortedSetIncrement {
+        key: Bytes,
+        member: Bytes,
+        increment: i64,
     },
     ListPush {
         key: Bytes,
@@ -200,6 +212,8 @@ impl Operation {
             | Self::HashSet { .. }
             | Self::HashDelete { .. }
             | Self::HashSetNx { .. }
+            | Self::HashIncrement { .. }
+            | Self::SortedSetIncrement { .. }
             | Self::ListPush { .. }
             | Self::ListPop { .. }
             | Self::ListRemove { .. }
@@ -227,6 +241,8 @@ impl Operation {
             | Self::HashSet { .. }
             | Self::HashDelete { .. }
             | Self::HashSetNx { .. }
+            | Self::HashIncrement { .. }
+            | Self::SortedSetIncrement { .. }
             | Self::ListPush { .. }
             | Self::ListPop { .. }
             | Self::ListRemove { .. }
@@ -279,6 +295,8 @@ impl StateMachine {
             | Operation::HashSet { .. }
             | Operation::HashDelete { .. }
             | Operation::HashSetNx { .. }
+            | Operation::HashIncrement { .. }
+            | Operation::SortedSetIncrement { .. }
             | Operation::ListPush { .. }
             | Operation::ListPop { .. }
             | Operation::ListRemove { .. }
@@ -467,6 +485,79 @@ impl StateMachine {
                     },
                 );
                 ApplyResult::Response(Frame::Integer(1))
+            }
+            Operation::HashIncrement {
+                key,
+                field,
+                increment,
+            } => {
+                const NOT_INTEGER: &str = "ERR hash value is not an integer";
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut hash = match existing.map(|entry| entry.value) {
+                    None => BTreeMap::new(),
+                    Some(Value::Hash(hash)) => hash,
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let current = match hash.get(&field) {
+                    None => 0,
+                    Some(bytes) => {
+                        match std::str::from_utf8(bytes)
+                            .map_err(|_| NOT_INTEGER)
+                            .and_then(|text| text.parse::<i64>().map_err(|_| NOT_INTEGER))
+                        {
+                            Ok(value) => value,
+                            Err(message) => return ApplyResult::Response(Frame::error(message)),
+                        }
+                    }
+                };
+                let Some(total) = current.checked_add(increment) else {
+                    return ApplyResult::Response(Frame::error(NOT_INTEGER));
+                };
+                hash.insert(field, Bytes::from(total.to_string()));
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::Hash(hash),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(Frame::Integer(total))
+            }
+            Operation::SortedSetIncrement {
+                key,
+                member,
+                increment,
+            } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut sorted_set = match existing.map(|entry| entry.value) {
+                    None => BTreeMap::new(),
+                    Some(Value::SortedSet(sorted_set)) => sorted_set,
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let current = sorted_set.get(&member).copied().unwrap_or(0);
+                let total = score_as_f64(current) + score_as_f64(increment);
+                if !total.is_finite() {
+                    return ApplyResult::Response(Frame::error(OVERFLOW));
+                }
+                sorted_set.insert(member, total.to_bits() as i64);
+                self.values.insert(
+                    key,
+                    Entry {
+                        value: Value::SortedSet(sorted_set),
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(score_frame(total))
             }
             Operation::ListPush {
                 key,
@@ -956,6 +1047,9 @@ impl StateMachine {
         if command.eq_ignore_ascii_case(b"HSETNX") {
             return self.execute_hash_set_nx(arguments);
         }
+        if command.eq_ignore_ascii_case(b"HINCRBY") {
+            return self.execute_hash_increment(arguments);
+        }
         if command.eq_ignore_ascii_case(b"HDEL") {
             return self.execute_hash_delete(arguments);
         }
@@ -1036,6 +1130,9 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"ZADD") {
             return self.execute_sorted_set_add(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"ZINCRBY") {
+            return self.execute_sorted_set_increment(arguments);
         }
         if command.eq_ignore_ascii_case(b"ZREM") {
             return self.execute_sorted_set_remove(arguments);
@@ -1402,6 +1499,72 @@ impl StateMachine {
         Ok((
             Some(Operation::Increment { key, increment }),
             Frame::Integer(total),
+        ))
+    }
+
+    fn execute_hash_increment(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        const NOT_INTEGER: &str = "hash value is not an integer";
+        expect_arity("HINCRBY", &arguments, 4)?;
+        let key = arguments[1].clone();
+        let field = arguments[2].clone();
+        let increment = std::str::from_utf8(&arguments[3])
+            .map_err(|_| Error::protocol(NOT_INTEGER))?
+            .parse::<i64>()
+            .map_err(|_| Error::protocol(NOT_INTEGER))?;
+        // Reject before replication only on the deterministic failure paths:
+        // wrong type and a non-integer current value. Overflow repeats under
+        // apply because the field may change before this operation commits.
+        let current = match self.hash_for_key(&key)? {
+            None => 0,
+            Some(hash) => match hash.get(&field) {
+                None => 0,
+                Some(value) => std::str::from_utf8(value)
+                    .map_err(|_| Error::protocol(NOT_INTEGER))?
+                    .parse::<i64>()
+                    .map_err(|_| Error::protocol(NOT_INTEGER))?,
+            },
+        };
+        let total = current
+            .checked_add(increment)
+            .ok_or_else(|| Error::protocol(OVERFLOW))?;
+        Ok((
+            Some(Operation::HashIncrement {
+                key,
+                field,
+                increment,
+            }),
+            Frame::Integer(total),
+        ))
+    }
+
+    fn execute_sorted_set_increment(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("ZINCRBY", &arguments, 4)?;
+        let key = arguments[1].clone();
+        let increment = parse_score(&arguments[2])?;
+        let member = arguments[3].clone();
+        // Scores are stored as f64 bit patterns; the increment repeats under
+        // apply where the sum is re-checked for finiteness.
+        let current = self
+            .sorted_set_for_key(&key)?
+            .and_then(|sorted_set| sorted_set.get(&member))
+            .copied()
+            .map(score_as_f64)
+            .unwrap_or(0.0);
+        let total = score_as_f64(current.to_bits() as i64)
+            + f64::from_bits(u64::from_ne_bytes(increment.to_ne_bytes()));
+        if !total.is_finite() {
+            return Err(Error::protocol(OVERFLOW));
+        }
+        Ok((
+            Some(Operation::SortedSetIncrement {
+                key,
+                member,
+                increment,
+            }),
+            score_frame(total),
         ))
     }
 
@@ -2231,6 +2394,10 @@ fn format_score(score: i64) -> Bytes {
     Bytes::from(score_as_f64(score).to_string())
 }
 
+fn score_frame(score: f64) -> Frame {
+    Frame::bulk_string(score.to_string())
+}
+
 fn score_as_f64(score: i64) -> f64 {
     f64::from_bits(u64::from_ne_bytes(score.to_ne_bytes()))
 }
@@ -2483,6 +2650,12 @@ mod tests {
             vec![b"MSET".to_vec(), b"key".to_vec(), b"value".to_vec()],
             vec![b"INCRBY".to_vec(), b"num".to_vec(), b"1".to_vec()],
             vec![
+                b"HINCRBY".to_vec(),
+                b"h".to_vec(),
+                b"counter".to_vec(),
+                b"3".to_vec(),
+            ],
+            vec![
                 b"HSET".to_vec(),
                 b"h".to_vec(),
                 b"f".to_vec(),
@@ -2553,6 +2726,12 @@ mod tests {
                 b"m".to_vec(),
             ],
             vec![b"ZREM".to_vec(), b"z".to_vec(), b"v".to_vec()],
+            vec![
+                b"ZINCRBY".to_vec(),
+                b"z".to_vec(),
+                b"5".to_vec(),
+                b"m".to_vec(),
+            ],
             vec![b"ZSCORE".to_vec(), b"z".to_vec(), b"m".to_vec()],
             vec![b"ZCARD".to_vec(), b"z".to_vec()],
             vec![
@@ -2715,6 +2894,150 @@ mod tests {
                 .execute_request(command(&[b"INCRBY", b"key", b"nope"]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn hincrby_counts_from_zero_replays_and_rejects_bad_values() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HINCRBY", b"h", b"hits", b"5"]))
+                .unwrap()
+                .1,
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HINCRBY", b"h", b"hits", b"-2"]))
+                .unwrap()
+                .1,
+            Frame::Integer(3)
+        );
+        // HINCRBY must not reset the key TTL.
+        state
+            .execute_request(command(&[b"HSET", b"ttl", b"f", b"10"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"PEXPIRE", b"ttl", b"4000"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"HINCRBY", b"ttl", b"f", b"1"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"ttl"]))
+                .unwrap()
+                .1,
+            Frame::Integer(4000)
+        );
+
+        // A prepared operation replays to the same result on a fresh replica.
+        let (operation, response) = state
+            .prepare_request(command(&[b"HINCRBY", b"h", b"hits", b"1"]))
+            .unwrap();
+        let mut replay = StateMachine::default();
+        replay
+            .execute_request(command(&[b"HSET", b"h", b"hits", b"3"]))
+            .unwrap();
+        assert_eq!(
+            replay.apply(operation.expect("HINCRBY must replicate")),
+            ApplyResult::Response(response.clone())
+        );
+        assert_eq!(response, Frame::Integer(4));
+
+        state
+            .execute_request(command(&[b"HSET", b"h", b"text", b"abc"]))
+            .unwrap();
+        let not_integer = state
+            .execute_request(command(&[b"HINCRBY", b"h", b"text", b"1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(not_integer.contains("not an integer"));
+        state
+            .execute_request(command(&[b"HINCRBY", b"h", b"big", b"9223372036854775807"]))
+            .unwrap();
+        let overflow = state
+            .execute_request(command(&[b"HINCRBY", b"h", b"big", b"1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(overflow.contains("overflow"));
+        state
+            .execute_request(command(&[b"SET", b"str", b"x"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"HINCRBY", b"str", b"f", b"1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn zincrby_creates_members_replays_and_rejects_overflow() {
+        let mut state = StateMachine::default();
+        // ZINCRBY replies with the new score as a bulk string, like Redis.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZINCRBY", b"z", b"5", b"a"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("5")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZINCRBY", b"z", b"2", b"a"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("7")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZINCRBY", b"z", b"1", b"b"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("1")
+        );
+        // Rank follows the updated scores.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"ZRANGE", b"z", b"0", b"-1"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![Frame::bulk_string("b"), Frame::bulk_string("a"),])
+        );
+
+        let (operation, response) = state
+            .prepare_request(command(&[b"ZINCRBY", b"z", b"1", b"a"]))
+            .unwrap();
+        let mut replay = StateMachine::default();
+        replay
+            .execute_request(command(&[b"ZADD", b"z", b"7", b"a"]))
+            .unwrap();
+        replay
+            .execute_request(command(&[b"ZADD", b"z", b"1", b"b"]))
+            .unwrap();
+        assert_eq!(
+            replay.apply(operation.expect("ZINCRBY must replicate")),
+            ApplyResult::Response(response.clone())
+        );
+        assert_eq!(response, Frame::bulk_string("8"));
+
+        // f64 saturates far above i64, so overflow needs near-f64::MAX scores.
+        state
+            .execute_request(command(&[b"ZINCRBY", b"z", b"1e308", b"c"]))
+            .unwrap();
+        let overflow = state
+            .execute_request(command(&[b"ZINCRBY", b"z", b"1e308", b"c"]))
+            .unwrap_err()
+            .to_string();
+        assert!(overflow.contains("overflow"));
+        state
+            .execute_request(command(&[b"SET", b"str", b"x"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"ZINCRBY", b"str", b"1", b"a"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
     }
 
     #[test]

@@ -25,14 +25,14 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 
 - 连接：`PING`、`ECHO`、`QUIT`、`AUTH`、`SELECT`、`HELLO`；
 - 字符串：`GET`、`SET`、`DEL`、`EXISTS`、`MGET`、`MSET`、`INCRBY`；
-- Hash：`HSET`、`HMSET`、`HSETNX`、`HDEL`、`HGET`、`HMGET`、`HGETALL`、
-  `HKEYS`、`HVALS`、`HLEN`、`HEXISTS`；
+- Hash：`HSET`、`HMSET`、`HSETNX`、`HINCRBY`、`HDEL`、`HGET`、`HMGET`、
+  `HGETALL`、`HKEYS`、`HVALS`、`HLEN`、`HEXISTS`；
 - List：`LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LINDEX`、`LRANGE`、`LLEN`、
   `LREM`、`LSET`、`LTRIM`；
 - Set：`SADD`、`SREM`、`SMEMBERS`、`SISMEMBER`、`SCARD`、`SDIFF`、
   `SINTER`、`SUNION`；
-- Sorted Set：`ZADD`、`ZREM`、`ZSCORE`、`ZCARD`、`ZRANGE`、`ZREVRANGE`、
-  `ZRANK`、`ZREVRANK`；
+- Sorted Set：`ZADD`、`ZINCRBY`、`ZREM`、`ZSCORE`、`ZCARD`、`ZRANGE`、
+  `ZREVRANGE`、`ZRANK`、`ZREVRANK`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
 - 可观测：`INFO [server|replication|cluster]`，输出取自单一 openraft metrics
   快照；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级 bulk
@@ -65,7 +65,11 @@ Hash 当前约束：
 - `HGETALL` 返回 RESP3 Map，RESP2 客户端按数组降级；
 - `HKEYS`、`HVALS` 和 `HMGET` 保持确定性顺序或请求顺序；
 - Hash 写入继承 key 的 TTL，删除最后一个 field 后删除整个 key；
-- `HINCRBY`、`HSCAN` 和 Hash 过期策略扩展尚未纳入稳定兼容范围。
+- `HINCRBY` 使用 `i64` 饱和算术：field 值必须是可解析的 64 位整数，否则
+  返回 `hash value is not an integer`；加减溢出返回
+  `increment or decrement would overflow`；对不存在的 field 从 0 开始；
+  保持 key 的既有 TTL；
+- `HSCAN` 和 Hash 过期策略扩展尚未纳入稳定兼容范围。
 
 List 当前约束：
 
@@ -86,13 +90,17 @@ Set 当前约束：
 Sorted Set 当前约束：
 
 - Sorted Set member 使用二进制安全的 bulk string；
-- score 使用 `i64` 整数。这不是 Redis 的 double 语义，是刻意的确定性取舍：
-  避免浮点比较和序列化在各副本间产生分歧；非整数 score 返回稳定错误；
+- score 接受任意有限 double 文本，内部以 f64 位模式存储（无损往返），
+  排序用 IEEE 754 `total_cmp` 全序。非有限 score（NaN/inf）返回稳定错误；
+  位模式与全序比较都是确定性的，跨副本重放不会分歧；
 - `ZADD` 返回新增 member 数，重复 member 更新 score 不计数；
 - 同分 member 按 member 字节序稳定排序，`ZRANK`/`ZREVRANK` 与之一致；
 - `ZRANGE`/`ZREVRANGE` 支持负索引和 `WITHSCORES`；
 - Sorted Set 写入继承 key 的 TTL，删除最后一个 member 后删除整个 key；
-- `ZINCRBY`、`ZRANGEBYSCORE`、`ZREMRANGEBY*`、`ZSCAN` 和 `WITHSCORES` 之外的
+- `ZINCRBY` 沿用 ZADD 的 score 语义（f64，以位模式确定性存储），member 不
+  存在时先按 increment 添加，返回新 score 的 bulk string；结果非有限时返回
+  溢出错误；
+- `ZRANGEBYSCORE`、`ZREMRANGEBY*`、`ZSCAN` 和 `WITHSCORES` 之外的
   选项（`GT`/`LT`/`CH`/`INCR`）尚未纳入稳定兼容范围。
 
 Sentinel 风格命令只能作为后续客户端发现适配层，不能成为 Raft 状态来源。
