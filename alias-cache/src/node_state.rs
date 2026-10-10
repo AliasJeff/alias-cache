@@ -24,6 +24,7 @@ impl NodeState {
         let wal_path = data_dir.join("raft.log");
         let mut replay_wal = Wal::open(&wal_path)?;
         replay_wal.replay(&mut state_machine)?;
+        state_machine.recompute_memory();
         let wal = Wal::open(wal_path)?;
         Ok(Self {
             state_machine,

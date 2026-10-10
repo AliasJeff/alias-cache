@@ -82,6 +82,11 @@ pub struct Config {
     pub max_array_len: usize,
     pub max_nesting_depth: usize,
     pub max_pipeline_len: usize,
+    /// Reject writes whose payload would push live data past this many
+    /// bytes; 0 disables the limit.
+    pub max_memory_bytes: u64,
+    /// Refuse new client connections past this count; 0 disables the limit.
+    pub max_connections: u32,
 }
 
 impl Default for Config {
@@ -105,6 +110,8 @@ impl Default for Config {
             max_array_len: 1_024,
             max_nesting_depth: 32,
             max_pipeline_len: 1_024,
+            max_memory_bytes: 0,
+            max_connections: 0,
         }
     }
 }
@@ -287,6 +294,11 @@ impl Config {
     pub fn ensure_data_dir(&self) -> Result<()> {
         std::fs::create_dir_all(Path::new(&self.data_dir))
             .map_err(|source| Error::io("create data directory", source))
+    }
+
+    /// Effective memory limit: `None` when the configured limit is zero.
+    pub fn max_memory_non_zero(&self) -> Option<u64> {
+        (self.max_memory_bytes > 0).then_some(self.max_memory_bytes)
     }
 
     pub fn protocol_limits(&self) -> ProtocolLimits {

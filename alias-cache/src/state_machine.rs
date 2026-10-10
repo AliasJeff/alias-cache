@@ -277,7 +277,7 @@ pub enum ApplyResult {
     NoResponse,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StateMachine {
     values: BTreeMap<Bytes, Entry>,
     /// Per-key modification counters backing WATCH optimistic locking.
@@ -285,9 +285,96 @@ pub struct StateMachine {
     /// Every committed change to a key increments its counter; removing the
     /// key removes the counter, so an absent key reads as version zero.
     versions: BTreeMap<Bytes, u64>,
+    /// Best-effort live payload size in bytes, maintained incrementally.
+    /// Skipped by serde and recomputed after recovery; it excludes BTreeMap
+    /// and queue structural overhead.
+    #[serde(skip, default)]
+    memory_bytes: u64,
+    /// Write rejection threshold; `None` disables the check.
+    #[serde(skip, default)]
+    max_memory: Option<u64>,
     logical_time: u64,
     client_results: BTreeMap<ClientRequestId, Frame>,
 }
+
+/// New bytes a write operation would charge against max_memory.
+///
+/// In-place mutations (counters, TTL changes, shrinks) charge nothing.
+fn incoming_bytes(operation: &Operation) -> u64 {
+    match operation {
+        Operation::Client { operation, .. } => incoming_bytes(operation),
+        Operation::Transaction { operations, .. } => operations.iter().map(incoming_bytes).sum(),
+        Operation::Set { key, value } | Operation::SetWithExpiration { key, value, .. } => {
+            (key.len() + value.len()) as u64
+        }
+        Operation::MultiSet { pairs } => pairs
+            .iter()
+            .map(|(key, value)| (key.len() + value.len()) as u64)
+            .sum(),
+        Operation::HashSet { key, fields, .. } => {
+            (key.len() as u64)
+                + fields
+                    .iter()
+                    .map(|(field, value)| (field.len() + value.len()) as u64)
+                    .sum::<u64>()
+        }
+        Operation::HashSetNx { key, field, value } => {
+            (key.len() + field.len() + value.len()) as u64
+        }
+        Operation::HashIncrement { key, field, .. } => (key.len() + field.len()) as u64,
+        Operation::ListPush { key, elements, .. } => {
+            (key.len() as u64) + elements.iter().map(|b| b.len() as u64).sum::<u64>()
+        }
+        Operation::SetAdd { key, members }
+        | Operation::SetRemove { key, members }
+        | Operation::SortedSetRemove { key, members }
+        | Operation::HashDelete {
+            key,
+            fields: members,
+        } => (key.len() as u64) + members.iter().map(|b| b.len() as u64).sum::<u64>(),
+        Operation::SortedSetAdd { key, entries } => {
+            (key.len() as u64)
+                + entries
+                    .iter()
+                    .map(|(member, _)| member.len() as u64 + 8)
+                    .sum::<u64>()
+        }
+        Operation::SortedSetIncrement { key, member, .. } => (key.len() + member.len()) as u64,
+        _ => 0,
+    }
+}
+
+/// Approximate payload size of one live entry, excluding tree overhead.
+fn entry_size(key: &Bytes, entry: &Entry) -> u64 {
+    let value_size = match &entry.value {
+        Value::String(bytes) => bytes.len() as u64,
+        Value::Hash(map) => map
+            .iter()
+            .map(|(field, value)| (field.len() + value.len()) as u64)
+            .sum(),
+        Value::List(list) => list.iter().map(|bytes| bytes.len() as u64).sum(),
+        Value::Set(set) => set.iter().map(|bytes| bytes.len() as u64).sum(),
+        Value::SortedSet(sorted_set) => sorted_set
+            .keys()
+            .map(|member| member.len() as u64 + 8)
+            .sum(),
+    };
+    key.len() as u64 + value_size
+}
+
+/// Equality ignores derived bookkeeping: the memory counter is recomputed
+/// after recovery and the limit is runtime configuration, so two state
+/// machines with identical replicated content are equal.
+impl PartialEq for StateMachine {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+            && self.versions == other.versions
+            && self.logical_time == other.logical_time
+            && self.client_results == other.client_results
+    }
+}
+
+impl Eq for StateMachine {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Entry {
@@ -351,7 +438,7 @@ impl StateMachine {
             }
             Operation::Set { key, value } => {
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::String(value),
@@ -385,7 +472,7 @@ impl StateMachine {
                     expire_at
                 };
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::String(value),
@@ -401,7 +488,7 @@ impl StateMachine {
             Operation::MultiSet { pairs } => {
                 for (key, value) in pairs {
                     self.bump_version(&key.clone());
-                    self.values.insert(
+                    self.insert_entry(
                         key,
                         Entry {
                             value: Value::String(value),
@@ -434,7 +521,7 @@ impl StateMachine {
                     }
                 }
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::Hash(hash),
@@ -466,11 +553,11 @@ impl StateMachine {
                     }
                 }
                 if hash.is_empty() {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                 } else {
                     self.bump_version(&key.clone());
-                    self.values.insert(
+                    self.insert_entry(
                         key,
                         Entry {
                             value: Value::Hash(hash),
@@ -497,7 +584,7 @@ impl StateMachine {
                 }
                 hash.insert(field, value);
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::Hash(hash),
@@ -540,7 +627,7 @@ impl StateMachine {
                 };
                 hash.insert(field, Bytes::from(total.to_string()));
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::Hash(hash),
@@ -572,7 +659,7 @@ impl StateMachine {
                 }
                 sorted_set.insert(member, total.to_bits() as i64);
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::SortedSet(sorted_set),
@@ -606,7 +693,7 @@ impl StateMachine {
                 }
                 let length = list.len();
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::List(list),
@@ -654,11 +741,11 @@ impl StateMachine {
                     }
                 };
                 if list.is_empty() {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                 } else {
                     self.bump_version(&key.clone());
-                    self.values.insert(
+                    self.insert_entry(
                         key,
                         Entry {
                             value: Value::List(list),
@@ -686,11 +773,11 @@ impl StateMachine {
                 };
                 let removed = remove_list_elements(&mut list, count, &element);
                 if list.is_empty() {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                 } else if removed > 0 {
                     self.bump_version(&key.clone());
-                    self.values.insert(
+                    self.insert_entry(
                         key,
                         Entry {
                             value: Value::List(list),
@@ -717,7 +804,7 @@ impl StateMachine {
                 };
                 list[index] = value;
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::List(list),
@@ -739,7 +826,7 @@ impl StateMachine {
                     return ApplyResult::Response(wrong_type_frame());
                 };
                 let Some((start, stop)) = normalize_list_range(start, stop, list.len()) else {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                     return ApplyResult::Response(Frame::simple_string("OK"));
                 };
@@ -749,7 +836,7 @@ impl StateMachine {
                     .take(stop - start + 1)
                     .collect::<VecDeque<_>>();
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::List(retained),
@@ -775,7 +862,7 @@ impl StateMachine {
                     .filter(|member| set.insert(member.clone()))
                     .count() as i64;
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::Set(set),
@@ -801,11 +888,11 @@ impl StateMachine {
                     .filter(|member| set.remove(member))
                     .count() as i64;
                 if set.is_empty() {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                 } else if removed > 0 {
                     self.bump_version(&key.clone());
-                    self.values.insert(
+                    self.insert_entry(
                         key,
                         Entry {
                             value: Value::Set(set),
@@ -836,7 +923,7 @@ impl StateMachine {
                     })
                     .count() as i64;
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::SortedSet(sorted_set),
@@ -862,11 +949,11 @@ impl StateMachine {
                     .filter(|member| sorted_set.remove(member).is_some())
                     .count() as i64;
                 if sorted_set.is_empty() {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                 } else if removed > 0 {
                     self.bump_version(&key.clone());
-                    self.values.insert(
+                    self.insert_entry(
                         key,
                         Entry {
                             value: Value::SortedSet(sorted_set),
@@ -901,7 +988,7 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error(NOT_INTEGER));
                 };
                 self.bump_version(&key.clone());
-                self.values.insert(
+                self.insert_entry(
                     key,
                     Entry {
                         value: Value::String(Bytes::from(total.to_string())),
@@ -917,7 +1004,7 @@ impl StateMachine {
                         .values
                         .get(&key)
                         .is_some_and(|entry| !self.is_expired(entry));
-                    if should_remove && self.values.remove(&key).is_some() {
+                    if should_remove && self.remove_entry(&key) {
                         self.versions.remove(&key);
                         removed += 1;
                     }
@@ -929,7 +1016,7 @@ impl StateMachine {
                     entry.expire_at == Some(expire_at) && self.is_expired(entry)
                 });
                 if should_remove {
-                    self.values.remove(&key);
+                    let _ = self.remove_entry(&key);
                     self.versions.remove(&key);
                 }
                 ApplyResult::NoResponse
@@ -1051,7 +1138,16 @@ impl StateMachine {
         {
             return Ok((None, response.clone()));
         }
-        let (operation, response) = self.prepare_request_inner(request)?;
+        let (operation, response) =
+            self.prepare_request_inner(request)
+                .and_then(|(operation, response)| {
+                    // OOM gate: reject writes whose new payload would push the
+                    // store past max_memory before they enter the log.
+                    if let Some(operation) = &operation {
+                        self.check_memory(operation)?;
+                    }
+                    Ok((operation, response))
+                })?;
         let operation = match (request_id, operation) {
             (Some(request_id), Some(operation)) => Some(Operation::Client {
                 request_id,
@@ -1328,6 +1424,66 @@ impl StateMachine {
 
     fn bump_version(&mut self, key: &Bytes) {
         *self.versions.entry(key.clone()).or_insert(0) += 1;
+    }
+
+    /// Replace or create a key, keeping the memory counter exact.
+    fn insert_entry(&mut self, key: Bytes, entry: Entry) {
+        if let Some(old) = self.values.get(&key) {
+            self.memory_bytes = self.memory_bytes.saturating_sub(entry_size(&key, old));
+        }
+        self.memory_bytes = self.memory_bytes.saturating_add(entry_size(&key, &entry));
+        self.values.insert(key, entry);
+    }
+
+    /// Delete a key, keeping the memory counter exact; reports whether the
+    /// key existed.
+    fn remove_entry(&mut self, key: &Bytes) -> bool {
+        match self.values.remove(key) {
+            Some(removed) => {
+                self.memory_bytes = self.memory_bytes.saturating_sub(entry_size(key, &removed));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set the OOM write-rejection threshold.
+    pub fn set_max_memory(&mut self, max_memory: Option<u64>) {
+        self.max_memory = max_memory;
+    }
+
+    /// Recompute the memory counter from live data (used after recovery).
+    pub fn recompute_memory(&mut self) {
+        self.memory_bytes = self
+            .values
+            .iter()
+            .filter(|(_, entry)| !self.is_expired(entry))
+            .map(|(key, entry)| entry_size(key, entry))
+            .sum();
+    }
+
+    /// Current live payload size in bytes.
+    pub fn memory_usage(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    /// Reject a write whose new payload would exceed the memory limit.
+    ///
+    /// The estimate charges the full size of the new data even when it
+    /// replaces an existing key, which is deliberately conservative: the
+    /// gate may refuse a write slightly early but never admits one that
+    /// overshoots. Reads and deletions always pass.
+    fn check_memory(&self, operation: &Operation) -> Result<()> {
+        let Some(max) = self.max_memory else {
+            return Ok(());
+        };
+        let incoming = incoming_bytes(operation);
+        if self.memory_bytes.saturating_add(incoming) > max {
+            return Err(Error::protocol(
+                "OOM command not allowed when used memory > 'maxmemory'",
+            ));
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> BTreeMap<Bytes, Value> {
@@ -3278,6 +3434,62 @@ mod tests {
             ApplyResult::Response(Frame::Null),
             "creation of a watched-missing key must abort"
         );
+    }
+
+    #[test]
+    fn max_memory_rejects_overshoot_and_recovers_after_delete() {
+        let mut state = StateMachine::default();
+        // "key"/"value" costs 3+5 = 8 bytes; the limit admits it but not a
+        // large second write.
+        state.set_max_memory(Some(16));
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        assert_eq!(state.memory_usage(), 8);
+
+        let oom = state
+            .execute_request(command(&[b"SET", b"big", b"0123456789"]))
+            .unwrap_err()
+            .to_string();
+        assert!(oom.contains("OOM"), "got: {oom}");
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"big"])).unwrap().1,
+            Frame::Null,
+            "rejected write must not have landed"
+        );
+
+        // In-place changes that shrink pass; growth beyond the cap fails.
+        state
+            .execute_request(command(&[b"SET", b"key", b"v"]))
+            .unwrap();
+        assert_eq!(state.memory_usage(), 4);
+        state
+            .execute_request(command(&[b"SET", b"key", b"value"]))
+            .unwrap();
+        let oom = state
+            .execute_request(command(&[b"SET", b"key", b"0123456789"]))
+            .unwrap_err()
+            .to_string();
+        assert!(oom.contains("OOM"));
+
+        // Deleting frees room again.
+        state.execute_request(command(&[b"DEL", b"key"])).unwrap();
+        assert_eq!(state.memory_usage(), 0);
+        state
+            .execute_request(command(&[b"SET", b"fresh", b"0123456789"]))
+            .unwrap();
+        assert_eq!(state.memory_usage(), 15);
+
+        // Disabling the limit restores unrestricted writes.
+        state.set_max_memory(None);
+        state
+            .execute_request(command(&[b"SET", b"key", b"0123456789"]))
+            .unwrap();
+
+        // The counter survives snapshot round-trips after recompute.
+        let mut restored = state.clone();
+        restored.recompute_memory();
+        assert_eq!(restored.memory_usage(), state.memory_usage());
     }
 
     #[test]

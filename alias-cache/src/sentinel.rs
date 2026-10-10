@@ -282,7 +282,7 @@ mod tests {
             std::process::id(),
             unique_test_id()
         ));
-        let raft = open_single_node(1, &data_dir, "127.0.0.1:16379")
+        let raft = open_single_node(1, &data_dir, "127.0.0.1:16379", None)
             .await
             .unwrap();
         let context = SentinelContext {

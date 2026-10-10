@@ -64,3 +64,23 @@ cache-cat 的指标和管理命令不能自动视为 alias-cache 的公开 API�
 - 所有限制触发后服务不会崩溃或无限增长。
 - 关键 Raft、存储和协议状态可观测。
 - 健康检查能区分进程存活、节点健康和安全写入。
+
+## 完成记录
+
+- 2026-10（首批）：AUTH 密码认证、客户端 TLS、Raft 复制 mTLS、INFO 可观测
+  命令、优雅关闭已交付（各自 feature 提交）。
+- 2026-10（续）：资源限制已落地——
+  - `max-memory`（字节，0 不限）：状态机维护增量 `memory_bytes` 计数器
+    （`insert_entry`/`remove_entry` 精确差量，恢复时 `recompute_memory` 重建，
+    serde skip 不进快照格式）。prepare 层 OOM 门：写入的新载荷全量计入
+    当前用量，超过上限返回 Redis 文本
+    `OOM command not allowed when used memory > 'maxmemory'`；替换写按全额
+    保守计费（宁可早拒不超发）；读与删除永不拦截；计数器恢复后重建，
+    PartialEq 忽略派生计数字段。
+  - `max-connections`（0 不限）：accept 循环维护活跃连接计数，超限时新
+    连接收到 `-ERR max number of clients reached` 后立即关闭，已有连接
+    不受影响。
+  - CLI：`--max-memory`、`--max-connections`，缺省 0（不限）。
+  - 测试：状态机 OOM 门（超限拒绝/拒绝不落盘/缩小放行/删除释放/关闭
+    限制恢复/快照往返计数一致）、CLI 解析、连接上限端到端（占位、拒绝
+    回复、释放后可再连）。

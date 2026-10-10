@@ -67,6 +67,15 @@ struct Args {
     /// Seed cluster membership on first start. Set on exactly one node.
     #[arg(long)]
     bootstrap: bool,
+
+    /// Reject writes whose payload would push live data past this many
+    /// bytes. 0 disables the limit.
+    #[arg(long, default_value_t = 0)]
+    max_memory: u64,
+
+    /// Refuse new client connections past this count. 0 disables the limit.
+    #[arg(long, default_value_t = 0)]
+    max_connections: u32,
 }
 
 fn build_config(args: &Args) -> Result<Config> {
@@ -95,6 +104,8 @@ fn build_config(args: &Args) -> Result<Config> {
         tls_replication: args.tls_replication,
         bootstrap: args.bootstrap,
         data_dir,
+        max_memory_bytes: args.max_memory,
+        max_connections: args.max_connections,
         ..Config::default()
     }
     .with_peers(&peers)
@@ -188,6 +199,34 @@ mod tests {
     #[test]
     fn node_id_is_required() {
         assert!(args(&[]).is_err());
+    }
+
+    #[test]
+    fn resource_limits_default_to_unlimited() {
+        let parsed = args(&["--node-id", "1"]).unwrap();
+        assert_eq!(parsed.max_memory, 0);
+        assert_eq!(parsed.max_connections, 0);
+        let config = build_config(&parsed).unwrap();
+        assert_eq!(config.max_memory_bytes, 0);
+        assert_eq!(config.max_connections, 0);
+        assert_eq!(config.max_memory_non_zero(), None);
+    }
+
+    #[test]
+    fn resource_limits_parse_from_cli() {
+        let parsed = args(&[
+            "--node-id",
+            "1",
+            "--max-memory",
+            "1048576",
+            "--max-connections",
+            "64",
+        ])
+        .unwrap();
+        let config = build_config(&parsed).unwrap();
+        assert_eq!(config.max_memory_bytes, 1_048_576);
+        assert_eq!(config.max_connections, 64);
+        assert_eq!(config.max_memory_non_zero(), Some(1_048_576));
     }
 
     #[test]

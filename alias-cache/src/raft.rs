@@ -1161,6 +1161,9 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
             state.advance_logical_time(operation.write_time());
             let _ = state.apply(operation);
         }
+        // The memory counter is skipped by serde and must be rebuilt from
+        // the restored data before the node serves anything.
+        state.recompute_memory();
         let stored_snapshot = StoredSnapshot {
             data,
             last_log_id: meta.last_log_id,
@@ -2297,6 +2300,7 @@ pub async fn new_file_raft(
     node_id: NodeId,
     data_dir: impl AsRef<Path>,
     peers: PeerMap,
+    max_memory: Option<u64>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
@@ -2314,6 +2318,12 @@ pub async fn new_file_raft(
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
+    state_machine
+        .inner
+        .lock()
+        .await
+        .state
+        .set_max_memory(max_memory);
     let raft = openraft::Raft::new(
         node_id,
         Arc::new(config),
@@ -2338,6 +2348,7 @@ pub async fn new_tcp_raft(
         true,
         TcpNetworkControl::default(),
         None,
+        None,
     )
     .await
 }
@@ -2348,7 +2359,7 @@ pub async fn new_tcp_raft_with_control(
     nodes: BTreeMap<NodeId, Node>,
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, true, control, None).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, true, control, None, None).await
 }
 
 pub async fn new_tcp_raft_joiner(
@@ -2363,6 +2374,7 @@ pub async fn new_tcp_raft_joiner(
         false,
         TcpNetworkControl::default(),
         None,
+        None,
     )
     .await
 }
@@ -2373,7 +2385,7 @@ pub async fn new_tcp_raft_joiner_with_control(
     nodes: BTreeMap<NodeId, Node>,
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(node_id, data_dir, nodes, false, control, None).await
+    new_tcp_raft_inner(node_id, data_dir, nodes, false, control, None, None).await
 }
 
 async fn new_tcp_raft_inner(
@@ -2383,6 +2395,7 @@ async fn new_tcp_raft_inner(
     bootstrap: bool,
     control: TcpNetworkControl,
     tls_connector: Option<TlsConnector>,
+    max_memory: Option<u64>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
@@ -2401,6 +2414,12 @@ async fn new_tcp_raft_inner(
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
+    state_machine
+        .inner
+        .lock()
+        .await
+        .state
+        .set_max_memory(max_memory);
     let raft = openraft::Raft::new(
         node_id,
         Arc::new(config),
@@ -2454,6 +2473,7 @@ pub async fn new_tcp_raft_for_server(
     nodes: BTreeMap<NodeId, Node>,
     bootstrap: bool,
     tls_connector: Option<TlsConnector>,
+    max_memory: Option<u64>,
 ) -> CacheResult<RaftHandle> {
     let raft = if bootstrap {
         new_tcp_raft_inner(
@@ -2463,6 +2483,7 @@ pub async fn new_tcp_raft_for_server(
             true,
             TcpNetworkControl::default(),
             tls_connector,
+            max_memory,
         )
         .await
         .map_err(|error| Error::server(format!("open bootstrap raft node: {error}")))?
@@ -2474,6 +2495,7 @@ pub async fn new_tcp_raft_for_server(
             false,
             TcpNetworkControl::default(),
             tls_connector,
+            max_memory,
         )
         .await
         .map_err(|error| Error::server(format!("open raft joiner: {error}")))?
@@ -2842,9 +2864,10 @@ pub async fn open_single_node(
     node_id: NodeId,
     data_dir: impl AsRef<Path>,
     raft_addr: impl Into<String>,
+    max_memory: Option<u64>,
 ) -> CacheResult<RaftHandle> {
     let peers = Arc::new(Mutex::new(BTreeMap::new()));
-    let raft = new_file_raft(node_id, data_dir, Arc::clone(&peers))
+    let raft = new_file_raft(node_id, data_dir, Arc::clone(&peers), max_memory)
         .await
         .map_err(|error| Error::server(format!("open raft node: {error}")))?;
     if !raft
@@ -6613,7 +6636,7 @@ mod tests {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
         let node = timeout(
             Duration::from_secs(3),
-            new_file_raft(1, &data_dir, Arc::clone(&peers)),
+            new_file_raft(1, &data_dir, Arc::clone(&peers), None),
         )
         .await
         .expect("initial startup should finish")
@@ -6656,7 +6679,7 @@ mod tests {
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
         let restarted = timeout(
             Duration::from_secs(3),
-            new_file_raft(1, &data_dir, Arc::clone(&peers)),
+            new_file_raft(1, &data_dir, Arc::clone(&peers), None),
         )
         .await
         .expect("restart should finish")
@@ -6698,7 +6721,7 @@ mod tests {
             unique_test_id()
         ));
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let node = new_file_raft(1, &data_dir, Arc::clone(&peers))
+        let node = new_file_raft(1, &data_dir, Arc::clone(&peers), None)
             .await
             .expect("initial node should start");
         node.initialize(BTreeMap::from([(
@@ -6738,7 +6761,7 @@ mod tests {
         node.shutdown().await.expect("initial node should stop");
 
         let peers = Arc::new(Mutex::new(BTreeMap::new()));
-        let restarted = new_file_raft(1, &data_dir, Arc::clone(&peers))
+        let restarted = new_file_raft(1, &data_dir, Arc::clone(&peers), None)
             .await
             .expect("restarted node should start");
         timeout(

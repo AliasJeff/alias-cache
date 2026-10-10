@@ -45,11 +45,13 @@ impl Server {
         &self,
         tls_connector: Option<tokio_rustls::TlsConnector>,
     ) -> Result<Arc<RaftHandle>> {
+        let max_memory = self.config.max_memory_non_zero();
         if self.config.cluster_nodes.is_empty() {
             let raft = open_single_node(
                 self.config.node_id,
                 &self.config.data_dir,
                 self.config.raft_addr.to_string(),
+                max_memory,
             )
             .await?;
             return Ok(Arc::new(raft));
@@ -60,6 +62,7 @@ impl Server {
             self.config.cluster_nodes.clone(),
             self.config.bootstrap,
             tls_connector,
+            max_memory,
         )
         .await?;
         if !self.config.bootstrap {
@@ -114,6 +117,7 @@ impl Server {
         let expiration_worker_shutdown = shutdown.as_ref().clone();
         let node_id = self.config.node_id;
         let sentinel_context = SentinelContext::from_config(&self.config);
+        let live_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             run_expiration_worker(
                 expiration_worker_raft,
@@ -138,7 +142,24 @@ impl Server {
                     let password = self.config.password.clone();
                     let tls_acceptor = client_tls_acceptor.clone();
                     let tls_connector = tls_connector.clone();
+                    let max_connections = self.config.max_connections as usize;
+                    let live_connections = Arc::clone(&live_connections);
                     tokio::spawn(async move {
+                        // Connection cap: a rejected peer gets the Redis
+                        // error reply and an immediate close.
+                        if max_connections > 0
+                            && live_connections.load(std::sync::atomic::Ordering::SeqCst)
+                                >= max_connections
+                        {
+                            warn!(%peer, limit = max_connections, "rejecting client connection");
+                            let mut rejected = stream;
+                            let _ = rejected
+                                .write_all(b"-ERR max number of clients reached\r\n")
+                                .await;
+                            let _ = rejected.shutdown().await;
+                            return;
+                        }
+                        live_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let result = match tls_acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
                                 Ok(stream) => {
@@ -173,6 +194,7 @@ impl Server {
                         if let Err(error) = result {
                             warn!(%peer, %error, "client connection failed");
                         }
+                        live_connections.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     });
                 }
                 result = wait_for_shutdown(shutdown.clone()) => {
@@ -1229,6 +1251,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
@@ -1381,6 +1404,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
@@ -1459,6 +1483,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_cap_rejects_new_clients_with_error_reply() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: unique_server_dir("conn-cap"),
+            max_connections: 1,
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_dir = config.data_dir.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let limits = config.protocol_limits();
+        let sentinel_context = SentinelContext::from_config(&config);
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_live = Arc::clone(&live);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        // Mirror the server accept loop's cap logic.
+                        if 1 > 0
+                            && accept_live.load(std::sync::atomic::Ordering::SeqCst) >= 1
+                        {
+                            let mut rejected = stream;
+                            let _ = rejected
+                                .write_all(b"-ERR max number of clients reached\r\n")
+                                .await;
+                            let _ = rejected.shutdown().await;
+                            continue;
+                        }
+                        accept_live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let raft = raft.clone();
+                        let shutdown = shutdown.clone();
+                        let sentinel_context = sentinel_context.clone();
+                        let live_counter = Arc::clone(&accept_live);
+                        tokio::spawn(async move {
+                            let _ = handle_raft_connection(
+                                stream,
+                                shutdown,
+                                raft,
+                                limits,
+                                sentinel_context,
+                                None,
+                                None,
+                            )
+                            .await;
+                            live_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => break,
+                }
+            }
+        });
+
+        // First connection occupies the single slot and works.
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut first_frames = FrameReader::new();
+        first.write_all(&encode_command(&[b"PING"])).await.unwrap();
+        assert_eq!(
+            first_frames.next_frame(&mut first).await,
+            Frame::simple_string("PONG")
+        );
+
+        // The second connection is rejected with the Redis error reply.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut rejected = vec![];
+        second.read_to_end(&mut rejected).await.unwrap();
+        assert_eq!(
+            String::from_utf8(rejected).unwrap(),
+            "-ERR max number of clients reached\r\n"
+        );
+
+        // Dropping the first connection frees the slot.
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        third.write_all(&encode_command(&[b"PING"])).await.unwrap();
+        let mut third_frames = FrameReader::new();
+        assert_eq!(
+            third_frames.next_frame(&mut third).await,
+            Frame::simple_string("PONG")
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = accept_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+        let _ = live;
+    }
+
+    #[tokio::test]
     async fn watch_aborts_transaction_when_watched_key_changes() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = Config {
@@ -1476,6 +1603,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
@@ -1578,6 +1706,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
@@ -1650,6 +1779,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
@@ -1746,6 +1876,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
@@ -1811,6 +1942,7 @@ mod tests {
                 config.node_id,
                 &config.data_dir,
                 config.raft_addr.to_string(),
+                None,
             )
             .await
             .unwrap(),
