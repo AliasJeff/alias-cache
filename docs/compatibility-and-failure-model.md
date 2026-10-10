@@ -34,6 +34,9 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - Sorted Set：`ZADD`、`ZREM`、`ZSCORE`、`ZCARD`、`ZRANGE`、`ZREVRANGE`、
   `ZRANK`、`ZREVRANK`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
+- 可观测：`INFO [server|replication|cluster]`，输出取自单一 openraft metrics
+  快照；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级 bulk
+  string；`replication_lag_node_<id>` 仅在 Leader 上报告（-1 表示未知）；
 - 事务：`MULTI`、`EXEC`、`DISCARD`；
 - Pipeline：复用普通请求顺序，不引入额外语义。
 

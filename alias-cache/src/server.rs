@@ -501,6 +501,9 @@ async fn handle_transaction_command(
         if let Some(response) = sentinel::execute(raft, sentinel_context, &request).await {
             return response;
         }
+        if let Some(response) = crate::info::execute(raft, &request).await {
+            return response;
+        }
     }
     let crate::protocol::Request::Command(arguments) = &request;
     let command = arguments.first().map(|argument| argument.as_ref());
@@ -796,6 +799,34 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(self.root);
         }
+    }
+
+    #[tokio::test]
+    async fn info_serves_raft_observability_from_any_node() {
+        let cluster = spawn_three_node_cluster("info").await;
+        let leader = cluster.leader_index().await;
+        let follower = if leader == 0 { 1 } else { 0 };
+
+        let mut conn = TcpStream::connect(cluster.client_addrs[follower])
+            .await
+            .unwrap();
+        let mut frames = FrameReader::new();
+        conn.write_all(&encode_command(&[b"INFO", b"replication"]))
+            .await
+            .unwrap();
+        // A plain RESP2 connection receives the verbatim report downgraded to
+        // a bulk string; either shape carries the same body.
+        let data = match frames.next_frame(&mut conn).await {
+            Frame::VerbatimString { data, .. } => data,
+            Frame::BulkString(data) => data,
+            other => panic!("INFO must return a report, got {other:?}"),
+        };
+        let text = String::from_utf8(data.to_vec()).unwrap();
+        assert!(text.contains("# Replication"));
+        assert!(text.contains("term:"));
+        assert!(text.contains(&format!("leader_id:{}", leader + 1)));
+
+        cluster.shutdown().await;
     }
 
     #[tokio::test]
