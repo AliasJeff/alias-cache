@@ -118,8 +118,11 @@ CLI 6 个、benchmark 2 个测试全部通过）：
 - 自带 `alias-cache-benchmark` 压测工具与基线数据（见 plans/12）
 
 单节点基线（Apple Silicon，release，8 客户端 × pipeline 16）：
-PING 103 万 ops/s；线性一致 GET 33.6 万 ops/s（p99 706µs）；
-SET 589 ops/s（每写 fsync 的强一致代价，group commit 为已知优化方向）。
+PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
+
+三节点集群（同负载）：线性一致 GET 1.77 万 ops/s（p99 13ms）、
+多数派提交 SET 2,352 ops/s——写入经 group commit 与 pipeline 并发提交
+（相比初版 461 ops/s 提升 5 倍），剩余瓶颈为每批一次的三节点 fsync 往返。
 
 进行中 / 未完成：Watcher 事务隔离（WATCH）、HINCRBY/ZINCRBY、SCAN 系列、
 写路径 group commit、生产 snapshot policy 调优。

@@ -13,6 +13,59 @@ const CLIENT_RESULT_CACHE_CAPACITY: usize = 4_096;
 
 const WRONG_TYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
+/// Commands whose execution only reads replicated state.
+///
+/// The pipeline layer uses this to order reads after preceding writes on the
+/// same connection without serializing independent writes. It must stay in
+/// sync with `prepare_request_inner`: a write command missing here would let
+/// a read observe a stale value, and a read command listed here would only
+/// lose concurrency, never correctness.
+pub fn is_replicated_write(command: &[u8]) -> bool {
+    !READS.contains(&command) && WRITES.contains(&command)
+}
+
+/// Replicated read commands, mirroring the read arms of
+/// `prepare_request_inner` one-to-one.
+const READS: &[&[u8]] = &[
+    b"GET",
+    b"EXISTS",
+    b"MGET",
+    b"TYPE",
+    b"DBSIZE",
+    b"TTL",
+    b"PTTL",
+    b"HGET",
+    b"HMGET",
+    b"HGETALL",
+    b"HKEYS",
+    b"HVALS",
+    b"HLEN",
+    b"HEXISTS",
+    b"LINDEX",
+    b"LRANGE",
+    b"LLEN",
+    b"SMEMBERS",
+    b"SISMEMBER",
+    b"SCARD",
+    b"SDIFF",
+    b"SINTER",
+    b"SUNION",
+    b"ZSCORE",
+    b"ZCARD",
+    b"ZRANGE",
+    b"ZREVRANGE",
+    b"ZRANK",
+    b"ZREVRANK",
+];
+
+/// Replicated write commands, mirroring the write arms of
+/// `prepare_request_inner` one-to-one.
+const WRITES: &[&[u8]] = &[
+    b"SET", b"DEL", b"MSET", b"INCRBY", b"HSET", b"HMSET", b"HSETNX", b"HDEL", b"LPUSH", b"RPUSH",
+    b"LPOP", b"RPOP", b"LREM", b"LSET", b"LTRIM", b"SADD", b"SREM", b"ZADD", b"ZREM", b"EXPIRE",
+    b"PEXPIRE", b"PERSIST",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(Bytes),
@@ -2413,6 +2466,159 @@ mod tests {
                 .1,
             Frame::Integer(1)
         );
+    }
+
+    #[test]
+    fn classification_matches_actual_mutation_for_every_command() {
+        // Every documented command must be classified, and the classification
+        // must agree with what executing it does: classified writes mutate,
+        // classified reads do not. This guards the pipeline read-after-write
+        // barrier against dispatch drift.
+        let commands: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"GET".to_vec(), b"key".to_vec()],
+            vec![b"SET".to_vec(), b"key".to_vec(), b"value".to_vec()],
+            vec![b"DEL".to_vec(), b"key".to_vec()],
+            vec![b"EXISTS".to_vec(), b"key".to_vec()],
+            vec![b"MGET".to_vec(), b"key".to_vec()],
+            vec![b"MSET".to_vec(), b"key".to_vec(), b"value".to_vec()],
+            vec![b"INCRBY".to_vec(), b"num".to_vec(), b"1".to_vec()],
+            vec![
+                b"HSET".to_vec(),
+                b"h".to_vec(),
+                b"f".to_vec(),
+                b"v".to_vec(),
+            ],
+            vec![
+                b"HMSET".to_vec(),
+                b"h".to_vec(),
+                b"f".to_vec(),
+                b"v".to_vec(),
+            ],
+            vec![
+                b"HSETNX".to_vec(),
+                b"h".to_vec(),
+                b"fresh".to_vec(),
+                b"v".to_vec(),
+            ],
+            vec![b"HDEL".to_vec(), b"h".to_vec(), b"f".to_vec()],
+            vec![b"HGET".to_vec(), b"h".to_vec(), b"f".to_vec()],
+            vec![b"HMGET".to_vec(), b"h".to_vec(), b"f".to_vec()],
+            vec![b"HGETALL".to_vec(), b"h".to_vec()],
+            vec![b"HKEYS".to_vec(), b"h".to_vec()],
+            vec![b"HVALS".to_vec(), b"h".to_vec()],
+            vec![b"HLEN".to_vec(), b"h".to_vec()],
+            vec![b"HEXISTS".to_vec(), b"h".to_vec(), b"f".to_vec()],
+            vec![b"LPUSH".to_vec(), b"l".to_vec(), b"v".to_vec()],
+            vec![b"RPUSH".to_vec(), b"l".to_vec(), b"v".to_vec()],
+            vec![b"LPOP".to_vec(), b"l".to_vec()],
+            vec![b"RPOP".to_vec(), b"l".to_vec()],
+            vec![b"LINDEX".to_vec(), b"l".to_vec(), b"0".to_vec()],
+            vec![
+                b"LRANGE".to_vec(),
+                b"l".to_vec(),
+                b"0".to_vec(),
+                b"0".to_vec(),
+            ],
+            vec![b"LLEN".to_vec(), b"l".to_vec()],
+            vec![
+                b"LREM".to_vec(),
+                b"l".to_vec(),
+                b"1".to_vec(),
+                b"v".to_vec(),
+            ],
+            vec![
+                b"LSET".to_vec(),
+                b"l".to_vec(),
+                b"0".to_vec(),
+                b"v".to_vec(),
+            ],
+            vec![
+                b"LTRIM".to_vec(),
+                b"l".to_vec(),
+                b"0".to_vec(),
+                b"0".to_vec(),
+            ],
+            vec![b"SADD".to_vec(), b"s".to_vec(), b"m".to_vec()],
+            vec![b"SREM".to_vec(), b"s".to_vec(), b"v".to_vec()],
+            vec![b"SMEMBERS".to_vec(), b"s".to_vec()],
+            vec![b"SISMEMBER".to_vec(), b"s".to_vec(), b"m".to_vec()],
+            vec![b"SCARD".to_vec(), b"s".to_vec()],
+            vec![b"SDIFF".to_vec(), b"a".to_vec(), b"b".to_vec()],
+            vec![b"SINTER".to_vec(), b"a".to_vec(), b"b".to_vec()],
+            vec![b"SUNION".to_vec(), b"a".to_vec(), b"b".to_vec()],
+            vec![
+                b"ZADD".to_vec(),
+                b"z".to_vec(),
+                b"1".to_vec(),
+                b"m".to_vec(),
+            ],
+            vec![b"ZREM".to_vec(), b"z".to_vec(), b"v".to_vec()],
+            vec![b"ZSCORE".to_vec(), b"z".to_vec(), b"m".to_vec()],
+            vec![b"ZCARD".to_vec(), b"z".to_vec()],
+            vec![
+                b"ZRANGE".to_vec(),
+                b"z".to_vec(),
+                b"0".to_vec(),
+                b"0".to_vec(),
+            ],
+            vec![
+                b"ZREVRANGE".to_vec(),
+                b"z".to_vec(),
+                b"0".to_vec(),
+                b"0".to_vec(),
+            ],
+            vec![b"ZRANK".to_vec(), b"z".to_vec(), b"m".to_vec()],
+            vec![b"ZREVRANK".to_vec(), b"z".to_vec(), b"m".to_vec()],
+            vec![b"TYPE".to_vec(), b"key".to_vec()],
+            vec![b"DBSIZE".to_vec()],
+            vec![b"EXPIRE".to_vec(), b"key".to_vec(), b"10".to_vec()],
+            vec![b"PEXPIRE".to_vec(), b"key".to_vec(), b"10".to_vec()],
+            vec![b"TTL".to_vec(), b"key".to_vec()],
+            vec![b"PTTL".to_vec(), b"key".to_vec()],
+            vec![b"PERSIST".to_vec(), b"key".to_vec()],
+        ];
+
+        for arguments in commands {
+            let command = arguments[0].clone();
+            // Seed one key of every shape so conditional writes such as DEL
+            // and EXPIRE always have a target and produce an operation.
+            let mut state = StateMachine::default();
+            let seeds: [&[&[u8]]; 6] = [
+                &[
+                    &b"SET"[..],
+                    &b"key"[..],
+                    &b"v"[..],
+                    &b"PX"[..],
+                    &b"5000"[..],
+                ],
+                &[&b"SET"[..], &b"num"[..], &b"0"[..]],
+                &[&b"HSET"[..], &b"h"[..], &b"f"[..], &b"v"[..]],
+                &[&b"LPUSH"[..], &b"l"[..], &b"v"[..]],
+                &[&b"SADD"[..], &b"s"[..], &b"v"[..]],
+                &[&b"ZADD"[..], &b"z"[..], &b"1"[..], &b"v"[..]],
+            ];
+            for seed in seeds {
+                state
+                    .execute_request(Request::Command(
+                        seed.iter().map(|&part| Bytes::from_static(part)).collect(),
+                    ))
+                    .expect("seed command must apply");
+            }
+            let classified_write = is_replicated_write(&command);
+            let mut mutated = false;
+            if let Ok((operation, _)) = state.execute_request(Request::Command(
+                arguments
+                    .iter()
+                    .map(|part| Bytes::copy_from_slice(part))
+                    .collect(),
+            )) {
+                mutated = operation.is_some();
+            }
+            assert_eq!(
+                classified_write, mutated,
+                "command {command:?} classification disagrees with execution"
+            );
+        }
     }
 
     #[test]

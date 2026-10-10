@@ -19,6 +19,7 @@ use crate::raft::{
     send_transaction_request_with_id, serve_raft_rpc_with_tls, wait_for_any_leader,
 };
 use crate::sentinel::{self, SentinelContext};
+use crate::state_machine::is_replicated_write;
 use crate::tls::TlsContext;
 
 pub struct Server {
@@ -291,8 +292,56 @@ async fn handle_raft_connection(
                         return Err(error);
                     }
                 };
-                for frame in frames {
-                    let response = match command_from_frame(frame) {
+                // A segment of pure state-machine commands is a pipeline:
+                // submit them concurrently so one fsync batch covers the whole
+                // segment, then write replies back in request order. Segments
+                // with transaction or connection state stay strictly ordered.
+                let parsed: Vec<_> = frames.into_iter().map(command_from_frame).collect();
+                let parallel = transaction.is_none()
+                    && parsed.iter().all(|result| {
+                        matches!(result, Ok(request) if is_pipeline_safe(request))
+                    });
+                if parallel {
+                    // Writes submit concurrently so one fsync batch covers a
+                    // whole pipeline run; reads execute strictly in order
+                    // after every prior write has been applied, matching
+                    // Redis pipeline semantics. Concurrent ReadIndex barriers
+                    // contend inside openraft, so ordered reads are the
+                    // measured throughput winner. Replies stay in order.
+                    let mut in_flight: Vec<tokio::task::JoinHandle<Frame>> = Vec::new();
+                    for result in parsed {
+                        let Ok(request) = result else {
+                            continue;
+                        };
+                        if !is_replicated_write(request.command_name()) {
+                            for handle in std::mem::take(&mut in_flight) {
+                                let response = handle
+                                    .await
+                                    .unwrap_or_else(|error| Frame::error(format!("ERR {error}")));
+                                write_frame(&mut stream, response, resp_version).await?;
+                            }
+                            let response =
+                                execute_client_command_with_tls(&raft, request, tls_connector.clone())
+                                    .await;
+                            write_frame(&mut stream, response, resp_version).await?;
+                            continue;
+                        }
+                        let raft = Arc::clone(&raft);
+                        let tls = tls_connector.clone();
+                        in_flight.push(tokio::spawn(async move {
+                            execute_client_command_with_tls(&raft, request, tls).await
+                        }));
+                    }
+                    for handle in std::mem::take(&mut in_flight) {
+                        let response = handle
+                            .await
+                            .unwrap_or_else(|error| Frame::error(format!("ERR {error}")));
+                        write_frame(&mut stream, response, resp_version).await?;
+                    }
+                    continue;
+                }
+                for parsed in parsed {
+                    let response = match parsed {
                         Ok(request) => {
                             handle_transaction_command(
                                 &raft,
@@ -319,6 +368,31 @@ async fn handle_raft_connection(
             }
         }
     }
+}
+
+/// Whether a request can be submitted without observing connection state.
+///
+/// Pipeline-safe commands depend only on the replicated state machine (or a
+/// ReadIndex barrier), so their execution order across a segment is free;
+/// replies are still written back in request order. Anything that touches
+/// transaction state, connection state, or local-only reporting must run in
+/// the ordered path.
+fn is_pipeline_safe(request: &crate::protocol::Request) -> bool {
+    let crate::protocol::Request::Command(arguments) = request;
+    let Some(command) = arguments.first() else {
+        return false;
+    };
+    !matches!(
+        command.as_ref(),
+        b"MULTI" | b"EXEC" | b"DISCARD" | b"SENTINEL" | b"INFO"
+    ) && !connection_command_names()
+        .iter()
+        .any(|name| command.eq_ignore_ascii_case(name))
+}
+
+/// Connection-level command names that must stay on the ordered path.
+const fn connection_command_names() -> &'static [&'static [u8]; 6] {
+    &[b"HELLO", b"AUTH", b"QUIT", b"SELECT", b"PING", b"ECHO"]
 }
 
 /// Connection-level commands that never touch the replicated state machine.
@@ -779,17 +853,30 @@ mod tests {
     }
 
     impl TestCluster {
+        /// Wait until every node observes the same leader and return it.
+        ///
+        /// A leader known to one node is not yet usable: writes race the
+        /// leadership-confirmation window on the others under parallel test
+        /// load, so the cluster must agree before the test proceeds.
         async fn leader_index(&self) -> usize {
-            timeout(Duration::from_secs(10), async {
+            // Four cluster tests run in parallel under cargo test; election
+            // under that load can take several election timeouts.
+            timeout(Duration::from_secs(30), async {
                 loop {
-                    if let Some(node_id) = self.rafts[0].current_leader().await {
-                        return usize::try_from(node_id - 1).unwrap();
+                    let mut observed = Vec::with_capacity(self.rafts.len());
+                    for raft in &self.rafts {
+                        observed.push(raft.current_leader().await);
+                    }
+                    if let Some(leader) = observed[0]
+                        && observed.iter().all(|leader_id| *leader_id == observed[0])
+                    {
+                        return usize::try_from(leader - 1).unwrap();
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             })
             .await
-            .expect("cluster should elect a leader")
+            .expect("cluster should elect an agreed leader")
         }
 
         async fn shutdown(self) {
@@ -1329,6 +1416,75 @@ mod tests {
         );
         assert_eq!(version, RespVersion::Resp3);
         assert!(matches!(response, Frame::Map(_)));
+    }
+
+    #[tokio::test]
+    async fn pipelined_writes_submit_concurrently_and_reply_in_order() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = Config {
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            raft_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: unique_server_dir("pipeline-concurrent"),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind(config.client_addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_dir = config.data_dir.clone();
+        let shutdown = Arc::new(shutdown_rx);
+        let raft = Arc::new(
+            open_single_node(
+                config.node_id,
+                &config.data_dir,
+                config.raft_addr.to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        let limits = config.protocol_limits();
+        let sentinel_context = SentinelContext::from_config(&config);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None, None)
+                .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut frames = FrameReader::new();
+        // One segment mixing SET, GET and INCRBY must execute concurrently
+        // yet reply in request order.
+        client
+            .write_all(&encode_command(&[b"SET", b"a", b"10"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&encode_command(&[b"INCRBY", b"a", b"5"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&encode_command(&[b"GET", b"a"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&encode_command(&[b"SET", b"b", b"tail"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("OK")
+        );
+        assert_eq!(frames.next_frame(&mut client).await, Frame::Integer(15));
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::bulk_string("15")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("OK")
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

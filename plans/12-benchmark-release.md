@@ -117,3 +117,36 @@ cache-cat 的历史 benchmark 数字和硬件假设不能作为 alias-cache 的�
 - 帧解析有单元测试（完整/截断/错误帧计数）。
 - 首次实跑即暴露服务端 decoder 的 pipeline 限制误用连接级累计的缺陷
   （长连接超过 1024 条命令后拒绝服务），已修复并加回归测试。
+
+### 写路径优化：group commit + pipeline 并发提交（2026-10-10）
+
+benchmark 暴露三节点 SET 仅 461 ops/s（读 4378）后，定位并修复两层串行化：
+
+1. `FileLogStore::append` 曾对每条 entry 单独 fsync。openraft 的
+   `append(entries, callback)` 契约要求回调前整批落盘——现在批量写、单次
+   `sync_data`、再回调，即 group commit。`save_committed` 从"每提交点追加
+   记录并 fsync"改为独立 `committed.meta` sidecar 的 write+rename 原子发布、
+   不 fsync：commit 指针只是恢复加速，openraft 文档认可其回退无害（重启后
+   等 cluster commit 覆盖才重新服务读）。`save_vote` 保持 fsync（选举安全）。
+2. 服务端 pipeline 处理曾逐条 await——16 深度的 pipeline 变成 16 次串行
+   Raft 往返。现在同段内的连续写并发提交（Raft 日志全序串行 apply，各自
+   线性化），读严格按序执行且在前面全部写 apply 之后；响应按请求顺序写回。
+   读-写分段边界由 `state_machine::is_replicated_write` 分类驱动，并有
+   全命令分类与真实 mutation 一致性的护栏测试。
+
+实测（三节点、8 客户端 × pipeline 16、release、Apple Silicon）：
+
+| 场景 | 优化前 | 优化后 | 提升 |
+| --- | --- | --- | --- |
+| SET（多数派提交） | 461 ops/s | 2,352 ops/s | 5.1× |
+| GET（线性一致读） | 4,378 ops/s | 17,651 ops/s | 4.0× |
+| 单节点 GET | 335,606 ops/s | 435,165 ops/s | 1.3× |
+
+测量纪律：GET 与 SET 必须各自在空闲集群上测——5 秒 SET 后 follower 仍在
+追赶日志尾部，此时 barrier 的 leadership 确认延迟会数倍劣化读吞吐（此前
+一组 1971 ops/s 的"退化"实为该顺序效应）。约 0.03% 的 GET 在选举边界收到
+barrier 超时错误：宁可报错也不放宽一致性，是刻意取舍。
+
+SET 的剩余瓶颈是每批一次的三节点 fsync 往返（p50 ≈ 53ms，符合
+in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 的
+更积极合并与 follower 端 fsync 策略。

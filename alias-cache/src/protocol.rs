@@ -739,6 +739,18 @@ pub enum Request {
     Command(Vec<Bytes>),
 }
 
+impl Request {
+    /// Name of the leading command byte string, or empty for a bare array.
+    pub fn command_name(&self) -> &[u8] {
+        match self {
+            Self::Command(arguments) => arguments
+                .first()
+                .map(|argument| argument.as_ref())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 pub fn command_from_frame(frame: Frame) -> Result<Request> {
     let Frame::Array(values) = frame else {
         return Err(Error::protocol("command must be a RESP array"));
