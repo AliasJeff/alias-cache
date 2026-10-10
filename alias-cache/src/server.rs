@@ -836,6 +836,118 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    /// Encode one RESP command as a bulk-array frame so tests cannot desync
+    /// the declared length from the payload.
+    fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
+        let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
+        for part in parts {
+            frame.extend(format!("${}\r\n", part.len()).into_bytes());
+            frame.extend_from_slice(part);
+            frame.extend_from_slice(b"\r\n");
+        }
+        frame
+    }
+
+    #[tokio::test]
+    async fn cluster_replicates_every_data_structure_and_serves_follower_reads() {
+        let cluster = spawn_three_node_cluster("structures").await;
+        let leader = cluster.leader_index().await;
+        let follower = if leader == 0 { 1 } else { 0 };
+
+        let mut leader_conn = TcpStream::connect(cluster.client_addrs[leader])
+            .await
+            .unwrap();
+        let mut leader_frames = FrameReader::new();
+        // Hash, list, set, sorted set, and string counters: one write round
+        // through the leader, then the same reads through a follower to prove
+        // replication plus read forwarding agree on every structure.
+        for command in [
+            encode_command(&[b"HSET", b"h", b"b", b"two", b"a", b"one"]),
+            encode_command(&[b"LPUSH", b"l", b"one"]),
+            encode_command(&[b"LPUSH", b"l", b"two"]),
+            encode_command(&[b"SADD", b"s", b"x"]),
+            encode_command(&[b"SADD", b"s", b"y"]),
+            encode_command(&[b"ZADD", b"z", b"2", b"beta"]),
+            encode_command(&[b"ZADD", b"z", b"1", b"alpha"]),
+            encode_command(&[b"INCRBY", b"hits", b"7"]),
+        ] {
+            leader_conn.write_all(&command).await.unwrap();
+        }
+        for expected in [
+            Frame::Integer(2), // HSET: two new fields
+            Frame::Integer(1), // LPUSH: list length after one element
+            Frame::Integer(2), // LPUSH: list length after two elements
+            Frame::Integer(1), // SADD
+            Frame::Integer(1), // SADD
+            Frame::Integer(1), // ZADD
+            Frame::Integer(1), // ZADD
+            Frame::Integer(7), // INCRBY from zero
+        ] {
+            assert_eq!(
+                leader_frames.next_frame(&mut leader_conn).await,
+                expected,
+                "leader write round must return canonical counts"
+            );
+        }
+
+        let mut follower_conn = TcpStream::connect(cluster.client_addrs[follower])
+            .await
+            .unwrap();
+        let mut follower_frames = FrameReader::new();
+        for command in [
+            encode_command(&[b"HGETALL", b"h"]),
+            encode_command(&[b"LRANGE", b"l", b"0", b"-1"]),
+            encode_command(&[b"SMEMBERS", b"s"]),
+            encode_command(&[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]),
+            encode_command(&[b"GET", b"hits"]),
+            encode_command(&[b"TYPE", b"z"]),
+        ] {
+            follower_conn.write_all(&command).await.unwrap();
+        }
+        assert_eq!(
+            follower_frames.next_frame(&mut follower_conn).await,
+            Frame::Array(vec![
+                Frame::bulk_string("a"),
+                Frame::bulk_string("one"),
+                Frame::bulk_string("b"),
+                Frame::bulk_string("two"),
+            ]),
+            "HGETALL returns fields in deterministic byte order"
+        );
+        assert_eq!(
+            follower_frames.next_frame(&mut follower_conn).await,
+            Frame::Array(vec![Frame::bulk_string("two"), Frame::bulk_string("one"),]),
+            "LRANGE reflects the last push first"
+        );
+        assert_eq!(
+            follower_frames.next_frame(&mut follower_conn).await,
+            Frame::Array(vec![Frame::bulk_string("x"), Frame::bulk_string("y"),]),
+            "SMEMBERS returns members in byte order"
+        );
+        assert_eq!(
+            follower_frames.next_frame(&mut follower_conn).await,
+            Frame::Array(vec![
+                Frame::bulk_string("alpha"),
+                Frame::bulk_string("1"),
+                Frame::bulk_string("beta"),
+                Frame::bulk_string("2"),
+            ]),
+            "ZRANGE sorts by score then member"
+        );
+        assert_eq!(
+            follower_frames.next_frame(&mut follower_conn).await,
+            Frame::bulk_string("7"),
+            "INCRBY result must be visible through a follower read"
+        );
+        assert_eq!(
+            follower_frames.next_frame(&mut follower_conn).await,
+            Frame::simple_string("zset"),
+            "TYPE must agree with the replicated value type"
+        );
+
+        cluster.shutdown().await;
+    }
+
     #[tokio::test]
     async fn foundation_server_preserves_pipeline_response_order() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
