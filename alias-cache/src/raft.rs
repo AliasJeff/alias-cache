@@ -281,6 +281,7 @@ const RAFT_LOG_CHECKSUM_LEN: usize = 4;
 pub struct FileLogStore {
     path: PathBuf,
     file: File,
+    committed_path: PathBuf,
     inner: Arc<Mutex<FileLog>>,
 }
 
@@ -318,10 +319,17 @@ impl FileLogStore {
             .append(true)
             .open(&path)
             .map_err(|source| Error::io("open raft log", source))?;
-        let inner = load_file_log(&mut file)?;
+        let mut inner = load_file_log(&mut file)?;
+        let committed_path = path.with_extension("committed");
+        // The sidecar only accelerates recovery; a missing or corrupt sidecar
+        // falls back to the committed record inside the log itself.
+        if let Ok(sidecar) = load_committed_sidecar(&committed_path) {
+            inner.committed = sidecar;
+        }
         Ok(Self {
             path,
             file,
+            committed_path,
             inner: Arc::new(Mutex::new(inner)),
         })
     }
@@ -331,6 +339,13 @@ impl FileLogStore {
     }
 
     fn append_record(&mut self, file_record: &FileRecord) -> CacheResult<()> {
+        self.write_record(file_record)?;
+        self.file
+            .sync_data()
+            .map_err(|source| Error::io("sync raft log entry", source))
+    }
+
+    fn write_record(&mut self, file_record: &FileRecord) -> CacheResult<()> {
         let payload = bincode::serialize(file_record)
             .map_err(|error| Error::server(format!("serialize raft log record: {error}")))?;
         let mut record =
@@ -343,11 +358,51 @@ impl FileLogStore {
         record.extend_from_slice(&checksum(&record).to_le_bytes());
         self.file
             .write_all(&record)
-            .map_err(|source| Error::io("append raft log entry", source))?;
-        self.file
-            .sync_data()
-            .map_err(|source| Error::io("sync raft log entry", source))
+            .map_err(|source| Error::io("append raft log entry", source))
     }
+}
+
+/// Load the recovery-acceleration sidecar that carries the last observed
+/// cluster commit.
+///
+/// The sidecar is published atomically and never fsynced, so any failure to
+/// parse it simply means recovery falls back to the log-internal committed
+/// record; it can never make the node serve wrong data.
+fn load_committed_sidecar(path: &Path) -> io::Result<Option<LogId>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if bytes.len() < RAFT_LOG_CHECKSUM_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "commit sidecar is truncated",
+        ));
+    }
+    let payload_end = bytes.len() - RAFT_LOG_CHECKSUM_LEN;
+    let expected = u32::from_le_bytes(bytes[payload_end..].try_into().unwrap());
+    if checksum(&bytes[..payload_end]) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "commit sidecar checksum mismatch",
+        ));
+    }
+    bincode::deserialize(&bytes[..payload_end])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn save_committed_sidecar(path: &Path, committed: &Option<LogId>) -> io::Result<()> {
+    let payload = bincode::serialize(committed)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut bytes = Vec::with_capacity(payload.len() + RAFT_LOG_CHECKSUM_LEN);
+    bytes.extend_from_slice(&payload);
+    let file_checksum = checksum(&bytes);
+    bytes.extend_from_slice(&file_checksum.to_le_bytes());
+
+    let temporary_path = path.with_extension("committed.tmp");
+    std::fs::write(&temporary_path, &bytes)?;
+    std::fs::rename(&temporary_path, path)
 }
 
 fn load_file_log(file: &mut File) -> CacheResult<FileLog> {
@@ -575,9 +630,14 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
     {
         let entries: Vec<Entry> = entries.into_iter().collect();
         for entry in &entries {
-            self.append_record(&FileRecord::Entry(entry.clone()))
+            self.write_record(&FileRecord::Entry(entry.clone()))
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
+        // Group commit: one fsync amortizes over every entry in the batch,
+        // and openraft requires durability only before the callback fires.
+        self.file
+            .sync_data()
+            .map_err(|source| io::Error::other(source.to_string()))?;
         self.inner.lock().await.entries.extend(entries);
         callback.io_completed(Ok(()));
         Ok(())
@@ -610,9 +670,13 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), io::Error> {
         self.inner.lock().await.committed = committed;
-        self.append_record(&FileRecord::Committed(committed))
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok(())
+        // The commit pointer is recovery acceleration, not a correctness
+        // record: openraft tolerates a stale value because a restarting node
+        // re-confirms a cluster commit before serving reads again. So the
+        // sidecar is published atomically without an fsync, keeping fsyncs
+        // out of the quorum-acknowledgment path.
+        save_committed_sidecar(&self.committed_path, &committed)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId>, io::Error> {
@@ -2991,6 +3055,52 @@ mod tests {
             Some(log_id)
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn committed_sidecar_recovers_and_falls_back_on_corruption() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-sidecar-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let committed_path = path.with_extension("committed");
+        let log_id = openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(4, 9), 12);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        {
+            let mut store = FileLogStore::open(&path).expect("file log should open");
+            runtime
+                .block_on(store.save_committed(Some(log_id)))
+                .expect("commit should persist");
+        }
+
+        // A fresh store prefers the sidecar value.
+        let mut reopened = FileLogStore::open(&path).expect("file log should reopen");
+        assert_eq!(
+            runtime
+                .block_on(reopened.read_committed())
+                .expect("commit should recover"),
+            Some(log_id)
+        );
+        drop(reopened);
+
+        // A corrupt sidecar is ignored: recovery falls back to the log and
+        // must not block startup.
+        let bytes = std::fs::read(&committed_path).expect("sidecar should exist");
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 0xff;
+        std::fs::write(&committed_path, corrupted).expect("sidecar should corrupt");
+        let mut corrupted_store = FileLogStore::open(&path).expect("corrupt sidecar tolerated");
+        assert_eq!(
+            runtime
+                .block_on(corrupted_store.read_committed())
+                .expect("commit should fall back"),
+            None,
+            "corrupt sidecar must not fabricate a commit pointer"
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(committed_path);
     }
 
     #[test]
