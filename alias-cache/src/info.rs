@@ -34,6 +34,7 @@ pub async fn execute(raft: &RaftHandle, request: &Request) -> Option<Frame> {
             .get(1)
             .is_none_or(|requested| requested.eq_ignore_ascii_case(section.as_bytes()))
     };
+    let wants_any = |sections: &[&str]| sections.iter().any(|section| wants(section));
 
     let metrics = raft.metrics().borrow_watched().clone();
     let leader_id = metrics.current_leader;
@@ -51,7 +52,18 @@ pub async fn execute(raft: &RaftHandle, request: &Request) -> Option<Frame> {
         .filter(|node_id| !voters.contains(node_id))
         .collect();
 
+    // Health levels, from liveness to write readiness. A follower is
+    // readable only while some leader exists (reads forward); writability
+    // additionally requires this node to be that leader.
     let mut output = String::new();
+    if wants_any(&["health", "server"]) {
+        let _ = writeln!(output, "# Health");
+        let _ = writeln!(output, "alive:{}", true);
+        let _ = writeln!(output, "raft_recovered:{}", metrics.running_state.is_ok());
+        let readable = leader_id.is_some();
+        let _ = writeln!(output, "readable:{}", readable);
+        let _ = writeln!(output, "writable:{}", leader_id == Some(metrics.id));
+    }
     if wants("server") {
         let _ = writeln!(output, "# Server");
         let _ = writeln!(output, "alias_cache_version:{}", env!("CARGO_PKG_VERSION"));
@@ -170,6 +182,11 @@ mod tests {
         };
         assert_eq!(format.as_ref(), b"txt");
         let text = String::from_utf8(data.to_vec()).unwrap();
+        assert!(text.contains("# Health"));
+        assert!(text.contains("alive:true"));
+        assert!(text.contains("raft_recovered:true"));
+        assert!(text.contains("readable:true"));
+        assert!(text.contains("writable:true"));
         assert!(text.contains("# Server"));
         assert!(text.contains("node_id:7"));
         assert!(text.contains("role:leader"));

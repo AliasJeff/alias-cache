@@ -84,3 +84,8 @@ cache-cat 的指标和管理命令不能自动视为 alias-cache 的公开 API�
   - 测试：状态机 OOM 门（超限拒绝/拒绝不落盘/缩小放行/删除释放/关闭
     限制恢复/快照往返计数一致）、CLI 解析、连接上限端到端（占位、拒绝
     回复、释放后可再连）。
+- 2026-10（续）：健康检查四级已实现——`INFO health` 输出 alive /
+  raft_recovered / readable / writable，全部取自单一 openraft metrics 快照。
+  分级语义与探针组合（liveness=TCP+PING，readiness=readable）记录于兼容性
+  文档；writable 为节点自报信号，quorum 丢失时由真实写失败兜底。
+  测试：单节点 INFO 全段落断言（含四级全真）。
