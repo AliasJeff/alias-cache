@@ -201,3 +201,32 @@ alias-cache 以三节点集群（每批多数派 fsync + ReadIndex 线性一致�
 - 写吞吐的进一步方向见上文 group commit 分析（批量合并粒度、follower
   fsync 策略）；强一致系统的正确宣传语是"可解释的代价"，而非"追平 Redis"。
 - 复现：README 快速开始 + `alias-cache-benchmark --help`；Redis 配置如上。
+
+### Snapshot policy 三档实测（2026-10-11）
+
+配置：单节点、release、8 客户端 × pipeline 16 × 30s 持续 SET（value 64B），
+`--snapshot-policy` 64 / 256 / 1024 三档各独立新目录。
+
+| policy | 吞吐 | p50 延迟 | 停止时 raft 日志 | 停止时快照 |
+| --- | --- | --- | --- | --- |
+| 64 | 1,046 ops/s | 114ms | 468 KB | 3.72 MB |
+| 256 | 1,041 ops/s | 115ms | 442 KB | 3.72 MB |
+| 1024 | 1,040 ops/s | 116ms | 417 KB | 3.73 MB |
+
+结论：
+
+1. **该规模下快照开销对写吞吐无感**：三档吞吐差异 <0.6%，因为瓶颈仍是
+   fsync 批处理而非快照生成/安装。默认 64 在 3.5 万 entry 规模无性能惩罚。
+2. 快照与日志的大小关系符合设计：快照接管后日志被 purge 到 <500 KB，
+   快照 ~3.7 MB（含 bincode 编码与 client_results 缓存）。
+3. 重启到可 PING 的时间两档均为 ~12.4s（进程启动 + raft 初始化 + 快照
+   载入），3.7 MB 快照不构成载入瓶颈。注意 PING 是连接级命令，此测量
+   不含 applied-index 追赶完成时间；后者需 INFO replication 的
+   last_applied_index 探测，留作更大规模下的测量项。
+4. 阈值选择建议：小数据量（<10 万 entry）下 64 即可；阈值的意义在于
+   控制重启后的日志重放量与磁盘占用，而非吞吐调优。
+
+合并粒度观察（同次运行顺带确认）：单节点 pipeline 16、128 in-flight 下
+p50 ≈ 115ms 与 128/1,046 吻合，说明 client_write 批合并充分（每批约
+128 条一次 fsync）——调优计划第 1 项的"合并不足"假设在本负载下不成立，
+写吞吐上限由磁盘 fsync 延迟决定。
