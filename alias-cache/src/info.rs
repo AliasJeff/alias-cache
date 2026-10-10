@@ -58,7 +58,7 @@ pub async fn execute(raft: &RaftHandle, request: &Request) -> Option<Frame> {
     let mut output = String::new();
     if wants_any(&["health", "server"]) {
         let _ = writeln!(output, "# Health");
-        let _ = writeln!(output, "alive:{}", true);
+        let _ = writeln!(output, "alive:true");
         let _ = writeln!(output, "raft_recovered:{}", metrics.running_state.is_ok());
         let readable = leader_id.is_some();
         let _ = writeln!(output, "readable:{}", readable);
