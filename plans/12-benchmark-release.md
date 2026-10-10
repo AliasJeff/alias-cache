@@ -72,7 +72,9 @@ cache-cat 的历史 benchmark 数字和硬件假设不能作为 alias-cache 的�
 - 版本化二进制、日志和快照格式；
 - 变更日志；
 - CI 测试、Clippy、格式检查和构建矩阵；
-- 依赖许可证和供应链检查；
+- 依赖许可证和供应链检查；✅ `scripts/check-licenses.sh` 基于 Cargo.lock
+  对全部依赖做 SPDX 白名单校验（MIT/Apache-2.0/BSD/ISC/Unicode/Zlib 等），
+  未知许可证使 CI 失败；已接入 check job。
 - 发布前运行多节点恢复、分区和快照测试。
 
 ## 完成标准

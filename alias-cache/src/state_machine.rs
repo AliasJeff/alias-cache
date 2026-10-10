@@ -3492,6 +3492,368 @@ mod tests {
         assert_eq!(restored.memory_usage(), state.memory_usage());
     }
 
+    /// Compatibility matrix for every SET option combination and the
+    /// EXPIRE/PEXPIRE protocol boundary, driven by an explicit table so the
+    /// supported surface is readable in one place.
+    #[test]
+    fn set_option_matrix_and_expire_boundaries() {
+        // (arguments, expect_error_fragment) — every rejected combination
+        // must fail before any state changes.
+        let invalid: &[(&[&[u8]], &str)] = &[
+            (&[b"NX", b"XX"], "mutually exclusive"),
+            (&[b"XX", b"NX"], "mutually exclusive"),
+            (&[b"PX", b"100", b"EX", b"100"], "expiration options are"),
+            (&[b"EX", b"100", b"PX", b"100"], "expiration options are"),
+            (&[b"EX", b"100", b"EXAT", b"200"], "expiration options are"),
+            (&[b"PXAT", b"200", b"KEEPTTL"], "expiration options are"),
+            (&[b"EX", b"100", b"PXAT", b"200"], "expiration options are"),
+            (&[b"EX", b"0"], "must be positive"),
+            (&[b"PX", b"-5"], "ttl is invalid"),
+            (&[b"EX", b"abc"], "invalid"),
+            (&[b"EXAT", b"abc"], "invalid"),
+            (&[b"PXAT", b"-1"], "ttl is invalid"),
+            (&[b"PX", b"99999999999999999999"], "ttl is invalid"),
+        ];
+        for (options, fragment) in invalid {
+            let mut state = StateMachine::default();
+            let mut arguments = vec![b"SET".to_vec(), b"key".to_vec(), b"value".to_vec()];
+            for option in *options {
+                arguments.push((*option).to_vec());
+            }
+            let error = state
+                .execute_request(Request::Command(
+                    arguments
+                        .iter()
+                        .map(|part| Bytes::copy_from_slice(part))
+                        .collect(),
+                ))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(fragment),
+                "SET {options:?} must fail with {fragment:?}, got {error}"
+            );
+            assert_eq!(
+                state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+                Frame::Null,
+                "failed SET must leave no trace for {options:?}"
+            );
+        }
+
+        // GET option duplication is rejected too.
+        let mut state = StateMachine::default();
+        let error = state
+            .execute_request(command(&[b"SET", b"key", b"value", b"GET", b"GET"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicated"));
+
+        // Legal combinations: (arguments, preexisting_key, expect_reply,
+        // expect_pttl_after — None means no TTL, Some means PTTL returns a
+        // value in that range).
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"present", b"old"]))
+            .unwrap();
+
+        struct Case {
+            name: &'static str,
+            arguments: Vec<Vec<u8>>,
+            key: &'static [u8],
+            reply: Frame,
+            get_after: Option<Vec<u8>>,
+        }
+        let ok = |name, arguments, key, reply, get_after| Case {
+            name,
+            arguments,
+            key,
+            reply,
+            get_after,
+        };
+        let cases = vec![
+            ok(
+                "plain",
+                vec![b"SET".to_vec(), b"plain".to_vec(), b"v".to_vec()],
+                b"plain",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "nx-new",
+                vec![
+                    b"SET".to_vec(),
+                    b"nx-new".to_vec(),
+                    b"v".to_vec(),
+                    b"NX".to_vec(),
+                ],
+                b"nx-new",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "nx-existing-null",
+                vec![
+                    b"SET".to_vec(),
+                    b"present".to_vec(),
+                    b"v".to_vec(),
+                    b"NX".to_vec(),
+                ],
+                b"present",
+                Frame::Null,
+                Some(b"old".to_vec()),
+            ),
+            ok(
+                "xx-existing",
+                vec![
+                    b"SET".to_vec(),
+                    b"present".to_vec(),
+                    b"new".to_vec(),
+                    b"XX".to_vec(),
+                ],
+                b"present",
+                Frame::simple_string("OK"),
+                Some(b"new".to_vec()),
+            ),
+            ok(
+                "xx-missing-null",
+                vec![
+                    b"SET".to_vec(),
+                    b"xx-missing".to_vec(),
+                    b"v".to_vec(),
+                    b"XX".to_vec(),
+                ],
+                b"xx-missing",
+                Frame::Null,
+                None,
+            ),
+            ok(
+                "ex",
+                vec![
+                    b"SET".to_vec(),
+                    b"ex".to_vec(),
+                    b"v".to_vec(),
+                    b"EX".to_vec(),
+                    b"10".to_vec(),
+                ],
+                b"ex",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "px",
+                vec![
+                    b"SET".to_vec(),
+                    b"px".to_vec(),
+                    b"v".to_vec(),
+                    b"PX".to_vec(),
+                    b"10000".to_vec(),
+                ],
+                b"px",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "exat",
+                vec![
+                    b"SET".to_vec(),
+                    b"exat".to_vec(),
+                    b"v".to_vec(),
+                    b"EXAT".to_vec(),
+                    b"11000".to_vec(),
+                ],
+                b"exat",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "pxat",
+                vec![
+                    b"SET".to_vec(),
+                    b"pxat".to_vec(),
+                    b"v".to_vec(),
+                    b"PXAT".to_vec(),
+                    b"11000000".to_vec(),
+                ],
+                b"pxat",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "nx-px",
+                vec![
+                    b"SET".to_vec(),
+                    b"nx-px".to_vec(),
+                    b"v".to_vec(),
+                    b"NX".to_vec(),
+                    b"PX".to_vec(),
+                    b"5000".to_vec(),
+                ],
+                b"nx-px",
+                Frame::simple_string("OK"),
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "xx-keppttl",
+                vec![
+                    b"SET".to_vec(),
+                    b"present".to_vec(),
+                    b"kept".to_vec(),
+                    b"XX".to_vec(),
+                    b"KEEPTTL".to_vec(),
+                ],
+                b"present",
+                Frame::simple_string("OK"),
+                Some(b"kept".to_vec()),
+            ),
+            ok(
+                "get-overwrite",
+                vec![
+                    b"SET".to_vec(),
+                    b"present".to_vec(),
+                    b"newer".to_vec(),
+                    b"GET".to_vec(),
+                ],
+                b"present",
+                // "present" holds "kept" at this point in the shared state.
+                Frame::bulk_string("kept"),
+                Some(b"newer".to_vec()),
+            ),
+            ok(
+                "get-missing-null",
+                vec![
+                    b"SET".to_vec(),
+                    b"get-missing".to_vec(),
+                    b"v".to_vec(),
+                    b"GET".to_vec(),
+                ],
+                b"get-missing",
+                Frame::Null,
+                Some(b"v".to_vec()),
+            ),
+            ok(
+                "nx-px-get",
+                vec![
+                    b"SET".to_vec(),
+                    b"nx-px-get".to_vec(),
+                    b"v".to_vec(),
+                    b"NX".to_vec(),
+                    b"PX".to_vec(),
+                    b"5000".to_vec(),
+                    b"GET".to_vec(),
+                ],
+                b"nx-px-get",
+                Frame::Null,
+                Some(b"v".to_vec()),
+            ),
+        ];
+        for case in &cases {
+            let reply = state
+                .execute_request(Request::Command(
+                    case.arguments
+                        .iter()
+                        .map(|part| Bytes::copy_from_slice(part))
+                        .collect(),
+                ))
+                .unwrap()
+                .1;
+            assert_eq!(reply, case.reply, "case {}", case.name);
+            let get = state
+                .execute_request(command(&[b"GET", case.key]))
+                .unwrap()
+                .1;
+            match &case.get_after {
+                Some(value) => {
+                    assert_eq!(get, Frame::bulk_string(value.clone()), "case {}", case.name)
+                }
+                None => assert_eq!(get, Frame::Null, "case {}", case.name),
+            }
+        }
+
+        // KEEPTTL inherits a live TTL; a plain overwrite clears it.
+        state
+            .execute_request(command(&[b"SET", b"ttl", b"v", b"PX", b"8000"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"SET", b"ttl", b"kept", b"KEEPTTL"]))
+            .unwrap();
+        let pttl = state
+            .execute_request(command(&[b"PTTL", b"ttl"]))
+            .unwrap()
+            .1;
+        assert!(
+            matches!(pttl, Frame::Integer(ms) if ms > 0 && ms <= 8000),
+            "KEEPTTL must preserve the TTL, got {pttl:?}"
+        );
+        state
+            .execute_request(command(&[b"SET", b"ttl", b"cleared"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"PTTL", b"ttl"]))
+                .unwrap()
+                .1,
+            Frame::Integer(-1),
+            "a plain overwrite clears the TTL"
+        );
+
+        // EXPIRE/PEXPIRE boundary: missing key, already-expired key, zero,
+        // negative, non-integer, and second-level rounding of PTTL.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXPIRE", b"missing", b"10"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        state
+            .execute_request(command(&[b"SET", b"gone", b"v", b"PX", b"1"]))
+            .unwrap();
+        state.advance_logical_time(1_000);
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXPIRE", b"gone", b"10"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0),
+            "an already-expired key reports 0"
+        );
+        state
+            .execute_request(command(&[b"SET", b"e", b"v"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXPIRE", b"e", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1),
+            "non-positive expiry is accepted and expires immediately"
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"e"])).unwrap().1,
+            Frame::Null
+        );
+        state
+            .execute_request(command(&[b"SET", b"e2", b"v"]))
+            .unwrap();
+        assert!(
+            state
+                .execute_request(command(&[b"PEXPIRE", b"e2", b"abc"]))
+                .is_err(),
+            "non-integer TTL must be a protocol error"
+        );
+        state
+            .execute_request(command(&[b"SET", b"e3", b"v"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"EXPIRE", b"e3", b"1"]))
+            .unwrap();
+        assert_eq!(
+            state.execute_request(command(&[b"PTTL", b"e3"])).unwrap().1,
+            Frame::Integer(1000),
+            "EXPIRE converts seconds to milliseconds exactly"
+        );
+    }
+
     #[test]
     fn scan_family_iterates_deterministically_with_cursors() {
         let mut state = StateMachine::default();

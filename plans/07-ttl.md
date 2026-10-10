@@ -116,3 +116,16 @@ cache-cat 的逻辑时钟设计依赖明确的时钟偏移假设；alias-cache �
   - TTL 逻辑在日志重放和快照恢复后保持一致；
   - 本地墙上时钟只用于调度，不决定复制结果；
   - 过期 worker 暂停或失败不会破坏业务正确性。
+
+### 完成记录（2026-10 收尾）
+
+- SET 全选项排列兼容矩阵测试已落地（`set_option_matrix_and_expire_boundaries`）：
+  表驱动覆盖 NX/XX/KEEPTTL/GET/EX/EXAT/PX/PXAT 的全部拒绝组合（互斥、双
+  TTL、双 GET、非正/非整数/溢出 TTL）与合法组合（NX 新旧 key、XX、绝对/
+  相对过期、KEEPTTL 继承、GET 返回旧值、三选项连用），并断言每个失败 SET
+  在状态机上零残留；EXPIRE/PEXPIRE 协议边界（缺失 key、已过期 key 返回 0、
+  非正 TTL 立即过期、非整数参数协议错误、秒→毫秒精确转换）一并覆盖。
+- 迁移策略文档已交付：`docs/storage-format-migration.md` 定义 WAL/本地
+  快照/Raft 快照载荷三个独立版本号的演进规则（只拒绝不猜测、随结构变更
+  递增、派生数据恢复后重算）与 0.x 升级路径（备份 + SCAN 导出 + 重建 +
+  回灌），三个版本拒绝测试作为门禁存在。
