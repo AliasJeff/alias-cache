@@ -350,6 +350,13 @@ fn connection_command(
     if configured_password.is_some() && !*authenticated {
         return Some(Frame::error("NOAUTH Authentication required."));
     }
+    if command.eq_ignore_ascii_case(b"SELECT") {
+        // The store is deliberately single-database; only index 0 exists.
+        return Some(match arguments.len() {
+            2 if arguments[1].as_ref() == b"0" => Frame::simple_string("OK"),
+            _ => Frame::error("ERR DB index is out of range"),
+        });
+    }
     if command.eq_ignore_ascii_case(b"PING") {
         return Some(match arguments.len() {
             1 => Frame::simple_string("PONG"),
@@ -1115,7 +1122,9 @@ mod tests {
                 *2\r\n$4\r\nPING\r\n$5\r\nhello\r\n\
                 *2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n\
                 *1\r\n$4\r\nECHO\r\n\
-                *3\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n",
+                *3\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n\
+                *2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n\
+                *2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
             )
             .await
             .unwrap();
@@ -1138,6 +1147,16 @@ mod tests {
         assert_eq!(
             frames.next_frame(&mut client).await,
             Frame::error("ERR wrong number of arguments for 'ping' command")
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::simple_string("OK"),
+            "SELECT 0 succeeds on the single-database store"
+        );
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::error("ERR DB index is out of range"),
+            "nonzero database indexes do not exist"
         );
 
         shutdown_tx.send(true).unwrap();
