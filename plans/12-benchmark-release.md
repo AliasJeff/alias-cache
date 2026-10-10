@@ -153,6 +153,26 @@ SET 的剩余瓶颈是每批一次的三节点 fsync 往返（p50 ≈ 53ms，符
 in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 的
 更积极合并与 follower 端 fsync 策略。
 
+### 写吞吐调优计划与判据（2026-10-11）
+
+当前对照基线：三节点 SET 2,352 ops/s（p50 53ms），每批一次三节点 fsync
+往返为已确认瓶颈（延迟符合 in-flight/吞吐 的 Little's law 排队模型）。
+
+下一步实验设计与判据：
+
+1. openraft 批量 append 合并粒度：在 benchmark 中固定 in-flight 总量
+   （8 连接 × pipeline 深度 1/16/64），统计每批实际合并的 entry 数与
+   fsync 次数/秒；判据为"pipeline 深度提升时 fsync 次数是否随之摊薄"，
+   若合并不足（每批 entry 数 ≈ 连接数而非 pipeline 深度），则需评估
+   openraft 的 client_write 合并行为或服务端提交队列。
+2. follower 端 fsync 策略：测量 leader 与 follower 各自 fsync 在一次
+   提交延迟中的占比（INFO stats 的 raft_log_bytes 增速 + 延迟分布），
+   评估 follower 侧 `sync_data` 频率放松对安全性的影响（openraft 契约
+   仍要求回调前落盘，放松空间有限，预期收益主要在 leader）。
+3. 生产 snapshot policy 实测：以 `--snapshot-policy` 64/256/1024 三档
+   分别跑 60s 写入，对比快照期间吞吐跌幅与日志重放恢复时间，选定
+   默认值的依据记录回本节。
+
 ### 与 Redis 的同机对比基线（2026-10-11）
 
 环境：同一台 Apple Silicon MacBook，release 构建，同一压测工具
