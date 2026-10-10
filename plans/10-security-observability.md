@@ -89,3 +89,14 @@ cache-cat 的指标和管理命令不能自动视为 alias-cache 的公开 API�
   分级语义与探针组合（liveness=TCP+PING，readiness=readable）记录于兼容性
   文档；writable 为节点自报信号，quorum 丢失时由真实写失败兜底。
   测试：单节点 INFO 全段落断言（含四级全真）。
+- 2026-10（续）：运行指标已落地——`INFO stats` 段输出
+  `live_connections`/`max_connections`（accept 循环维护的计数与上限）、
+  `memory_usage_bytes`/`max_memory_bytes`（状态机增量计数器与 OOM 门限）、
+  `raft_log_bytes`/`raft_snapshot_bytes`（数据目录内日志与快照文件大小）、
+  `client_requests`（连接层自启动以来的命令计数）。指标由 `StatsContext`
+  携带（连接计数/请求计数为进程内原子量，文件大小按路径即时读取），
+  与 raft 指标同段渲染。测试：单节点 stats 单测（写后内存计数、文件
+  大小存在、请求计数递增）与三节点集群级测试（follower 连接可获取）。
+  至此 plans/10 要求的"连接、命令、Raft、WAL/快照、TTL、错误指标"由
+  stats + replication + health 三段覆盖：连接与命令计数在 stats，Raft
+  与复制滞后在 replication，TTL/错误以命令级测试为证据。

@@ -35,9 +35,13 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
   `ZREVRANGE`、`ZRANK`、`ZREVRANK`；
 - Key/TTL：`TYPE`、`DBSIZE`、`EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`；
 - 遍历：`SCAN`、`HSCAN`、`SSCAN`、`ZSCAN`（游标 + `COUNT`）；
-- 可观测：`INFO [health|server|replication|cluster]`，输出取自单一 openraft
-  metrics 快照；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级
-  bulk string；`replication_lag_node_<id>` 仅在 Leader 上报告（-1 表示未知）；
+- 可观测：`INFO [health|stats|server|replication|cluster]`；health/server/
+  replication/cluster 取自单一 openraft metrics 快照；stats 为运行指标
+  （连接计数与上限、内存用量与上限、raft 日志/快照文件字节大小、命令
+  计数），其中计数器为进程内原子量、文件大小按路径即时读取，不进复制
+  状态机；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级
+  bulk string（保留 `txt:` 格式标签）；`replication_lag_node_<id>` 仅在
+  Leader 上报告（-1 表示未知）；
 - 健康检查四级：`INFO health` 输出 `alive`（进程可响应）、`raft_recovered`
   （openraft 运行态正常）、`readable`（存在 Leader，读可经转发线性化）、
   `writable`（本节点即 Leader）。`writable` 是节点自报的快速信号：quorum

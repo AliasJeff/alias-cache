@@ -118,6 +118,11 @@ impl Server {
         let expiration_worker_shutdown = shutdown.as_ref().clone();
         let node_id = self.config.node_id;
         let sentinel_context = SentinelContext::from_config(&self.config);
+        let stats = crate::info::StatsContext::new(
+            &self.config.data_dir,
+            self.config.max_connections,
+            self.config.max_memory_non_zero(),
+        );
         let live_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             run_expiration_worker(
@@ -143,6 +148,7 @@ impl Server {
                     let password = self.config.password.clone();
                     let tls_acceptor = client_tls_acceptor.clone();
                     let tls_connector = tls_connector.clone();
+                    let connection_stats = stats.clone();
                     let max_connections = self.config.max_connections as usize;
                     let live_connections = Arc::clone(&live_connections);
                     tokio::spawn(async move {
@@ -172,6 +178,7 @@ impl Server {
                                         sentinel_context,
                                         password,
                                         tls_connector.clone(),
+                                        connection_stats.clone(),
                                     )
                                     .await
                                 }
@@ -188,6 +195,7 @@ impl Server {
                                     sentinel_context,
                                     password,
                                     tls_connector.clone(),
+                                    connection_stats,
                                 )
                                 .await
                             }
@@ -284,6 +292,7 @@ async fn handle_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_raft_connection(
     mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     shutdown: Arc<watch::Receiver<bool>>,
@@ -292,6 +301,7 @@ async fn handle_raft_connection(
     sentinel_context: SentinelContext,
     password: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
+    stats: crate::info::StatsContext,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
@@ -375,6 +385,7 @@ async fn handle_raft_connection(
                                 &mut watched,
                                 request,
                                 &sentinel_context,
+                                &stats,
                                 &mut resp_version,
                                 &mut authenticated,
                                 password.as_deref(),
@@ -581,6 +592,7 @@ async fn handle_transaction_command(
     watched: &mut BTreeMap<Bytes, Option<u64>>,
     request: crate::protocol::Request,
     sentinel_context: &SentinelContext,
+    stats: &crate::info::StatsContext,
     resp_version: &mut RespVersion,
     authenticated: &mut bool,
     configured_password: Option<&[u8]>,
@@ -610,7 +622,7 @@ async fn handle_transaction_command(
         if let Some(response) = sentinel::execute(raft, sentinel_context, &request).await {
             return response;
         }
-        if let Some(response) = crate::info::execute(raft, &request).await {
+        if let Some(response) = crate::info::execute(raft, stats, &request).await {
             return response;
         }
     }
@@ -892,6 +904,7 @@ mod tests {
                                     sentinel_context,
                                     password,
                                     None,
+                                    crate::info::StatsContext::new("target/stats-test", 0, None),
                                 )
                                 .await;
                             });
@@ -982,6 +995,45 @@ mod tests {
         assert!(text.contains("# Replication"));
         assert!(text.contains("term:"));
         assert!(text.contains(&format!("leader_id:{}", leader + 1)));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stats_section_is_served_from_any_cluster_node() {
+        let cluster = spawn_three_node_cluster("stats").await;
+        let leader = cluster.leader_index().await;
+        let follower = if leader == 0 { 1 } else { 0 };
+
+        let mut conn = TcpStream::connect(cluster.client_addrs[follower])
+            .await
+            .unwrap();
+        let mut frames = FrameReader::new();
+        conn.write_all(&encode_command(&[b"INFO", b"stats"]))
+            .await
+            .unwrap();
+        let data = match frames.next_frame(&mut conn).await {
+            Frame::VerbatimString { data, .. } => data,
+            Frame::BulkString(data) => data,
+            other => panic!("INFO stats must return a report, got {other:?}"),
+        };
+        // The RESP2 downgrade of a verbatim string keeps the "txt:" format
+        // tag inline; both forms carry the same body after it.
+        let text = String::from_utf8(data.to_vec()).unwrap();
+        let text = text.strip_prefix("txt:").unwrap_or(&text);
+        assert!(text.starts_with("# Stats"), "got: {text}");
+        assert!(
+            text.contains("raft_log_bytes:"),
+            "log size must be reported: {text}"
+        );
+        assert!(
+            text.contains("client_requests:"),
+            "request counter must be reported: {text}"
+        );
+        assert!(
+            text.contains("memory_usage_bytes:"),
+            "memory usage must be reported: {text}"
+        );
 
         cluster.shutdown().await;
     }
@@ -1261,8 +1313,17 @@ mod tests {
         let sentinel_context = SentinelContext::from_config(&config);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None, None)
-                .await
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                limits,
+                sentinel_context,
+                None,
+                None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1420,6 +1481,7 @@ mod tests {
                 SentinelContext::from_config(&config),
                 password,
                 None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
             )
             .await
         });
@@ -1541,6 +1603,7 @@ mod tests {
                                 sentinel_context,
                                 None,
                                 None,
+                                crate::info::StatsContext::new("target/stats-test", 0, None),
                             )
                             .await;
                             live_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1613,8 +1676,17 @@ mod tests {
         let sentinel_context = SentinelContext::from_config(&config);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None, None)
-                .await
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                limits,
+                sentinel_context,
+                None,
+                None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1716,8 +1788,17 @@ mod tests {
         let sentinel_context = SentinelContext::from_config(&config);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_raft_connection(stream, shutdown, raft, limits, sentinel_context, None, None)
-                .await
+            handle_raft_connection(
+                stream,
+                shutdown,
+                raft,
+                limits,
+                sentinel_context,
+                None,
+                None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1795,6 +1876,7 @@ mod tests {
                 SentinelContext::from_config(&config),
                 None,
                 None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
             )
             .await
         });
@@ -1892,6 +1974,7 @@ mod tests {
                 SentinelContext::from_config(&config),
                 None,
                 None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
             )
             .await
         });
@@ -1960,6 +2043,7 @@ mod tests {
                 sentinel_context,
                 None,
                 None,
+                crate::info::StatsContext::new("target/stats-test", 0, None),
             )
             .await
         });
