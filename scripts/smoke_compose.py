@@ -9,7 +9,32 @@ import sys
 import time
 from pathlib import Path
 
-from smoke_cluster import MASTER_NAME, info_values, request, wait_for
+from smoke_cluster import MASTER_NAME, RedisError, info_values, request, wait_for
+
+
+def retry_until_leader(
+    port: int,
+    *arguments: str,
+    attempts: int = 40,
+    delay: float = 0.25,
+) -> object:
+    """Send a command, retrying while the cluster is re-electing a leader.
+
+    A freshly elected leader briefly reports "not known" on client_write
+    while openraft finishes confirming leadership; a real client retries
+    such transient errors, and so must the smoke test on slow runners.
+    """
+    last_error: RedisError | None = None
+    for _ in range(attempts):
+        try:
+            return request(port, *arguments)
+        except RedisError as error:
+            text = str(error)
+            if "leader is not known" not in text and "TRYAGAIN" not in text:
+                raise
+            last_error = error
+            time.sleep(delay)
+    raise last_error if last_error else RuntimeError("retry exhausted")
 
 
 CLIENT_PORTS = (6379, 6380, 6381)
@@ -69,7 +94,9 @@ def main() -> int:
         )
         follower = next(node for node in (1, 2, 3) if node != original_leader)
         assert (
-            request(CLIENT_PORTS[follower - 1], "SET", "compose:before", "committed")
+            retry_until_leader(
+                CLIENT_PORTS[follower - 1], "SET", "compose:before", "committed"
+            )
             == b"OK"
         )
 
@@ -86,7 +113,9 @@ def main() -> int:
         )
         writer = next(node for node in survivors if node != elected_leader)
         assert (
-            request(CLIENT_PORTS[writer - 1], "SET", "compose:after", "failover")
+            retry_until_leader(
+                CLIENT_PORTS[writer - 1], "SET", "compose:after", "failover"
+            )
             == b"OK"
         )
         committed_index = int(
@@ -110,7 +139,7 @@ def main() -> int:
             lambda: True if restarted_node_caught_up() else None,
         )
         assert (
-            request(
+            retry_until_leader(
                 CLIENT_PORTS[original_leader - 1], "GET", "compose:after"
             )
             == b"failover"
