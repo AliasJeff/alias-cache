@@ -9,7 +9,7 @@
 - 当前阶段已实现 `EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`，以及 `SET EX/EXAT/PX/PXAT/NX/XX/KEEPTTL/GET` 的基础语义。
 - 当前阶段使用 `SetWithExpiration`、`Expire`、`Persist` 和 `AdvanceTime` 作为可序列化 Raft 操作，过期时间和逻辑时间随日志复制。
 - 实现 `EXPIRE`、`PEXPIRE`、`TTL`、`PTTL`、`PERSIST`。
-- 后续按兼容矩阵实现 `SET EX/NX/PX/KEEPTTL`。
+- `SET EX/EXAT/PX/PXAT/NX/XX/KEEPTTL/GET` 已按兼容矩阵实现。
 - 定义逻辑时间、读时钟、写时钟和本地物理时钟。
 - 写日志携带确定的 write time。
 - 使用绝对逻辑过期时间保存 TTL。
@@ -38,7 +38,8 @@
 - `cache_cat/src/protocol/key/expire.rs`、`pexpire.rs`、`ttl.rs`、`pttl.rs`、`persist.rs`：
   参考 Redis 返回值、过期条件和秒级舍入；当前已覆盖 EXPIRE/PEXPIRE/TTL/PTTL/PERSIST 的基础路径。
 - `cache_cat/src/protocol/string/set.rs`：
-  参考 `SET` 的 EX/EXAT/PX/PXAT、NX/XX、KEEPTTL、GET 选项解析和互斥规则；当前仍需补齐全部选项排列组合的错误响应矩阵。
+  参考 `SET` 的 EX/EXAT/PX/PXAT、NX/XX、KEEPTTL、GET 选项解析和互斥规则；
+  当前实现已补齐选项排列组合的错误响应矩阵。
 - `cache_cat/src/mocha/test.rs`、`docs/distributed_delete_en.md`、`distributed_delete_zh.md`：
   参考时钟单调性、过期边界、读写竞态和故障切换推导；不直接复制其 lease-read 假设。
 
@@ -87,14 +88,15 @@ cache-cat 的逻辑时钟设计依赖明确的时钟偏移假设；alias-cache �
    - 参考：`cache_cat/src/mocha/mod.rs` 的过期删除检查，以及 `docs/distributed_delete_zh.md` 的分布式删除推导。
    - 实现：旧清理任务遇到同 Key 新写入、TTL 更新或 `PERSIST` 时 no-op；清理操作经过 Raft 复制。
    - 测试：`state_machine::tests::stale_expiration_cleanup_cannot_delete_replaced_or_persisted_value`、`raft::tests::expiration_worker_removes_expired_key_after_replicated_time_advance`。
-7. [进行中] 增加 Pipeline、事务、Leader 切换和重启场景下的 TTL 测试。
+7. [x] 增加 Pipeline、事务、Leader 切换和重启场景下的 TTL 测试。
    - [x] Pipeline：`server::tests::foundation_server_preserves_ttl_pipeline_responses` 验证 SET/ PTTL/EXISTS 的响应顺序。
    - [x] 事务：`server::tests::single_connection_executes_ttl_transaction_atomically` 验证事务内 SET/PEXPIRE/PERSIST 作为单次提交执行；事务内读命令暂不支持。
    - [x] Leader 切换：`raft::tests::committed_expired_key_does_not_reappear_after_leader_failover` 验证已提交过期 Key 不因切主重新出现。
-   - [ ] 重启：已有普通写入重启测试，仍需增加 TTL 写入、逻辑时间和过期清理后的文件 Raft 重启场景。
-8. [ ] 补充完整兼容矩阵和持久化迁移策略。
-   - 待覆盖命令：`SET` 选项的全部顺序组合、完整错误响应，以及 `EXPIRE`/`PEXPIRE` 的协议边界。
-   - 待定义格式：应用状态版本、WAL 版本、Raft snapshot 载荷版本分别演进；不兼容版本必须启动失败并提供可诊断错误。
+   - [x] 重启：`file_raft_preserves_ttl_across_restart` 验证 TTL 写入、逻辑时间和剩余 TTL
+     在文件 Raft 重启后保持一致。
+8. [x] 补充完整兼容矩阵和持久化迁移策略。
+   - 已覆盖 `SET` 选项拒绝/合法组合、`EXPIRE`/`PEXPIRE` 协议边界，以及三个存储格式
+     版本的拒绝和迁移策略；详见 `docs/storage-format-migration.md`。
    - 参考：`cache_cat/src/raft/types/entry/base_operation.rs`、`read_operation.rs`，以及 `cache_cat/src/raft/types/core/mocha/core.rs`。
 
 ## 一致性测试
@@ -109,8 +111,10 @@ cache-cat 的逻辑时钟设计依赖明确的时钟偏移假设；alias-cache �
 ## 完成标准
 
 - 当前阶段：TTL 过期时间和逻辑时间通过 Raft operation 复制，三节点重放结果一致；基础 Redis TTL 命令和 SET 选项已覆盖。
-- 已完成：非正 TTL 边界、TTL 元数据恢复测试，以及 WAL/本地 snapshot 的不兼容版本拒绝。
-- 未完成：事务内读命令和 WATCH、完整 SET/EXPIRE 条件矩阵、Raft snapshot 载荷独立版本和旧数据迁移工具。
+- 已完成：非正 TTL 边界、TTL 元数据恢复测试、文件 Raft 重启恢复、WATCH、
+  SET/EXPIRE 条件矩阵，以及 WAL/本地 snapshot/Raft snapshot 的版本拒绝和迁移策略。
+- 当前限制：事务内读命令仍不支持；WATCH、SET/EXPIRE 条件矩阵、Raft snapshot
+  载荷版本和迁移策略已完成。
 - 最终完成标准仍为：
   - TTL 命令兼容矩阵中的边界全部通过；
   - TTL 逻辑在日志重放和快照恢复后保持一致；

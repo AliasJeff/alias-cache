@@ -63,7 +63,8 @@ cache-cat 的历史 benchmark 数字和硬件假设不能作为 alias-cache 的�
   `alias-cache-cli` 单元测试）。
 - README 已补快速开始（单节点 + 三节点 + Leader 故障行为说明），并用真实
   `redis-cli`/RESP 会话手工验证：follower 读写透明转发、杀 Leader 后自动选主
-  并继续写入。命令级截图/输出仍待发布阶段补充。
+  并继续写入。`scripts/smoke_cluster.py` 现在以标准库 RESP 客户端自动验证三节点
+  启动、Leader 故障切换、故障后写入和原节点重启追赶。
 
 ## 发布任务
 
@@ -76,6 +77,8 @@ cache-cat 的历史 benchmark 数字和硬件假设不能作为 alias-cache 的�
   对全部依赖做 SPDX 白名单校验（MIT/Apache-2.0/BSD/ISC/Unicode/Zlib 等），
   未知许可证使 CI 失败；已接入 check job。
 - 发布前运行多节点恢复、分区和快照测试。
+- 发布前运行 `python3 scripts/smoke_cluster.py`，验证干净临时目录中的故障切换和恢复。
+- CI 通过 `python3 scripts/smoke_compose.py` 构建镜像并验证 Compose 集群故障切换与恢复。
 
 ## 完成标准
 

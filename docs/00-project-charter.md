@@ -66,7 +66,7 @@ alias-cache 是一个使用 Rust 编写的 Redis 协议兼容分布式内存 KV 
 
 - RESP2
 - RESP3
-- AUTH、HELLO、CLIENT 等基础连接命令
+- AUTH、HELLO 和基础连接命令；`CLIENT` 不在当前稳定兼容范围
 - Pipeline
 - 基础 Sentinel 风格主节点发现
 
@@ -98,7 +98,7 @@ alias-cache 是一个使用 Rust 编写的 Redis 协议兼容分布式内存 KV 
 
 ## 5. 参考实现边界
 
-项目主要参考 `/Users/zhexun/Projects/cache-cat` 的以下设计：
+项目参考本地 `cache-cat` 开源仓库的以下设计：
 
 - OpenRaft 集成和自定义日志存储；
 - 内存状态机与统一 command handler；

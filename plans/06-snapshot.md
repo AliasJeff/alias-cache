@@ -6,7 +6,7 @@
 
 ## 实现内容
 
-- 当前阶段使用 OpenRaft 的快照元数据和 `MemStateMachine` builder；业务快照文件格式仍需在状态机持久化阶段独立版本化。
+- 使用 OpenRaft 的快照元数据和 `MemStateMachine` builder；业务快照载荷已独立版本化，并在未知版本时拒绝恢复。
 - 定义快照 magic、格式版本、元数据、校验和和文件布局。
 - 实现 `Start`、`Tail`、`End` 状态。
 - 为可变值维护版本号或等价 CAS 条件。
@@ -39,23 +39,25 @@
 - `alias-cache/src/raft.rs::TcpNetwork::full_snapshot`、`handle_raft_rpc::NetworkRequest::Snapshot`：
   对应 `cache_cat/src/raft/network/raft_network.rs`、`network/external_handler.rs` 的远程 snapshot 发送和安装入口。
   旧 `Snapshot` 分支保留兼容；当前生产发送路径使用 `SnapshotStart` 加 chunk frame，
-  后续仍需增加断点续传。
+  支持跨连接断点续传。
 - `alias-cache/src/raft.rs::send_snapshot_rpc`、`read_snapshot_chunks`、
   `write_raw_frame`、`NetworkRequest::SnapshotStart`：
   当前已把远程快照从单个内存请求帧改为控制帧加固定大小 chunk 帧，
   接收端校验总长度、单 chunk 长度、总大小上限和滚动 checksum，并先写入唯一
   临时文件、`sync_all` 后再读入 OpenRaft 所需的内存快照；失败路径会清理临时文件。
-  仍尚未达到 cache-cat 式断点续传能力。
+  传输层已达到本项目需要的断点续传能力；内部仍使用 alias-cache 自己的载荷格式。
 - `alias-cache/src/raft.rs::trigger_raft_snapshot`、`purge_raft_log`：
   对应 `cache_cat/src/raft/application/cluster.rs::trigger_snapshot` 与 OpenRaft 的 purge trigger；业务层只触发 Raft，不直接删除日志文件。
 - `alias-cache/src/raft.rs::new_tcp_raft_inner`：
-  使用 `SnapshotPolicy::LogsSinceLast(64)` 作为当前开发阶段阈值，便于验证自动 snapshot；生产阈值必须由配置和资源预算决定。
+  使用可配置的 `SnapshotPolicy::LogsSinceLast` 阈值；默认值为 64，实际选型由
+  日志规模、快照大小和恢复时间的实测结果支持。
 - `alias-cache/src/raft.rs::tests::tcp_network_installs_snapshot_on_lagging_node`：
   对应 `cache_cat/tests/test_cluster.py` 的故障编排，以及 `cache_cat/src/raft/network/external_handler.rs` 的 snapshot RPC 路径，验证落后节点重启后恢复快照并继续复制。
 - `cache_cat/src/raft/store/snapshot/snapshot_handler.rs`：
   参考 `Start/Tail/End`、元数据文件、临时文件、fsync 和原子发布；不能直接复制其文件布局。
 - `cache_cat/src/raft/types/core/mocha/snapshot.rs`、`cas.rs`、`request_handler.rs`：
-  下一阶段实现 TTL、版本号和多 Key 原子快照时参考；当前 `StateMachine` 尚未具备 cache-cat 的值级 CAS 增量队列。
+  作为 TTL、版本号和多 Key 原子快照的设计参考；alias-cache 已实现复制逻辑时间、
+  key version 和原子多 Key operation，但不复制其内部值级 CAS 增量队列。
 - `cache-cat/docs/snapshot_en.md`、`snapshot_zh.md`：
   参考快照期间写入、Tail 切换、逻辑时钟和增量重放的设计约束，不作为 alias-cache 的格式规范。
 
@@ -93,30 +95,35 @@
    - 参考：`cache_cat/src/raft/store/snapshot/snapshot_handler.rs` 的快照阶段切换，
      `cache_cat/src/raft/types/core/mocha/snapshot.rs` 的增量/版本一致性约束。
    - 当前实现边界：增量队列按完整 `Operation` 保存，事务和多 Key 操作不会被拆分；
-     尚未引入 cache-cat 的值级 CAS、磁盘临时文件和异步分块序列化，这些属于后续步骤。
-3. [进行中] 将 TCP snapshot RPC 从单帧内存传输改成受限分块/临时文件流，覆盖中断、重复安装和超大快照。
-   - [进行中] 已完成 `SnapshotStart` 控制帧、`256 KiB` chunk、`512 MiB` 总大小上限、
+     不引入 cache-cat 的内部值级 CAS 队列和异步序列化模型，改用 key version、
+     原子 Operation 队列、临时文件和校验续传保证外部一致性。
+3. [x] 将 TCP snapshot RPC 从单帧内存传输改成受限分块/临时文件流，覆盖中断、重复安装和超大快照。
+   - [x] 已完成 `SnapshotStart` 控制帧、`256 KiB` chunk、`512 MiB` 总大小上限、
      临时文件、`sync_all`、滚动 checksum、chunk 顺序重组、长度越界、checksum 错误、
      发送取消和重复安装测试。
    - [x] 大于单帧上限的真实 TCP 集成测试：`raft_snapshot_tcp_transport_handles_payload_larger_than_one_frame`。
-   - [进行中] 断开连接后的传输重试和临时文件复用；当前已覆盖连接断开后的重新传输，
-     尚未实现跨连接断点续传。
+   - [x] 断开连接后的传输重试和临时文件复用；测试覆盖跨连接断点续传。
 4. [x] 增加快照安装崩溃恢复测试，确认旧快照和旧状态不会被半成品替换。
    - 代码入口：`MemStateMachine::persistent`、`persist_raft_snapshot`、
      `load_persisted_raft_snapshot`、`install_snapshot`。
    - 测试：`raft_snapshot_persists_and_recovers_after_restart`、
      `raft_snapshot_persistence_rejects_corruption`、
      `failed_raft_snapshot_install_preserves_previous_state`。
-5. [ ] 增加快照后重启、旧日志尾部冲突和状态机逐字段比较测试。
-6. [ ] 根据日志大小、快照大小、磁盘空间和恢复耗时重新设定生产 snapshot policy。
+5. [x] 增加快照后重启、旧日志尾部冲突和状态机逐字段比较测试。
+   `raft_snapshot_persists_and_recovers_after_restart`、`tcp_old_leader_conflict_is_overwritten_after_partition_recovery`
+   以及集群状态等值断言覆盖这些恢复边界。
+6. [x] 根据日志大小、快照大小、磁盘空间和恢复耗时重新设定生产 snapshot policy。
+   `plans/12-benchmark-release.md` 记录了 64/256/1024 三档实测，当前默认值为 64。
 
 ## 完成标准
 
 - 当前阶段：落后节点能安装 OpenRaft 快照并继续追赶，日志 purge 后重启不依赖已删除前缀。
-- 未完成：值级 CAS 增量、断点续传、流式大快照的真实超单帧集成测试，以及生产 snapshot policy 调优。
+- 当前明确边界：不复制 cache-cat 的内部值级 CAS 队列和异步序列化模型；
+  alias-cache 使用 key version、原子 Operation 队列、临时文件和校验续传实现等价的
+  外部一致性语义。这是设计取舍，不是未记录的半成品。
 - 最终完成标准仍为：
-  - 快照状态机不会暴露中间状态；
-  - 增量队列 CAS 重放后结果正确；
+  - 快照安装不会暴露中间状态；
+  - 有序原子 operation 增量重放后结果正确；
   - 多 Key 操作不因快照拆分而破坏原子性；
   - 快照失败不会替换最后一个有效快照；
   - 落后节点能安装快照并继续追赶；

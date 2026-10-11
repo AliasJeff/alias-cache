@@ -38,6 +38,8 @@ pre-1.0; formats and guarantees may change between minor versions (see
 - Packaging: Dockerfile (pinned toolchain, non-root), docker-compose
   three-node cluster, CI build matrix for linux/macos/windows with
   release artifacts.
+- Validation: repeatable local and Docker Compose three-node smoke tests cover
+  leader failover, post-failover writes, and recovery of the restarted node.
 - Benchmark tool (`alias-cache-benchmark`) and a same-machine comparison
   against Redis 6.2 with an honest interpretation of the strong
   consistency cost.
@@ -51,6 +53,10 @@ pre-1.0; formats and guarantees may change between minor versions (see
   enabled election, hanging bootstrap and failover in the server path.
 - Follower reads surfaced raw openraft forwarding errors instead of the
   transparent leader redirect that writes already used.
+- CLI startup errors from the server task were not observed by the process,
+  which could leave a failed listener looking like a live server.
+- Docker Compose used hostnames where the CLI requires socket addresses, and
+  the image's non-root user could not initialize its mounted data directory.
 
 ## [0.1.0] - 2026-10-08
 

@@ -125,7 +125,7 @@ Set 当前约束：
 - 内部使用确定性有序集合，集合返回结果按字节序排列；
 - `SDIFF`、`SINTER`、`SUNION` 支持多 Key 只读计算，并检查所有存在 Key 的类型；
 - Set 写入继承 key 的 TTL，删除最后一个 member 后删除整个 key；
-- `SPOP`、`SRANDMEMBER`、`SSCAN` 和 `*STORE` 写入变体尚未纳入稳定兼容范围。
+- `SPOP`、`SRANDMEMBER` 和 `*STORE` 写入变体尚未纳入稳定兼容范围。
 
 Sorted Set 当前约束：
 

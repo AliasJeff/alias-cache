@@ -5,3 +5,8 @@
 /data/
 /tmp/
 /coverage/
+
+# Generated Redis comparison and benchmark artifacts.
+*.aof
+*.rdb
+__pycache__/

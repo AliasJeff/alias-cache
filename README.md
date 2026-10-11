@@ -72,6 +72,8 @@ redis-cli -p 6379 GET hello
 ```
 
 三节点强一致集群（节点 1 种子成员，其余节点以 voter 加入）：
+
+```bash
 ./target/release/alias-cache-cli --node-id 1 --client-addr 127.0.0.1:6379 \
   --raft-addr 127.0.0.1:16379 --data-dir data/node-1 --bootstrap \
   --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
@@ -100,8 +102,8 @@ redis-cli -p 6379 GET hello
 
 ## 当前状态
 
-已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 129 个测试、
-CLI 6 个、benchmark 2 个测试全部通过）：
+已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 142 个测试、
+CLI 9 个、benchmark 2 个测试全部通过）：
 
 - RESP2/RESP3：`HELLO 2/3` 协商、Pipeline、MULTI/EXEC/DISCARD 事务
 - 安全：`--password`/`ALIAS_CACHE_PASSWORD` 密码认证（AUTH/HELLO AUTH）、
@@ -120,6 +122,28 @@ CLI 6 个、benchmark 2 个测试全部通过）：
 - CLI 配置化（单节点/集群拓扑/种子引导）、Dockerfile + docker-compose 三节点编排
 - 自带 `alias-cache-benchmark` 压测工具与基线数据（见 plans/12）
 
+可重复的三节点故障切换与恢复 smoke test：
+
+```bash
+python3 scripts/smoke_cluster.py
+```
+
+脚本会创建临时数据目录，启动三节点集群，写入并读取数据，终止当前
+Leader，验证新 Leader 继续写入，再重启原节点并验证其追赶已提交状态。
+需要 Python 3；脚本只使用标准库，不依赖 Redis 客户端。
+CI 还会通过 `python3 scripts/smoke_compose.py` 对 Docker Compose 部署执行相同的
+Leader 故障切换和重启恢复检查。
+
+Docker Compose 启动三个容器后，宿主机可分别通过 `127.0.0.1:6379`、
+`6380`、`6381` 连接各节点；任一入口都可在其他节点故障后继续使用：
+
+```bash
+docker compose up --build --detach
+redis-cli -p 6380 SET docker-smoke replicated
+redis-cli -p 6381 GET docker-smoke
+docker compose down
+```
+
 单节点基线（Apple Silicon，release，8 客户端 × pipeline 16）：
 PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
 
@@ -127,7 +151,7 @@ PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
 多数派提交 SET 2,352 ops/s——写入经 group commit 与 pipeline 并发提交
 （相比初版 461 ops/s 提升 5 倍），剩余瓶颈为每批一次的三节点 fsync 往返。
 
-已发布：三平台（linux/macos/windows）CI 构建矩阵与制品打包。
+CI 已配置 Linux/macOS/Windows 三平台构建矩阵并上传构建制品。
 
 与 Redis 6.2 的同机对比（同工具同负载，诚实口径）见 plans/12：
 PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s

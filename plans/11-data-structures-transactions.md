@@ -91,7 +91,8 @@
 - 事务内子命令共享同一个逻辑写入时间，TTL 操作按入队顺序执行。
 - 当前事务只接受 replicated write；读命令在 `EXEC` 时返回稳定错误，不进入 Raft。
 - 已实现事务请求的 Leader 转发 RPC，避免 follower 将事务拆成多个写入。
-- 当前限制：未实现 `WATCH`、事务内读命令和运行时错误元素；事务中命令形状错误会使 `EXEC` 整体失败。
+- 当前限制：事务内读命令和运行时错误元素仍不支持；事务中命令形状错误会使
+  `EXEC` 整体失败。WATCH 已通过日志内 CAS 实现。
 - 参考实现：
   - `alias-cache/src/server.rs::handle_transaction_command`：连接状态和命令入队。
   - `alias-cache/src/state_machine.rs::prepare_transaction`：确定性子操作准备。
@@ -121,13 +122,14 @@
 - 2026-10：String、Hash、List、Set、Sorted Set 五种结构已实现，均沿用统一的
   prepare/apply 路径：prepare 在当前状态上校验参数并生成可序列化 `Operation`，
   apply 重放且结果与 prepare 响应一致；写入继承 key TTL，删空即删 key。
-- 确定性取舍：Set 用 `BTreeSet` 按字节序返回；Sorted Set 的 score 用 `i64`
-  而非 double，避免浮点跨副本分歧；集合内乱序输入的返回顺序全部确定。
+- 确定性取舍：Set 用 `BTreeSet` 按字节序返回；Sorted Set 的 score 使用
+  f64 位模式存储并用 `total_cmp` 排序，保证有限 double 的跨副本确定性；
+  集合内乱序输入的返回顺序全部确定。
 - 测试：`state_machine::tests` 覆盖每种结构的命令语义、重放、TTL 继承、
   WRONGTYPE 拒绝和 INCRBY 的溢出/非整数边界；兼容矩阵见
   `docs/compatibility-and-failure-model.md` 的各结构约束段。
-- 待完成：数据结构命令的多节点 TCP 集成回归（当前多节点测试集中在 String/TTL）、
-  `WATCH`、事务内读命令、HINCRBY/ZINCRBY、SCAN 系列。
+- 已完成：数据结构命令的多节点 TCP 集成回归、HINCRBY/ZINCRBY、SCAN 系列和
+  WATCH/UNWATCH。事务内读命令和运行时错误元素仍是明确限制。
 
 - 2026-10（续）：`HINCRBY`/`ZINCRBY`、`SCAN`/`HSCAN`/`SSCAN`/`ZSCAN` 和
   `WATCH`/`UNWATCH` 已实现。WATCH 采用日志内 CAS：key 版本随状态机保存，
