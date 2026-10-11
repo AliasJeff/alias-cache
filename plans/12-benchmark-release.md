@@ -156,7 +156,11 @@ SET 的剩余瓶颈是每批一次的三节点 fsync 往返（p50 ≈ 53ms，符
 in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 的
 更积极合并与 follower 端 fsync 策略。
 
-### 写吞吐调优计划与判据（2026-10-11）
+### 写吞吐调优计划与判据（2026-10-11；已立项为 plans/13）
+
+> 2026-10 更新：本节实验已立项为 [plans/13](13-batch-write-pipeline.md)
+> （批量写管线与性能主张），合并粒度与 follower fsync 两项实验随该计划
+> 的批量入口实现一并闭环；redis-benchmark 交叉验证亦在该计划步骤 4。
 
 当前对照基线：三节点 SET 2,352 ops/s（p50 53ms），每批一次三节点 fsync
 往返为已确认瓶颈（延迟符合 in-flight/吞吐 的 Little's law 排队模型）。

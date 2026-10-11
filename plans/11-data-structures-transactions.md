@@ -101,14 +101,15 @@
 
 ## Lua、阻塞和 Stream 前置条件
 
-只有满足以下条件才进入实现：
+核心日志、快照和恢复链路已稳定（01-12 全部门禁在案），第二阶段扩展
+已立项为独立计划：
 
-- 脚本执行确定性；
-- 禁止或替换时间、随机数和外部 I/O；
-- CPU、内存、递归和返回值有上限；
-- 阻塞等待不会占用 Raft apply 线程；
-- Push、唤醒和取消语义已定义；
-- 快照和恢复可以重现相同结果。
+- Stream / Bitmap / Bloom Filter：见 [plans/14](14-bitmap-bf-stream.md)
+  （Bitmap → BF → Stream 非阻塞骨干，风险递增）；
+- Lua：见 [plans/15](15-lua-scripting.md)。原前置条件的解法已在设计
+  中落定：脚本在 Leader 执行、复制确定性 Operation（回避"脚本确定性"
+  问题，无需禁用 random/time），mlua 沙箱（内存上限 + 指令钩子）承担
+  资源限制，阻塞类命令（BLPOP/XREAD BLOCK）仍暂缓至唤醒机制立项。
 
 ## 完成标准
 

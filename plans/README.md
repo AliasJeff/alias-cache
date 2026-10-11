@@ -25,6 +25,14 @@
 10. [安全、资源限制与可观测性](10-security-observability.md)
 11. [数据结构、Pipeline 与事务扩展](11-data-structures-transactions.md)
 12. [Benchmark、兼容矩阵与发布](12-benchmark-release.md)
+13. [批量写管线与性能主张](13-batch-write-pipeline.md)
+14. [Bitmap、Bloom Filter 与 Stream](14-bitmap-bf-stream.md)
+15. [Lua 脚本（EVAL / EVALSHA / SCRIPT）](15-lua-scripting.md)
+
+13-15 为第二轮扩展：13 优先（复刻 cache-cat 的批量提交架构，兑现
+"强一致 + 高写吞吐"主张，并引入 redis-benchmark 交叉验证）；随后按
+风险递增做 14（Bitmap → BF → Stream 非阻塞骨干）；15 收尾（leader
+执行/结果复制模型 + mlua 沙箱，消除 cache-cat 的 unsafe 桥接）。
 
 核心契约见：
 
