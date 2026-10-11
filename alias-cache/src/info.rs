@@ -99,22 +99,28 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
     if wants_any(&["health", "server"]) {
         let _ = writeln!(output, "# Health");
         let _ = writeln!(output, "alive:true");
-        let _ = writeln!(output, "raft_recovered:{}", metrics.running_state.is_ok());
+        let raft_recovered = metrics.running_state.is_ok();
+        let _ = writeln!(output, "raft_recovered:{raft_recovered}");
         let readable = leader_id.is_some();
-        let _ = writeln!(output, "readable:{}", readable);
-        let _ = writeln!(output, "writable:{}", leader_id == Some(metrics.id));
+        let _ = writeln!(output, "readable:{readable}");
+        let writable = leader_id == Some(metrics.id);
+        let _ = writeln!(output, "writable:{writable}");
     }
     if wants("server") {
         let _ = writeln!(output, "# Server");
-        let _ = writeln!(output, "alias_cache_version:{}", env!("CARGO_PKG_VERSION"));
-        let _ = writeln!(output, "node_id:{}", metrics.id);
+        let alias_cache_version = env!("CARGO_PKG_VERSION");
+        let _ = writeln!(output, "alias_cache_version:{alias_cache_version}");
+        let node_id = metrics.id;
+        let _ = writeln!(output, "node_id:{node_id}");
         let _ = writeln!(output, "role:{role}");
-        let _ = writeln!(output, "running:{}", metrics.running_state.is_ok());
+        let running = metrics.running_state.is_ok();
+        let _ = writeln!(output, "running:{running}");
     }
     if wants("replication") {
         let _ = writeln!(output, "# Replication");
         let _ = writeln!(output, "state:{:?}", metrics.state);
-        let _ = writeln!(output, "term:{}", metrics.current_term);
+        let term = metrics.current_term;
+        let _ = writeln!(output, "term:{term}");
         let _ = writeln!(
             output,
             "leader_id:{}",
@@ -177,7 +183,8 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
             "live_connections:{}",
             stats.live_connections.load(Ordering::SeqCst)
         );
-        let _ = writeln!(output, "max_connections:{}", stats.max_connections);
+        let max_connections = stats.max_connections;
+        let _ = writeln!(output, "max_connections:{max_connections}");
         let memory = raft
             .with_state_machine(|state_machine| {
                 Box::pin(async move { state_machine.state().await.memory_usage() })
@@ -185,13 +192,12 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
             .await
             .unwrap_or(0);
         let _ = writeln!(output, "memory_usage_bytes:{memory}");
-        let _ = writeln!(output, "max_memory_bytes:{}", stats.max_memory.unwrap_or(0));
-        let _ = writeln!(output, "raft_log_bytes:{}", stats.file_bytes("raft/log"));
-        let _ = writeln!(
-            output,
-            "raft_snapshot_bytes:{}",
-            stats.file_bytes("raft/snapshot")
-        );
+        let max_memory_bytes = stats.max_memory.unwrap_or(0);
+        let _ = writeln!(output, "max_memory_bytes:{max_memory_bytes}");
+        let raft_log_bytes = stats.file_bytes("raft/log");
+        let _ = writeln!(output, "raft_log_bytes:{raft_log_bytes}");
+        let raft_snapshot_bytes = stats.file_bytes("raft/snapshot");
+        let _ = writeln!(output, "raft_snapshot_bytes:{raft_snapshot_bytes}");
         let _ = writeln!(
             output,
             "client_requests:{}",
@@ -200,9 +206,12 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
     }
     if wants("cluster") {
         let _ = writeln!(output, "# Cluster");
-        let _ = writeln!(output, "cluster_size:{}", voters.len() + learners.len());
-        let _ = writeln!(output, "voters:{}", join_ids(&voters));
-        let _ = writeln!(output, "learners:{}", join_ids(&learners));
+        let cluster_size = voters.len() + learners.len();
+        let _ = writeln!(output, "cluster_size:{cluster_size}");
+        let voters_list = join_ids(&voters);
+        let _ = writeln!(output, "voters:{voters_list}");
+        let learners_list = join_ids(&learners);
+        let _ = writeln!(output, "learners:{learners_list}");
     }
     Some(Frame::VerbatimString {
         format: Bytes::from_static(b"txt"),
