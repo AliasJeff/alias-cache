@@ -5,3 +5,6 @@ docs/
 plans/
 *.md
 .github/
+*.aof
+*.rdb
+__pycache__/

@@ -137,18 +137,23 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = Server::new(config, shutdown_rx)?;
-    let server_task = tokio::spawn(server.run());
+    let mut server_task = tokio::spawn(server.run());
 
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|source| Error::io("wait for ctrl-c", source))?;
-    info!("received ctrl-c, shutting down");
-    shutdown_tx
-        .send(true)
-        .map_err(|_| Error::server("server shutdown receiver dropped"))?;
-    server_task
-        .await
-        .map_err(|error| Error::server(format!("join server task: {error}")))?
+    tokio::select! {
+        result = &mut server_task => {
+            result.map_err(|error| Error::server(format!("join server task: {error}")))?
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(|source| Error::io("wait for ctrl-c", source))?;
+            info!("received ctrl-c, shutting down");
+            shutdown_tx
+                .send(true)
+                .map_err(|_| Error::server("server shutdown receiver dropped"))?;
+            server_task
+                .await
+                .map_err(|error| Error::server(format!("join server task: {error}")))?
+        }
+    }
 }
 
 #[cfg(test)]

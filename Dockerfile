@@ -4,6 +4,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY alias-cache ./alias-cache
 COPY alias-cache-cli ./alias-cache-cli
+COPY benchmark ./benchmark
 RUN cargo build --release --locked -p alias-cache-cli
 
 FROM debian:bookworm-slim
@@ -13,7 +14,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/alias-cache-cli /usr/local/bin/alias-cache
-RUN useradd --system --no-create-home alias-cache
+RUN useradd --system --no-create-home alias-cache \
+    && mkdir -p /data \
+    && chown alias-cache:alias-cache /data
 USER alias-cache
 EXPOSE 6379 16379
 ENTRYPOINT ["alias-cache"]
