@@ -40,6 +40,10 @@ pre-1.0; formats and guarantees may change between minor versions (see
   release artifacts.
 - Validation: repeatable local and Docker Compose three-node smoke tests cover
   leader failover, post-failover writes, and recovery of the restarted node.
+- Storage recovery: partial Raft log tails are truncated on reopen; log
+  truncate/purge uses fsync plus atomic replacement, with injected sync-failure
+  tests covering both pre-publication rollback and post-rename directory-sync
+  failure state consistency.
 - Benchmark tool (`alias-cache-benchmark`) and a same-machine comparison
   against Redis 6.2 with an honest interpretation of the strong
   consistency cost.

@@ -281,12 +281,20 @@ const RAFT_LOG_CHECKSUM_LEN: usize = 4;
 #[derive(Debug)]
 pub struct FileLogStore {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
     committed_path: PathBuf,
     inner: Arc<Mutex<FileLog>>,
+    #[cfg(test)]
+    fail_next_sync_data: bool,
+    #[cfg(test)]
+    fail_next_write_after: Option<usize>,
+    #[cfg(test)]
+    fail_next_rewrite_sync: bool,
+    #[cfg(test)]
+    fail_next_rewrite_directory_sync: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct FileLog {
     entries: Vec<Entry>,
     vote: Option<Vote>,
@@ -314,12 +322,14 @@ impl FileLogStore {
             std::fs::create_dir_all(parent)
                 .map_err(|source| Error::io("create raft log directory", source))?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| Error::io("open raft log", source))?;
+        let rewrite_path = raft_log_rewrite_path(&path);
+        if let Err(source) = fs::remove_file(&rewrite_path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            return Err(Error::io("remove incomplete raft log rewrite", source));
+        }
+        let mut file =
+            open_raft_log_file(&path).map_err(|source| Error::io("open raft log", source))?;
         let mut inner = load_file_log(&mut file)?;
         let committed_path = path.with_extension("committed");
         // The sidecar only accelerates recovery; a missing or corrupt sidecar
@@ -329,9 +339,17 @@ impl FileLogStore {
         }
         Ok(Self {
             path,
-            file,
+            file: Some(file),
             committed_path,
             inner: Arc::new(Mutex::new(inner)),
+            #[cfg(test)]
+            fail_next_sync_data: false,
+            #[cfg(test)]
+            fail_next_write_after: None,
+            #[cfg(test)]
+            fail_next_rewrite_sync: false,
+            #[cfg(test)]
+            fail_next_rewrite_directory_sync: false,
         })
     }
 
@@ -340,10 +358,52 @@ impl FileLogStore {
     }
 
     fn append_record(&mut self, file_record: &FileRecord) -> CacheResult<()> {
-        self.write_record(file_record)?;
+        let original_len = self
+            .file
+            .as_ref()
+            .ok_or_else(|| Error::server("raft log file handle is unavailable"))?
+            .metadata()
+            .map_err(|source| Error::io("read raft log length", source))?
+            .len();
+        if let Err(error) = self.write_record(file_record) {
+            let rollback = self.rollback_append(original_len);
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => Error::server(format!(
+                    "append raft log record failed: {error}; rollback failed: {rollback}"
+                )),
+            });
+        }
+        if let Err(source) = self.sync_log_data() {
+            let rollback = self.rollback_append(original_len);
+            return Err(match rollback {
+                Ok(()) => Error::io("sync raft log entry", source),
+                Err(rollback) => Error::server(format!(
+                    "sync raft log entry failed: {source}; rollback failed: {rollback}"
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    fn rollback_append(&self, original_len: u64) -> io::Result<()> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("raft log file handle is unavailable"))?;
+        file.set_len(original_len)?;
+        file.sync_all()
+    }
+
+    fn sync_log_data(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_sync_data) {
+            return Err(io::Error::other("injected raft log sync_data failure"));
+        }
         self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("raft log file handle is unavailable"))?
             .sync_data()
-            .map_err(|source| Error::io("sync raft log entry", source))
     }
 
     fn write_record(&mut self, file_record: &FileRecord) -> CacheResult<()> {
@@ -357,7 +417,32 @@ impl FileLogStore {
         record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         record.extend_from_slice(&payload);
         record.extend_from_slice(&checksum(&record).to_le_bytes());
+        #[cfg(test)]
+        if let Some(prefix_len) = self.fail_next_write_after.take() {
+            let prefix_len = prefix_len.min(record.len());
+            self.file
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::io(
+                        "append raft log record prefix",
+                        io::Error::other("raft log file handle is unavailable"),
+                    )
+                })?
+                .write_all(&record[..prefix_len])
+                .map_err(|source| Error::io("append raft log record prefix", source))?;
+            return Err(Error::io(
+                "append raft log record",
+                io::Error::other("injected partial raft log write failure"),
+            ));
+        }
         self.file
+            .as_mut()
+            .ok_or_else(|| {
+                Error::io(
+                    "append raft log entry",
+                    io::Error::other("raft log file handle is unavailable"),
+                )
+            })?
             .write_all(&record)
             .map_err(|source| Error::io("append raft log entry", source))
     }
@@ -420,7 +505,8 @@ fn load_file_log(file: &mut File) -> CacheResult<FileLog> {
     while offset < bytes.len() {
         let start = offset;
         if bytes.len() - offset < RAFT_LOG_HEADER_LEN {
-            return Err(Error::server("raft log header is truncated"));
+            truncate_partial_raft_log_tail(file, start)?;
+            break;
         }
         if bytes[offset..offset + 4] != RAFT_LOG_MAGIC {
             return Err(Error::server("raft log magic is invalid"));
@@ -442,7 +528,8 @@ fn load_file_log(file: &mut File) -> CacheResult<FileLog> {
             .and_then(|value| value.checked_add(RAFT_LOG_CHECKSUM_LEN))
             .ok_or_else(|| Error::server("raft log record size overflows"))?;
         if end > bytes.len() {
-            return Err(Error::server("raft log record is truncated"));
+            truncate_partial_raft_log_tail(file, start)?;
+            break;
         }
         let payload_end = offset + length;
         let expected = u32::from_le_bytes(bytes[payload_end..end].try_into().unwrap());
@@ -468,6 +555,13 @@ fn load_file_log(file: &mut File) -> CacheResult<FileLog> {
         offset = end;
     }
     Ok(state)
+}
+
+fn truncate_partial_raft_log_tail(file: &File, valid_len: usize) -> CacheResult<()> {
+    file.set_len(valid_len as u64)
+        .map_err(|source| Error::io("truncate partial raft log tail", source))?;
+    file.sync_all()
+        .map_err(|source| Error::io("sync recovered raft log tail", source))
 }
 
 impl FileRecord {
@@ -615,9 +709,9 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
-        self.inner.lock().await.vote = Some(*vote);
         self.append_record(&FileRecord::Vote(*vote))
             .map_err(|error| io::Error::other(error.to_string()))?;
+        self.inner.lock().await.vote = Some(*vote);
         Ok(())
     }
 
@@ -630,54 +724,146 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
         I: IntoIterator<Item = Entry> + Send,
     {
         let entries: Vec<Entry> = entries.into_iter().collect();
+        let original_len = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("raft log file handle is unavailable"))?
+            .metadata()
+            .map_err(|source| io::Error::other(source.to_string()))?
+            .len();
         for entry in &entries {
-            self.write_record(&FileRecord::Entry(entry.clone()))
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            if let Err(error) = self.write_record(&FileRecord::Entry(entry.clone())) {
+                let write_error = io::Error::other(error.to_string());
+                return Err(match self.rollback_append(original_len) {
+                    Ok(()) => write_error,
+                    Err(rollback) => io::Error::other(format!(
+                        "append raft log entry failed: {write_error}; rollback failed: {rollback}"
+                    )),
+                });
+            }
         }
         // Group commit: one fsync amortizes over every entry in the batch,
         // and openraft requires durability only before the callback fires.
-        self.file
-            .sync_data()
-            .map_err(|source| io::Error::other(source.to_string()))?;
+        if let Err(source) = self.sync_log_data() {
+            return Err(match self.rollback_append(original_len) {
+                Ok(()) => source,
+                Err(rollback) => io::Error::other(format!(
+                    "sync raft log batch failed: {source}; rollback failed: {rollback}"
+                )),
+            });
+        }
         self.inner.lock().await.entries.extend(entries);
         callback.io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate_after(&mut self, last_log_id: Option<LogId>) -> Result<(), io::Error> {
-        let mut inner = self.inner.lock().await;
-        if let Some(last_log_id) = last_log_id {
-            inner
-                .entries
-                .retain(|entry| entry.log_id.index <= last_log_id.index);
+        let path = self.path.clone();
+        #[cfg(test)]
+        let fail_sync = std::mem::take(&mut self.fail_next_rewrite_sync);
+        #[cfg(test)]
+        let fail_directory_sync = std::mem::take(&mut self.fail_next_rewrite_directory_sync);
+        let replacement = {
+            let inner = self.inner.lock().await;
+            let mut replacement = inner.clone();
+            if let Some(last_log_id) = last_log_id {
+                replacement
+                    .entries
+                    .retain(|entry| entry.log_id.index <= last_log_id.index);
+            } else {
+                replacement.entries.clear();
+            }
+            replacement
+        };
+        drop(
+            self.file
+                .take()
+                .ok_or_else(|| io::Error::other("raft log file handle is unavailable"))?,
+        );
+        #[cfg(test)]
+        let rewritten = if fail_sync {
+            rewrite_file_with_sync(&path, &replacement, |_| {
+                Err(io::Error::other("injected raft log rewrite sync failure"))
+            })
+        } else if fail_directory_sync {
+            rewrite_file_with_hooks(&path, &replacement, File::sync_all, |_| {
+                Err(io::Error::other("injected raft log directory sync failure"))
+            })
         } else {
-            inner.entries.clear();
+            rewrite_file(&path, &replacement)
+        };
+        #[cfg(not(test))]
+        let rewritten = rewrite_file(&path, &replacement);
+        match rewritten {
+            Ok(rewritten) => {
+                self.file = Some(rewritten.file);
+                *self.inner.lock().await = replacement;
+                rewritten.directory_sync
+            }
+            Err(error) => {
+                self.file = Some(open_raft_log_file(&path)?);
+                Err(error)
+            }
         }
-        rewrite_file(&mut self.file, &inner).map_err(|error| io::Error::other(error.to_string()))
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), io::Error> {
-        let mut inner = self.inner.lock().await;
-        inner
-            .entries
-            .retain(|entry| entry.log_id.index > log_id.index);
-        inner.last_purged_log_id = Some(log_id);
-        rewrite_file(&mut self.file, &inner)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        drop(inner);
-        self.append_record(&FileRecord::Purged(log_id))
-            .map_err(|error| io::Error::other(error.to_string()))
+        let path = self.path.clone();
+        #[cfg(test)]
+        let fail_sync = std::mem::take(&mut self.fail_next_rewrite_sync);
+        #[cfg(test)]
+        let fail_directory_sync = std::mem::take(&mut self.fail_next_rewrite_directory_sync);
+        let replacement = {
+            let inner = self.inner.lock().await;
+            let mut replacement = inner.clone();
+            replacement
+                .entries
+                .retain(|entry| entry.log_id.index > log_id.index);
+            replacement.last_purged_log_id = Some(log_id);
+            replacement
+        };
+        drop(
+            self.file
+                .take()
+                .ok_or_else(|| io::Error::other("raft log file handle is unavailable"))?,
+        );
+        #[cfg(test)]
+        let rewritten = if fail_sync {
+            rewrite_file_with_sync(&path, &replacement, |_| {
+                Err(io::Error::other("injected raft log rewrite sync failure"))
+            })
+        } else if fail_directory_sync {
+            rewrite_file_with_hooks(&path, &replacement, File::sync_all, |_| {
+                Err(io::Error::other("injected raft log directory sync failure"))
+            })
+        } else {
+            rewrite_file(&path, &replacement)
+        };
+        #[cfg(not(test))]
+        let rewritten = rewrite_file(&path, &replacement);
+        match rewritten {
+            Ok(rewritten) => {
+                self.file = Some(rewritten.file);
+                *self.inner.lock().await = replacement;
+                rewritten.directory_sync
+            }
+            Err(error) => {
+                self.file = Some(open_raft_log_file(&path)?);
+                Err(error)
+            }
+        }
     }
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), io::Error> {
-        self.inner.lock().await.committed = committed;
         // The commit pointer is recovery acceleration, not a correctness
         // record: openraft tolerates a stale value because a restarting node
         // re-confirms a cluster commit before serving reads again. So the
         // sidecar is published atomically without an fsync, keeping fsyncs
         // out of the quorum-acknowledgment path.
         save_committed_sidecar(&self.committed_path, &committed)
-            .map_err(|error| io::Error::other(error.to_string()))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.inner.lock().await.committed = committed;
+        Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId>, io::Error> {
@@ -685,11 +871,48 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
     }
 }
 
-fn rewrite_file(file: &mut File, state: &FileLog) -> CacheResult<()> {
-    file.set_len(0)
-        .map_err(|source| Error::io("truncate raft log", source))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| Error::io("seek raft log for rewrite", source))?;
+struct RewrittenLog {
+    file: File,
+    directory_sync: io::Result<()>,
+}
+
+fn open_raft_log_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+}
+
+fn raft_log_rewrite_path(path: &Path) -> PathBuf {
+    path.with_extension("log.rewrite.tmp")
+}
+
+fn rewrite_file(path: &Path, state: &FileLog) -> io::Result<RewrittenLog> {
+    rewrite_file_with_hooks(path, state, File::sync_all, sync_parent_directory)
+}
+
+#[cfg(test)]
+fn rewrite_file_with_sync(
+    path: &Path,
+    state: &FileLog,
+    sync_file: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<RewrittenLog> {
+    rewrite_file_with_hooks(path, state, sync_file, sync_parent_directory)
+}
+
+fn rewrite_file_with_hooks(
+    path: &Path,
+    state: &FileLog,
+    sync_file: impl FnOnce(&File) -> io::Result<()>,
+    sync_directory: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<RewrittenLog> {
+    let temporary_path = raft_log_rewrite_path(path);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary_path)?;
     let mut records = Vec::with_capacity(
         state.entries.len()
             + usize::from(state.vote.is_some())
@@ -707,8 +930,16 @@ fn rewrite_file(file: &mut File, state: &FileLog) -> CacheResult<()> {
         records.push(FileRecord::Committed(state.committed));
     }
     for record_value in records {
-        let payload = bincode::serialize(&record_value)
-            .map_err(|error| Error::server(format!("serialize raft log record: {error}")))?;
+        let payload = match bincode::serialize(&record_value) {
+            Ok(payload) => payload,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&temporary_path);
+                return Err(io::Error::other(format!(
+                    "serialize raft log record: {error}"
+                )));
+            }
+        };
         let mut record =
             Vec::with_capacity(RAFT_LOG_HEADER_LEN + payload.len() + RAFT_LOG_CHECKSUM_LEN);
         record.extend_from_slice(&RAFT_LOG_MAGIC);
@@ -717,11 +948,42 @@ fn rewrite_file(file: &mut File, state: &FileLog) -> CacheResult<()> {
         record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         record.extend_from_slice(&payload);
         record.extend_from_slice(&checksum(&record).to_le_bytes());
-        file.write_all(&record)
-            .map_err(|source| Error::io("rewrite raft log", source))?;
+        if let Err(error) = file.write_all(&record) {
+            drop(file);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
     }
-    file.sync_all()
-        .map_err(|source| Error::io("sync rewritten raft log", source))
+    if let Err(error) = sync_file(&file) {
+        drop(file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    let file = match open_raft_log_file(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+    };
+    let directory_sync = sync_directory(path);
+    Ok(RewrittenLog {
+        file,
+        directory_sync,
+    })
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 impl RaftLogStorage<TypeConfig> for MemLogStore {
@@ -3061,6 +3323,337 @@ mod tests {
             .expect("entries should recover");
         assert_eq!(entries, vec![first, second]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn file_log_store_recovers_partial_tail_and_accepts_new_entries() {
+        let first = entry(1, EntryPayload::Blank);
+        let second = entry(2, EntryPayload::Blank);
+        let record = FileRecord::Entry(second.clone());
+        let payload = bincode::serialize(&record).expect("entry should serialize");
+        let mut partial_record = Vec::new();
+        partial_record.extend_from_slice(&RAFT_LOG_MAGIC);
+        partial_record.extend_from_slice(&RAFT_LOG_VERSION.to_le_bytes());
+        partial_record.push(record.kind());
+        partial_record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        partial_record.extend_from_slice(&payload[..payload.len() / 2]);
+
+        for (tail_index, tail) in [(0, RAFT_LOG_MAGIC[..2].to_vec()), (1, partial_record)] {
+            let path = std::env::temp_dir().join(format!(
+                "alias-cache-file-log-partial-tail-{}-{}-{tail_index}.log",
+                std::process::id(),
+                unique_test_id()
+            ));
+            {
+                let mut store = FileLogStore::open(&path).expect("file log should open");
+                store
+                    .append(vec![first.clone()], IOFlushed::noop())
+                    .await
+                    .expect("first entry should append");
+            }
+            let valid_len = std::fs::metadata(&path)
+                .expect("log metadata should be readable")
+                .len();
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("log should open for tail injection")
+                .write_all(&tail)
+                .expect("partial tail should be injected");
+
+            let mut recovered =
+                FileLogStore::open(&path).expect("partial final record should be discarded");
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("recovered log metadata should be readable")
+                    .len(),
+                valid_len
+            );
+            let mut reader = recovered.get_log_reader().await;
+            assert_eq!(
+                reader
+                    .try_get_log_entries(1..=2)
+                    .await
+                    .expect("valid prefix should remain readable"),
+                vec![first.clone()]
+            );
+            recovered
+                .append(vec![second.clone()], IOFlushed::noop())
+                .await
+                .expect("append after tail recovery should succeed");
+            drop(recovered);
+
+            let mut reopened =
+                FileLogStore::open(&path).expect("log should reopen after new append");
+            let mut reader = reopened.get_log_reader().await;
+            assert_eq!(
+                reader
+                    .try_get_log_entries(1..=2)
+                    .await
+                    .expect("recovered and appended entries should be readable"),
+                vec![first.clone(), second.clone()]
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_log_store_discards_abandoned_rewrite_temp_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-stale-rewrite-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let first = entry(1, EntryPayload::Blank);
+        {
+            let mut store = FileLogStore::open(&path).expect("file log should open");
+            store
+                .append(vec![first.clone()], IOFlushed::noop())
+                .await
+                .expect("entry should append");
+        }
+        let temporary_path = raft_log_rewrite_path(&path);
+        std::fs::write(&temporary_path, b"partial rewrite")
+            .expect("abandoned rewrite should be injected");
+
+        let mut reopened = FileLogStore::open(&path).expect("original log should reopen");
+        assert!(
+            !temporary_path.exists(),
+            "abandoned rewrite temp should be removed"
+        );
+        let mut reader = reopened.get_log_reader().await;
+        assert_eq!(
+            reader
+                .try_get_log_entries(1..=1)
+                .await
+                .expect("original entry should remain readable"),
+            vec![first]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn file_log_store_appends_to_the_replaced_log_after_truncation() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-rewrite-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let first = entry(1, EntryPayload::Blank);
+        let second = entry(2, EntryPayload::Blank);
+        let third = entry(3, EntryPayload::Blank);
+        let mut store = FileLogStore::open(&path).expect("file log should open");
+        store
+            .append(vec![first.clone(), second.clone()], IOFlushed::noop())
+            .await
+            .expect("initial entries should append");
+        store
+            .truncate_after(Some(first.log_id))
+            .await
+            .expect("truncate should succeed");
+        store
+            .append(vec![third.clone()], IOFlushed::noop())
+            .await
+            .expect("append after truncate should succeed");
+        drop(store);
+
+        let mut reopened = FileLogStore::open(&path).expect("rewritten log should reopen");
+        let mut reader = reopened.get_log_reader().await;
+        assert_eq!(
+            reader
+                .try_get_log_entries(1..=3)
+                .await
+                .expect("rewritten log should be readable"),
+            vec![first, third]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn file_log_store_keeps_old_vote_when_storage_sync_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-sync-failure-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut store = FileLogStore::open(&path).expect("file log should open");
+        let vote = Vote::new_committed(3, 1);
+        store.fail_next_sync_data = true;
+
+        assert!(
+            store.save_vote(&vote).await.is_err(),
+            "failed fsync must be reported"
+        );
+        let mut reader = store.get_log_reader().await;
+        assert_eq!(
+            reader.read_vote().await.expect("vote should be readable"),
+            None,
+            "an unflushed vote must not be published in memory"
+        );
+        drop(reader);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("raft log should remain readable")
+                .len(),
+            0,
+            "failed vote append should be rolled back"
+        );
+
+        store.fail_next_write_after = Some(5);
+        assert!(
+            store
+                .append(vec![entry(1, EntryPayload::Blank)], IOFlushed::noop())
+                .await
+                .is_err(),
+            "partial record writes must be reported"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("raft log should remain readable")
+                .len(),
+            0,
+            "partial record write should be rolled back"
+        );
+
+        store.fail_next_sync_data = true;
+        assert!(
+            store
+                .append(vec![entry(1, EntryPayload::Blank)], IOFlushed::noop())
+                .await
+                .is_err(),
+            "failed batch sync must be reported"
+        );
+        assert_eq!(
+            store
+                .get_log_state()
+                .await
+                .expect("log state should remain readable")
+                .last_log_id,
+            None,
+            "an unflushed entry must not be published in memory"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("raft log should remain readable")
+                .len(),
+            0,
+            "failed batch append should be rolled back"
+        );
+        drop(store);
+        let mut reopened = FileLogStore::open(&path).expect("rolled-back log should reopen");
+        let mut reader = reopened.get_log_reader().await;
+        assert_eq!(
+            reader.read_vote().await.expect("vote should recover"),
+            None,
+            "failed vote must not reappear after restart"
+        );
+        assert!(
+            reopened
+                .get_log_state()
+                .await
+                .expect("log state should recover")
+                .last_log_id
+                .is_none(),
+            "failed append must not reappear after restart"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn failed_log_rewrite_preserves_disk_and_memory_state() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-rewrite-failure-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let first = entry(1, EntryPayload::Blank);
+        let second = entry(2, EntryPayload::Blank);
+        let mut store = FileLogStore::open(&path).expect("file log should open");
+        store
+            .append(vec![first.clone(), second.clone()], IOFlushed::noop())
+            .await
+            .expect("entries should append");
+        let original_bytes = std::fs::read(&path).expect("log should be readable");
+
+        store.fail_next_rewrite_sync = true;
+        assert!(
+            store.truncate_after(Some(first.log_id)).await.is_err(),
+            "failed rewrite sync must be reported"
+        );
+        store.fail_next_rewrite_sync = true;
+        assert!(
+            store.purge(first.log_id).await.is_err(),
+            "failed purge rewrite sync must be reported"
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("original log should remain readable"),
+            original_bytes,
+            "an unpublished rewrite must not alter the old log"
+        );
+        assert_eq!(
+            store
+                .get_log_state()
+                .await
+                .expect("log state should remain readable")
+                .last_log_id,
+            Some(second.log_id),
+            "failed rewrites must not publish their in-memory state"
+        );
+        drop(store);
+
+        let mut reopened = FileLogStore::open(&path).expect("original log should reopen");
+        let mut reader = reopened.get_log_reader().await;
+        assert_eq!(
+            reader
+                .try_get_log_entries(1..=2)
+                .await
+                .expect("original entries should recover"),
+            vec![first, second]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn directory_sync_failure_keeps_published_state_consistent() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-directory-sync-failure-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let first = entry(1, EntryPayload::Blank);
+        let second = entry(2, EntryPayload::Blank);
+        let mut store = FileLogStore::open(&path).expect("file log should open");
+        store
+            .append(vec![first.clone(), second], IOFlushed::noop())
+            .await
+            .expect("entries should append");
+        store.fail_next_rewrite_directory_sync = true;
+
+        assert!(
+            store.truncate_after(Some(first.log_id)).await.is_err(),
+            "directory sync failure must be reported"
+        );
+        assert_eq!(
+            store
+                .get_log_state()
+                .await
+                .expect("log state should remain readable")
+                .last_log_id,
+            Some(first.log_id),
+            "memory must match the replacement already published by rename"
+        );
+
+        let mut reopened = FileLogStore::open(&path).expect("published log should reopen");
+        let mut reader = reopened.get_log_reader().await;
+        assert_eq!(
+            reader
+                .try_get_log_entries(1..=2)
+                .await
+                .expect("published log should be readable"),
+            vec![first]
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

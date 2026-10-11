@@ -102,7 +102,7 @@ redis-cli -p 6379 GET hello
 
 ## 当前状态
 
-已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 142 个测试、
+已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 148 个测试、
 CLI 9 个、benchmark 2 个测试全部通过）：
 
 - RESP2/RESP3：`HELLO 2/3` 协商、Pipeline、MULTI/EXEC/DISCARD 事务

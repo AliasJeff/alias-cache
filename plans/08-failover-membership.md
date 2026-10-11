@@ -145,8 +145,9 @@
      `GET-MASTER-ADDR-BY-NAME`、`SLAVES`、`SENTINELS`。
    - 当前限制：健康 flags 仍是基于 Raft metrics 的简化表示，不实现 Sentinel 自身的
      监控、选主、FAILOVER 或配置写入。
-   - 已完成真实 RESP TCP 入口测试；Leader 切换后的多节点客户端地址发现测试仍属于后续
-     集成测试增强项。
+   - 已完成真实 RESP TCP 入口测试；`scripts/smoke_cluster.py` 和
+     `scripts/smoke_compose.py` 在 Leader 被终止后通过 Sentinel 地址发现新 Leader，
+     并验证新 Leader 写入及旧节点重启追赶。
 
 ### Sentinel 兼容性矩阵（设计基线）
 
