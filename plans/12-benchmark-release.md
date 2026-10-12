@@ -171,7 +171,8 @@ in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 
    （8 连接 × pipeline 深度 1/16/64），统计每批实际合并的 entry 数与
    fsync 次数/秒；可用每个节点 `INFO stats` 的
    `raft_log_append_calls`、`raft_log_appended_entries`、
-   `raft_log_append_batch_entries_avg/max` 和 `raft_log_sync_data_calls`，
+   `raft_log_append_batch_entries_avg/max` 和 `raft_log_sync_data_calls`；
+   `scripts/profile_batch_writes.py` 默认用独立空集群依次测量 pipeline 1/16/64，
    按压测前后差值计算；判据为"pipeline 深度提升时 fsync 次数是否随之摊薄"，
    若合并不足（每批 entry 数 ≈ 连接数而非 pipeline 深度），则需评估
    openraft 的 client_write 合并行为或服务端提交队列。

@@ -174,7 +174,7 @@ target/release/alias-cache-benchmark --address 127.0.0.1:6379 \
 ### Profiling 实测（2026-10-13）
 
 复现：`cargo build --release --locked && python3
-scripts/profile_batch_writes.py --clients 8 --pipeline 16 --duration 5`。
+scripts/profile_batch_writes.py --pipelines 16 --clients 8 --duration 5`。
 脚本在本机建立空数据目录三节点集群，直连当前 Leader 压测，并在压测前后读取
 每个节点的 `INFO stats`。环境为 Apple Silicon MacBook、macOS、release、
 RESP2、64B value、100K key space、8 clients、pipeline 16、5 秒；
@@ -191,6 +191,23 @@ CPU/内存/磁盘具体型号未采集。
 不能据此归因 quorum RTT、也不能证明 20k ops/s 目标可达。吞吐与此前单轮
 结果有波动；需要固定 in-flight 总量、pipeline 1/16/64、多轮重复并记录
 系统资源后再作优化判断。完整逐节点计数可由上述脚本复现。
+
+补充三档单轮对照（同一台 Apple Silicon MacBook，release、8 clients、64B、
+100K key space、每档独立空数据目录三节点集群、3 秒、0 错误）：
+
+| pipeline | 吞吐 ops/s | p50 | p95 | p99 | Leader entries/append | Follower entries/append |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 513 | 56.5 ms | 94.4 ms | 106.9 ms | 3.13 | 6.30 / 6.37 |
+| 16 | 2,609 | 145.4 ms | 210.3 ms | 243.2 ms | 31.95 | 65.93 / 62.93 |
+| 64 | 7,232 | 209.5 ms | 262.0 ms | 279.1 ms | 104.84 | 183.88 / 183.88 |
+
+该对照说明 pipeline 深度提升确实摊薄了本机 WAL sync 次数，但延迟同步上升；
+pipeline 64 的吞吐仍只有目标 20k ops/s 的约 36%，且这是单轮短时样本，
+不能作为稳定容量或生产推荐值。脚本默认测量 pipeline 1、16、64：
+
+```bash
+python3 scripts/profile_batch_writes.py --duration 3 --clients 8
+```
 
 ## 风险与回退
 

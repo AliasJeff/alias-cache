@@ -140,7 +140,7 @@ Leader 故障切换和重启恢复检查。
 
 ```bash
 cargo build --release --locked
-python3 scripts/profile_batch_writes.py --clients 8 --pipeline 16 --duration 5
+python3 scripts/profile_batch_writes.py --clients 8 --duration 5
 ```
 
 脚本会创建临时三节点集群，输出 benchmark 结果和每个节点 `INFO stats` 的

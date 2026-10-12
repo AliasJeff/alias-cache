@@ -17,15 +17,6 @@ from typing import BinaryIO
 
 HOST = "127.0.0.1"
 WAIT_SECONDS = 25.0
-METRICS = (
-    "raft_log_append_calls",
-    "raft_log_appended_entries",
-    "raft_log_append_batch_entries_max",
-    "raft_log_sync_data_calls",
-    "raft_log_sync_data_max_us",
-)
-
-
 def reserve_ports(count: int) -> list[int]:
     listeners: list[socket.socket] = []
     try:
@@ -166,13 +157,21 @@ def main() -> int:
         default=Path("target/release/alias-cache-benchmark"),
     )
     parser.add_argument("--clients", type=int, default=8)
-    parser.add_argument("--pipeline", type=int, default=16)
     parser.add_argument("--duration", type=int, default=5)
     parser.add_argument("--value-size", type=int, default=64)
     parser.add_argument("--key-space", type=int, default=100_000)
+    parser.add_argument(
+        "--pipelines",
+        type=int,
+        nargs="+",
+        default=[1, 16, 64],
+        help="pipeline depths to measure in separate fresh clusters",
+    )
     args = parser.parse_args()
-    if min(args.clients, args.pipeline, args.duration, args.key_space) <= 0:
-        parser.error("clients, pipeline, duration, and key-space must be positive")
+    if min(args.clients, args.duration, args.key_space, *args.pipelines) <= 0:
+        parser.error("clients, pipelines, duration, and key-space must be positive")
+    if any(pipeline > 1_024 for pipeline in args.pipelines):
+        parser.error("pipeline must be 1..=1024")
 
     repository = Path(__file__).resolve().parents[1]
     binary = args.binary if args.binary.is_absolute() else repository / args.binary
@@ -187,12 +186,41 @@ def main() -> int:
                 f"{executable} is missing; run cargo build --release --locked first"
             )
 
+    root = Path(tempfile.mkdtemp(prefix="alias-cache-profile-"))
+    try:
+        for pipeline in args.pipelines:
+            run_profile(
+                repository,
+                root / f"pipeline-{pipeline}",
+                binary,
+                benchmark_binary,
+                args.clients,
+                pipeline,
+                args.duration,
+                args.value_size,
+                args.key_space,
+            )
+        return 0
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def run_profile(
+    repository: Path,
+    workdir: Path,
+    binary: Path,
+    benchmark_binary: Path,
+    clients: int,
+    pipeline: int,
+    duration: int,
+    value_size: int,
+    key_space: int,
+) -> None:
     client_ports = reserve_ports(3)
     raft_ports = reserve_ports(3)
-    workdir = Path(tempfile.mkdtemp(prefix="alias-cache-profile-"))
+    workdir.mkdir(parents=True)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[BinaryIO] = []
-    success = False
     try:
         for node_id in range(1, 4):
             log = (workdir / f"node-{node_id}.log").open("wb")
@@ -224,23 +252,18 @@ def main() -> int:
             "--mode",
             "pwrite",
             "--clients",
-            str(args.clients),
+            str(clients),
             "--pipeline",
-            str(args.pipeline),
+            str(pipeline),
             "--time",
-            str(args.duration),
+            str(duration),
             "--value-size",
-            str(args.value_size),
+            str(value_size),
             "--key-space",
-            str(args.key_space),
+            str(key_space),
         ]
-        result = subprocess.run(
-            command,
-            cwd=repository,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        result = subprocess.run(command, cwd=repository, capture_output=True, text=True)
+        print(f"\n=== pipeline {pipeline} ===")
         print(result.stdout, end="")
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)
@@ -249,36 +272,21 @@ def main() -> int:
 
         time.sleep(0.5)
         after = [info(port, "stats") for port in client_ports]
-        print("per-node WAL metrics (counter deltas and interval averages):")
         for index, (initial, final) in enumerate(zip(before, after), start=1):
             role = "leader" if client_ports[index - 1] == leader_port else "follower"
-            print(f"node {index} ({role}):")
-            for metric in METRICS:
-                old = int(initial.get(metric, "0"))
-                new = int(final.get(metric, "0"))
-                print(f"  {metric}: before={old} after={new} delta={new - old}")
-            append_calls = int(final.get("raft_log_append_calls", "0")) - int(
-                initial.get("raft_log_append_calls", "0")
-            )
-            appended_entries = int(
-                final.get("raft_log_appended_entries", "0")
-            ) - int(initial.get("raft_log_appended_entries", "0"))
-            sync_calls = int(final.get("raft_log_sync_data_calls", "0")) - int(
-                initial.get("raft_log_sync_data_calls", "0")
-            )
-            sync_total_us = int(
-                final.get("raft_log_sync_data_total_us", "0")
-            ) - int(initial.get("raft_log_sync_data_total_us", "0"))
+            append_calls = counter_delta(initial, final, "raft_log_append_calls")
+            appended_entries = counter_delta(initial, final, "raft_log_appended_entries")
+            sync_calls = counter_delta(initial, final, "raft_log_sync_data_calls")
+            sync_total_us = counter_delta(initial, final, "raft_log_sync_data_total_us")
+            sync_max_us = counter_delta(initial, final, "raft_log_sync_data_max_us")
             print(
-                "  interval_append_batch_entries_avg:"
-                f"{appended_entries / append_calls if append_calls else 0:.2f}"
+                f"node {index} ({role}): append_calls={append_calls} "
+                f"entries={appended_entries} entries_per_append="
+                f"{appended_entries / append_calls if append_calls else 0:.2f} "
+                f"sync_calls={sync_calls} sync_avg_us="
+                f"{sync_total_us / sync_calls if sync_calls else 0:.1f} "
+                f"sync_max_delta_us={sync_max_us}"
             )
-            print(
-                "  interval_sync_data_avg_us:"
-                f"{sync_total_us / sync_calls if sync_calls else 0:.1f}"
-            )
-        success = True
-        return 0
     finally:
         for process in processes:
             if process.poll() is None:
@@ -292,10 +300,10 @@ def main() -> int:
                 process.wait()
         for log in logs:
             log.close()
-        if success:
-            shutil.rmtree(workdir)
-        else:
-            print(f"profile logs preserved at {workdir}", file=sys.stderr)
+
+
+def counter_delta(initial: dict[str, str], final: dict[str, str], key: str) -> int:
+    return int(final.get(key, "0")) - int(initial.get(key, "0"))
 
 
 if __name__ == "__main__":
