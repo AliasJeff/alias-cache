@@ -24,6 +24,10 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 第一版建议支持：
 
 - 连接：`PING`、`ECHO`、`QUIT`、`AUTH`、`SELECT`、`HELLO`；
+- 只读配置探测：`CONFIG GET save|appendonly|*`；`save` 和 `appendonly` 分别
+  返回空字符串和 `no`，表示没有 Redis RDB/AOF 配置。alias-cache 的写入
+  持久化通过独立的 Raft WAL 完成，不表示 Redis AOF/RDB 文件兼容；所有
+  `CONFIG` 修改命令均拒绝，快照频率由 `--snapshot-policy` 控制；
 - 字符串：`GET`、`SET`、`DEL`、`EXISTS`、`MGET`、`MSET`、`INCRBY`；
 - Hash：`HSET`、`HMSET`、`HSETNX`、`HINCRBY`、`HDEL`、`HGET`、`HMGET`、
   `HGETALL`、`HKEYS`、`HVALS`、`HLEN`、`HEXISTS`；
@@ -38,8 +42,13 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - 可观测：`INFO [health|stats|server|replication|cluster]`；health/server/
   replication/cluster 取自单一 openraft metrics 快照；stats 为运行指标
   （连接计数与上限、内存用量与上限、raft 日志/快照文件字节大小、命令
-  计数），其中计数器为进程内原子量、文件大小按路径即时读取，不进复制
-  状态机；未知 section 返回空 body；RESP3 为 VerbatimString，RESP2 降级
+  计数、WAL append 批次大小、sync_data 次数及耗时），其中计数器为进程内
+  原子量、文件大小按路径即时读取，不进复制状态机；WAL 指标仅统计
+  `FileLogStore::append` 的成功追加批次和成功返回的 `sync_data` 调用，不包括
+  vote、日志重写/清理、目录同步或失败的 sync；平均批次大小为成功 append
+  entry 数除以成功非空 append 调用数，在线读取各原子计数器并非同一时刻的事务快照；
+  fsync 耗时是本机调用耗时而非跨节点提交延迟；未知 section 返回空
+  body；RESP3 为 VerbatimString，RESP2 降级
   bulk string（保留 `txt:` 格式标签）；`replication_lag_node_<id>` 仅在
   Leader 上报告（-1 表示未知）；
 - 健康检查四级：`INFO health` 输出 `alive`（进程可响应）、`raft_recovered`

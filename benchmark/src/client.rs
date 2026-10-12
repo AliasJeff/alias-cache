@@ -4,10 +4,16 @@
 //! encoded inline (no decoding on the write path) and responses are matched by
 //! completion order, which is RESP pipeline order.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
+use clap::ValueEnum;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{
+    TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
+use tokio::sync::mpsc;
 
 /// Fixed-size command slots: large enough for `SET key value` at the largest
 /// benchmarked value size.
@@ -19,6 +25,12 @@ pub enum Command {
     Set,
     Get,
     Ping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Mode {
+    Batch,
+    Pwrite,
 }
 
 impl Command {
@@ -114,6 +126,22 @@ pub struct WorkerStats {
     pub latencies: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SentRequest {
+    started: tokio::time::Instant,
+    sampled: bool,
+}
+
+fn record_latency(stats: &mut WorkerStats, request: SentRequest, completed: tokio::time::Instant) {
+    if request.sampled {
+        stats.latencies.push(
+            completed
+                .saturating_duration_since(request.started)
+                .as_micros() as u32,
+        );
+    }
+}
+
 /// Run `requests` pipeline-depth batches against one connection.
 ///
 /// `key_space` spreads keys across `0..key_space` so GET and SET hit the same
@@ -122,6 +150,7 @@ pub struct WorkerStats {
 pub struct WorkerConfig {
     pub address: String,
     pub command: Command,
+    pub mode: Mode,
     pub value_size: usize,
     pub pipeline_depth: usize,
     pub key_space: u64,
@@ -131,9 +160,17 @@ pub struct WorkerConfig {
 }
 
 pub async fn run_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Result<WorkerStats> {
+    match config.mode {
+        Mode::Batch => run_batch_worker(config, worker_id).await,
+        Mode::Pwrite => run_pwrite_worker(config, worker_id).await,
+    }
+}
+
+async fn run_batch_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Result<WorkerStats> {
     let WorkerConfig {
         address,
         command,
+        mode: _,
         value_size,
         pipeline_depth,
         key_space,
@@ -149,6 +186,8 @@ pub async fn run_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Res
     let mut read_buffer = vec![0_u8; READ_BUFFER];
     let value = vec![b'x'; *value_size];
     let mut sequence: u64 = worker_id as u64 * 1_000_003;
+    let mut request_index = 0_u64;
+    let mut pending = VecDeque::with_capacity(*pipeline_depth);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(*run_seconds);
     while tokio::time::Instant::now() < deadline {
@@ -158,14 +197,19 @@ pub async fn run_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Res
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
             let key = format!("benchmark-key-{}", sequence % key_space);
+            request_index = request_index.wrapping_add(1);
+            let started = tokio::time::Instant::now();
             match command {
                 Command::Set => encode(&[b"SET", key.as_bytes(), &value], &mut write_buffer),
                 Command::Get => encode(&[b"GET", key.as_bytes()], &mut write_buffer),
                 Command::Ping => encode(&[b"PING"], &mut write_buffer),
             }
+            pending.push_back(SentRequest {
+                started,
+                sampled: request_index.is_multiple_of(*sample_rate as u64),
+            });
         }
 
-        let started = tokio::time::Instant::now();
         tokio::time::timeout(*timeout, stream.write_all(&write_buffer)).await??;
         let expected = *pipeline_depth;
         let mut completed = 0;
@@ -183,6 +227,15 @@ pub async fn run_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Res
             let (replies, errors, consumed) = count_replies(&read_buffer[..filled]);
             completed += replies;
             stats.errors += errors as u64;
+            for _ in 0..replies {
+                let sent = pending.pop_front().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "received more replies than submitted requests",
+                    )
+                })?;
+                record_latency(&mut stats, sent, tokio::time::Instant::now());
+            }
             read_buffer.copy_within(consumed..filled, 0);
             tail_start = filled - consumed;
             if completed >= expected {
@@ -195,14 +248,175 @@ pub async fn run_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Res
                 ));
             }
         }
-        let elapsed = started.elapsed();
-
         stats.completed += completed as u64;
-        if *sample_rate == 1 || (stats.completed as usize).is_multiple_of(*sample_rate) {
-            stats.latencies.push(elapsed.as_micros() as u32);
-        }
     }
     Ok(stats)
+}
+
+#[derive(Debug)]
+struct RequestJob {
+    payload: Vec<u8>,
+    sent: SentRequest,
+}
+
+async fn run_pwrite_worker(
+    config: &WorkerConfig,
+    worker_id: usize,
+) -> std::io::Result<WorkerStats> {
+    let stream = TcpStream::connect(&config.address).await?;
+    stream.set_nodelay(true)?;
+    let (reader, writer) = stream.into_split();
+    let (request_tx, request_rx) = mpsc::channel(config.pipeline_depth);
+    let (sent_tx, sent_rx) = mpsc::channel(config.pipeline_depth);
+    let timeout = config.timeout;
+    let pipeline_depth = config.pipeline_depth;
+    let writer_task = tokio::spawn(stream_writer(
+        writer,
+        request_rx,
+        sent_tx,
+        timeout,
+        pipeline_depth,
+    ));
+    let reader_task = tokio::spawn(stream_reader(reader, sent_rx, timeout));
+
+    let value = vec![b'x'; config.value_size];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.run_seconds);
+    let mut sequence: u64 = worker_id as u64 * 1_000_003;
+    let mut request_index = 0_u64;
+    let producer_result = async {
+        while tokio::time::Instant::now() < deadline {
+            sequence = sequence
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            request_index = request_index.wrapping_add(1);
+            let key = format!("benchmark-key-{}", sequence % config.key_space);
+            let mut payload = Vec::with_capacity(WRITE_BUFFER);
+            match config.command {
+                Command::Set => encode(&[b"SET", key.as_bytes(), &value], &mut payload),
+                Command::Get => encode(&[b"GET", key.as_bytes()], &mut payload),
+                Command::Ping => encode(&[b"PING"], &mut payload),
+            }
+            let job = RequestJob {
+                payload,
+                sent: SentRequest {
+                    started: tokio::time::Instant::now(),
+                    sampled: request_index.is_multiple_of(config.sample_rate as u64),
+                },
+            };
+            tokio::time::timeout(timeout, request_tx.send(job))
+                .await
+                .map_err(std::io::Error::other)?
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "benchmark writer task stopped",
+                    )
+                })?;
+        }
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    drop(request_tx);
+
+    let writer_result = writer_task.await.map_err(std::io::Error::other)?;
+    let reader_result = reader_task.await.map_err(std::io::Error::other)?;
+    producer_result?;
+    writer_result?;
+    reader_result
+}
+
+async fn stream_writer(
+    mut writer: OwnedWriteHalf,
+    mut requests: mpsc::Receiver<RequestJob>,
+    sent: mpsc::Sender<SentRequest>,
+    timeout: Duration,
+    max_batch_requests: usize,
+) -> std::io::Result<()> {
+    let mut carry = None;
+    loop {
+        let first = match carry.take() {
+            Some(job) => Some(job),
+            None => requests.recv().await,
+        };
+        let Some(first) = first else { break };
+        let mut batch = vec![first];
+        let mut batch_bytes = batch[0].payload.len();
+        tokio::task::yield_now().await;
+        while batch.len() < max_batch_requests {
+            match requests.try_recv() {
+                Ok(job) if batch_bytes.saturating_add(job.payload.len()) <= WRITE_BUFFER => {
+                    batch_bytes += job.payload.len();
+                    batch.push(job);
+                }
+                Ok(job) => {
+                    carry = Some(job);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut write_buffer = Vec::with_capacity(batch_bytes);
+        for job in &batch {
+            write_buffer.extend_from_slice(&job.payload);
+        }
+        tokio::time::timeout(timeout, writer.write_all(&write_buffer)).await??;
+        for job in batch {
+            sent.send(job.sent).await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "benchmark response reader stopped",
+                )
+            })?;
+        }
+    }
+    writer.shutdown().await
+}
+
+async fn stream_reader(
+    mut reader: OwnedReadHalf,
+    mut sent: mpsc::Receiver<SentRequest>,
+    timeout: Duration,
+) -> std::io::Result<WorkerStats> {
+    let mut stats = WorkerStats::default();
+    let mut read_buffer = vec![0_u8; READ_BUFFER];
+    let mut tail_start = 0;
+    loop {
+        let read =
+            tokio::time::timeout(timeout, reader.read(&mut read_buffer[tail_start..])).await??;
+        if read == 0 {
+            if sent.recv().await.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "server closed with outstanding benchmark requests",
+                ));
+            }
+            return Ok(stats);
+        }
+        let filled = tail_start + read;
+        let (replies, errors, consumed) = count_replies(&read_buffer[..filled]);
+        stats.errors += errors as u64;
+        stats.completed += replies as u64;
+        for _ in 0..replies {
+            let request = tokio::time::timeout(timeout, sent.recv())
+                .await?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "received a reply without a submitted request",
+                    )
+                })?;
+            record_latency(&mut stats, request, tokio::time::Instant::now());
+        }
+        read_buffer.copy_within(consumed..filled, 0);
+        tail_start = filled - consumed;
+        if tail_start == read_buffer.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reply buffer exhausted before a complete RESP frame",
+            ));
+        }
+    }
 }
 
 /// Aggregate latencies across workers into percentile micros.
@@ -221,6 +435,7 @@ pub fn percentiles(latencies: &[u32], quantiles: &[f64]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[test]
     fn counts_flat_replies_and_keeps_partial_tail() {
@@ -241,5 +456,62 @@ mod tests {
         let mut output = Vec::new();
         encode(&[b"GET", b"key"], &mut output);
         assert_eq!(output, b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
+    }
+
+    #[tokio::test]
+    async fn streaming_pipeline_pairs_fifo_responses_with_request_timestamps() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut requests = Vec::new();
+            stream.read_to_end(&mut requests).await.unwrap();
+            let command = b"*1\r\n$4\r\nPING\r\n";
+            let count = requests
+                .windows(command.len())
+                .filter(|window| *window == command)
+                .count();
+            let mut replies = Vec::new();
+            for _ in 0..count {
+                replies.extend_from_slice(b"+PONG\r\n");
+            }
+            stream.write_all(&replies).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (sent_tx, sent_rx) = mpsc::channel(4);
+        let writer_task = tokio::spawn(stream_writer(
+            writer,
+            request_rx,
+            sent_tx,
+            Duration::from_secs(1),
+            4,
+        ));
+        for delay_ms in [90, 50, 10] {
+            request_tx
+                .send(RequestJob {
+                    payload: b"*1\r\n$4\r\nPING\r\n".to_vec(),
+                    sent: SentRequest {
+                        started: tokio::time::Instant::now() - Duration::from_millis(delay_ms),
+                        sampled: true,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        drop(request_tx);
+
+        writer_task.await.unwrap().unwrap();
+        let stats = stream_reader(reader, sent_rx, Duration::from_secs(1))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(stats.completed, 3);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.latencies.len(), 3);
+        assert!(stats.latencies[0] > stats.latencies[1]);
+        assert!(stats.latencies[1] > stats.latencies[2]);
     }
 }

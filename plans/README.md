@@ -29,8 +29,8 @@
 14. [Bitmap、Bloom Filter 与 Stream](14-bitmap-bf-stream.md)
 15. [Lua 脚本（EVAL / EVALSHA / SCRIPT）](15-lua-scripting.md)
 
-13-15 为第二轮扩展：13 优先（复刻 cache-cat 的批量提交架构，兑现
-"强一致 + 高写吞吐"主张，并引入 redis-benchmark 交叉验证）；随后按
+13-15 为第二轮扩展：13 的批量提交架构与 redis-benchmark 兼容检查已实现，
+但高吞吐目标未达成，当前应先补齐性能剖析与尾延迟治理；随后按
 风险递增做 14（Bitmap → BF → Stream 非阻塞骨干）；15 收尾（leader
 执行/结果复制模型 + mlua 沙箱，消除 cache-cat 的 unsafe 桥接）。
 

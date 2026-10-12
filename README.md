@@ -102,8 +102,8 @@ redis-cli -p 6379 GET hello
 
 ## 当前状态
 
-已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 148 个测试、
-CLI 9 个、benchmark 2 个测试全部通过）：
+已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 158 个测试、
+CLI 9 个、benchmark 3 个测试全部通过）：
 
 - RESP2/RESP3：`HELLO 2/3` 协商、Pipeline、MULTI/EXEC/DISCARD 事务
 - 安全：`--password`/`ALIAS_CACHE_PASSWORD` 密码认证（AUTH/HELLO AUTH）、
@@ -118,9 +118,11 @@ CLI 9 个、benchmark 2 个测试全部通过）：
 - 分块快照传输、快照安装/持久化、落后节点追赶、重启恢复
 - 复制逻辑时钟 TTL：跨节点重放、故障切换、重启后语义一致
 - 可观测：`INFO server|replication|cluster`（term/leader/commit/复制滞后/membership）
+- WAL profiling：`INFO stats` 报告 append 批次与本机 sync_data 次数/耗时
 - 只读 Sentinel 风格主节点发现
 - CLI 配置化（单节点/集群拓扑/种子引导）、Dockerfile + docker-compose 三节点编排
-- 自带 `alias-cache-benchmark` 压测工具与基线数据（见 plans/12）
+- 有界 Raft 批量写入口、RESP pipeline 连续写批处理、流式 pwrite 压测模式
+- 自带 `alias-cache-benchmark` 压测工具与基线数据（见 plans/12、plans/13）
 
 可重复的三节点故障切换与恢复 smoke test：
 
@@ -133,6 +135,17 @@ Leader，验证新 Leader 继续写入，再重启原节点并验证其追赶已
 需要 Python 3；脚本只使用标准库，不依赖 Redis 客户端。
 CI 还会通过 `python3 scripts/smoke_compose.py` 对 Docker Compose 部署执行相同的
 Leader 故障切换和重启恢复检查。
+
+复现三节点写入批次/fsync profiling：
+
+```bash
+cargo build --release --locked
+python3 scripts/profile_batch_writes.py --clients 8 --pipeline 16 --duration 5
+```
+
+脚本会创建临时三节点集群，输出 benchmark 结果和每个节点 `INFO stats` 的
+WAL append 批次、`sync_data` 次数及本机耗时差值。
+指标口径及不包含的存储路径见[兼容性与故障模型](docs/compatibility-and-failure-model.md)。
 
 Docker Compose 启动三个容器后，宿主机可分别通过 `127.0.0.1:6379`、
 `6380`、`6381` 连接各节点；任一入口都可在其他节点故障后继续使用：
@@ -159,11 +172,14 @@ PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s
 的可解释代价，两者保证不同层级（Redis 副本为异步复制，failover 有丢失
 窗口）。测试与发布：SET 全选项兼容矩阵、EXPIRE/PEXPIRE 协议边界测试、三处存储
 格式的版本拒绝门禁与迁移策略文档（docs/storage-format-migration.md）、
-CHANGELOG、依赖 SPDX 许可证白名单门禁。下一步路线（plans/13-15）：13 批量写管线（复刻 cache-cat 的
-client_write_many + 流式管线客户端，目标三节点多数派写 ≥2 万 ops/s，
-并以 redis-benchmark 交叉验证）→ 14 Bitmap/Bloom Filter/Stream →
-15 Lua 脚本（leader 执行/结果复制模型）。当前 2,352 ops/s 的三节点
-SET 为对照基线。
+CHANGELOG、依赖 SPDX 许可证白名单门禁。
+
+计划 13 的批量写入口、RESP pipeline 批处理和 pwrite 压测模式已实现，
+`redis-benchmark -t set,get -P 16` 也已完成三节点交叉验证；但多数派写吞吐
+目标 ≥20,000 ops/s 尚未达到。当前测得最高约 10,563 ops/s（16 客户端 ×
+pipeline 512），p99 约 2.68 秒并出现 15 个请求错误，不能视为可用性能达标。
+完整测量与限制见 plans/13。后续路线：先继续解决批量写的吞吐和尾延迟，再做
+14 Bitmap/Bloom Filter/Stream，最后做 15 Lua 脚本（leader 执行/结果复制）。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
 `--tls-key-file` 即可启用客户端 TLS listener；额外指定

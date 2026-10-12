@@ -159,8 +159,8 @@ in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 
 ### 写吞吐调优计划与判据（2026-10-11；已立项为 plans/13）
 
 > 2026-10 更新：本节实验已立项为 [plans/13](13-batch-write-pipeline.md)
-> （批量写管线与性能主张），合并粒度与 follower fsync 两项实验随该计划
-> 的批量入口实现一并闭环；redis-benchmark 交叉验证亦在该计划步骤 4。
+> （批量写管线与性能主张）。批量入口和 Redis 基准兼容检查已落地，但
+> 20k ops/s 目标未达成；合并粒度 profiling 与 follower fsync 诊断仍待完成。
 
 当前对照基线：三节点 SET 2,352 ops/s（p50 53ms），每批一次三节点 fsync
 往返为已确认瓶颈（延迟符合 in-flight/吞吐 的 Little's law 排队模型）。
@@ -169,16 +169,26 @@ in-flight/吞吐 的排队模型）；进一步方向是 openraft 批量 append 
 
 1. openraft 批量 append 合并粒度：在 benchmark 中固定 in-flight 总量
    （8 连接 × pipeline 深度 1/16/64），统计每批实际合并的 entry 数与
-   fsync 次数/秒；判据为"pipeline 深度提升时 fsync 次数是否随之摊薄"，
+   fsync 次数/秒；可用每个节点 `INFO stats` 的
+   `raft_log_append_calls`、`raft_log_appended_entries`、
+   `raft_log_append_batch_entries_avg/max` 和 `raft_log_sync_data_calls`，
+   按压测前后差值计算；判据为"pipeline 深度提升时 fsync 次数是否随之摊薄"，
    若合并不足（每批 entry 数 ≈ 连接数而非 pipeline 深度），则需评估
    openraft 的 client_write 合并行为或服务端提交队列。
-2. follower 端 fsync 策略：测量 leader 与 follower 各自 fsync 在一次
-   提交延迟中的占比（INFO stats 的 raft_log_bytes 增速 + 延迟分布），
-   评估 follower 侧 `sync_data` 频率放松对安全性的影响（openraft 契约
-   仍要求回调前落盘，放松空间有限，预期收益主要在 leader）。
+2. follower 端 fsync 诊断：测量 leader 与 follower 各自 fsync 在一次
+   提交延迟中的占比（使用本机 sync 耗时指标，而非只看文件字节增速）。
+   `INFO stats` 暴露本地 `sync_data` 调用次数及平均/累计/最大耗时；需要分别
+   连接每个节点采样。该指标只反映本地 WAL sync，不含网络等待和 quorum 延迟。
+   在 openraft 要求回调前持久化的约束下，任何策略变更须先证明安全性，
+   不能为吞吐放松已提交数据的持久化语义。
 3. 生产 snapshot policy 实测：以 `--snapshot-policy` 64/256/1024 三档
    分别跑 60s 写入，对比快照期间吞吐跌幅与日志重放恢复时间，选定
    默认值的依据记录回本节。
+
+2026-10-13 已新增 `scripts/profile_batch_writes.py` 与 `INFO stats` WAL 指标，
+并在计划 13 记录一次三节点 profiling 样本。原计划的 1/16/64 pipeline 多轮
+对照、snapshot policy 新一轮快照期间测量仍未完成；本次数据仅打通诊断手段，
+不应视为关闭全部调优实验。
 
 ### 与 Redis 的同机对比基线（2026-10-11）
 

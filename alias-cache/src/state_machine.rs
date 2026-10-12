@@ -23,46 +23,58 @@ const OVERFLOW: &str = "ERR increment or decrement would overflow";
 /// a read observe a stale value, and a read command listed here would only
 /// lose concurrency, never correctness.
 pub fn is_replicated_write(command: &[u8]) -> bool {
-    !READS.contains(&command) && WRITES.contains(&command)
+    WRITES
+        .iter()
+        .any(|candidate| command.eq_ignore_ascii_case(candidate))
 }
 
-/// Replicated read commands, mirroring the read arms of
-/// `prepare_request_inner` one-to-one.
-const READS: &[&[u8]] = &[
-    b"SCAN",
-    b"HSCAN",
-    b"SSCAN",
-    b"ZSCAN",
-    b"GET",
-    b"EXISTS",
-    b"MGET",
-    b"TYPE",
-    b"DBSIZE",
-    b"TTL",
-    b"PTTL",
-    b"HGET",
-    b"HMGET",
-    b"HGETALL",
-    b"HKEYS",
-    b"HVALS",
-    b"HLEN",
-    b"HEXISTS",
-    b"LINDEX",
-    b"LRANGE",
-    b"LLEN",
-    b"SMEMBERS",
-    b"SISMEMBER",
-    b"SCARD",
-    b"SDIFF",
-    b"SINTER",
-    b"SUNION",
-    b"ZSCORE",
-    b"ZCARD",
-    b"ZRANGE",
-    b"ZREVRANGE",
-    b"ZRANK",
-    b"ZREVRANK",
-];
+/// Whether a write is safe to combine into a bounded batch RPC.
+///
+/// SET GET and list pops may return values that are much larger than their
+/// request. They stay on the single-request path so one batch cannot exceed
+/// the bounded Raft response frame because of stored data.
+pub fn is_batchable_write(command: &[u8], _request: &Request) -> bool {
+    if !is_replicated_write(command) {
+        return false;
+    }
+    if command.eq_ignore_ascii_case(b"LPOP") || command.eq_ignore_ascii_case(b"RPOP") {
+        return false;
+    }
+    if command.eq_ignore_ascii_case(b"SET") && request_has_set_get_option(_request) {
+        return false;
+    }
+    true
+}
+
+fn request_has_set_get_option(request: &Request) -> bool {
+    let Request::Command(arguments) = request;
+    arguments
+        .iter()
+        .skip(3)
+        .any(|argument| argument.eq_ignore_ascii_case(b"GET"))
+}
+
+pub fn batch_request_has_unique_keys(command: &[u8], request: &Request) -> bool {
+    if !command.eq_ignore_ascii_case(b"DEL") {
+        return true;
+    }
+    let Request::Command(arguments) = request;
+    let mut keys = BTreeSet::new();
+    !arguments
+        .iter()
+        .skip(1)
+        .any(|key| !keys.insert(key.as_ref()))
+}
+
+pub fn batchable_write_has_bounded_response(command: &[u8], request: &Request) -> bool {
+    if !is_batchable_write(command, request) {
+        return false;
+    }
+    if !batch_request_has_unique_keys(command, request) {
+        return false;
+    }
+    true
+}
 
 /// Replicated write commands, mirroring the write arms of
 /// `prepare_request_inner` one-to-one.
@@ -205,12 +217,23 @@ pub enum Operation {
         /// transaction (replying Null) when any key's live version differs.
         watch_expectations: Vec<(Bytes, Option<u64>)>,
     },
+    ClientBatch {
+        request_id: ClientRequestId,
+        request: Request,
+        write_time: u64,
+        /// Captured from the leader so every replica applies the same OOM
+        /// admission decision even if local runtime configuration differs.
+        /// Each entry is evaluated against the state at its actual log position.
+        max_memory: Option<u64>,
+        max_batch_memory: u64,
+    },
 }
 
 impl Operation {
     pub fn write_time(&self) -> u64 {
         match self {
             Self::Client { operation, .. } => operation.write_time(),
+            Self::ClientBatch { write_time, .. } => *write_time,
             Self::SetWithExpiration { write_time, .. }
             | Self::Expire { write_time, .. }
             | Self::ExpireSeconds { write_time, .. }
@@ -243,6 +266,7 @@ impl Operation {
         match self {
             Self::Delete { keys } => keys,
             Self::Client { .. }
+            | Self::ClientBatch { .. }
             | Self::Set { .. }
             | Self::SetWithExpiration { .. }
             | Self::MultiSet { .. }
@@ -303,6 +327,7 @@ pub struct StateMachine {
 fn incoming_bytes(operation: &Operation) -> u64 {
     match operation {
         Operation::Client { operation, .. } => incoming_bytes(operation),
+        Operation::ClientBatch { .. } => 0,
         Operation::Transaction { operations, .. } => operations.iter().map(incoming_bytes).sum(),
         Operation::Set { key, value } | Operation::SetWithExpiration { key, value, .. } => {
             (key.len() + value.len()) as u64
@@ -342,6 +367,15 @@ fn incoming_bytes(operation: &Operation) -> u64 {
         Operation::SortedSetIncrement { key, member, .. } => (key.len() + member.len()) as u64,
         _ => 0,
     }
+}
+
+fn request_memory_bytes(request: &Request) -> u64 {
+    let Request::Command(arguments) = request;
+    arguments
+        .iter()
+        .skip(1)
+        .map(|argument| argument.len() as u64)
+        .sum()
 }
 
 /// Approximate payload size of one live entry, excluding tree overhead.
@@ -386,6 +420,7 @@ impl StateMachine {
     pub fn apply(&mut self, operation: Operation) -> ApplyResult {
         let write_time = match &operation {
             Operation::Client { operation, .. } => Some(operation.write_time()),
+            Operation::ClientBatch { write_time, .. } => Some(*write_time),
             Operation::SetWithExpiration { write_time, .. }
             | Operation::Expire { write_time, .. }
             | Operation::ExpireSeconds { write_time, .. }
@@ -425,16 +460,47 @@ impl StateMachine {
                 }
                 let result = self.apply(*operation);
                 if let ApplyResult::Response(response) = &result {
-                    self.client_results.insert(request_id, response.clone());
-                    while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
-                        let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id)
-                        else {
-                            break;
-                        };
-                        self.client_results.remove(&oldest);
-                    }
+                    self.cache_client_response(request_id, response.clone());
                 }
                 result
+            }
+            Operation::ClientBatch {
+                request_id,
+                request,
+                max_memory,
+                max_batch_memory,
+                ..
+            } => {
+                if let Some(cached) = self.client_results.get(&request_id) {
+                    return ApplyResult::Response(cached.clone());
+                }
+                if request_memory_bytes(&request) > max_batch_memory {
+                    let response =
+                        Frame::error("ERR client batch command exceeds the memory admission limit");
+                    self.cache_client_response(request_id, response.clone());
+                    return ApplyResult::Response(response);
+                }
+                let response = match self.prepare_request_inner(request) {
+                    Ok((Some(operation), _)) => {
+                        if max_memory.is_some_and(|limit| {
+                            self.check_memory_with_limit(&operation, Some(limit))
+                                .is_err()
+                        }) {
+                            Frame::error(
+                                "ERR protocol error: OOM command not allowed when used memory > 'maxmemory'",
+                            )
+                        } else {
+                            match self.apply(operation) {
+                                ApplyResult::Response(response) => response,
+                                ApplyResult::NoResponse => Frame::Null,
+                            }
+                        }
+                    }
+                    Ok((None, response)) => response,
+                    Err(error) => Frame::error(format!("ERR {error}")),
+                };
+                self.cache_client_response(request_id, response.clone());
+                ApplyResult::Response(response)
             }
             Operation::Set { key, value } => {
                 self.bump_version(&key.clone());
@@ -1158,6 +1224,120 @@ impl StateMachine {
         Ok((operation, response))
     }
 
+    fn prepare_batch_item(
+        &mut self,
+        request_id: ClientRequestId,
+        request: Request,
+        write_time: u64,
+        max_memory: Option<u64>,
+        max_batch_memory: u64,
+    ) -> (Operation, Frame) {
+        if let Some(response) = self.client_results.get(&request_id) {
+            return (
+                Operation::ClientBatch {
+                    request_id,
+                    request,
+                    write_time,
+                    max_memory,
+                    max_batch_memory,
+                },
+                response.clone(),
+            );
+        }
+
+        self.advance_logical_time(write_time);
+        let (operation, response) = if request_memory_bytes(&request) > max_batch_memory {
+            (
+                None,
+                Frame::error("ERR client batch command exceeds the memory admission limit"),
+            )
+        } else {
+            match self.prepare_request_inner(request.clone()) {
+                Ok(result) => result,
+                Err(error) => (None, Frame::error(format!("ERR {error}"))),
+            }
+        };
+        let response = if let Some(operation) = operation {
+            if max_memory.is_some_and(|limit| {
+                self.check_memory_with_limit(&operation, Some(limit))
+                    .is_err()
+            }) {
+                Frame::error(
+                    "ERR protocol error: OOM command not allowed when used memory > 'maxmemory'",
+                )
+            } else {
+                match self.apply(operation) {
+                    ApplyResult::Response(response) => response,
+                    ApplyResult::NoResponse => Frame::Null,
+                }
+            }
+        } else {
+            response
+        };
+        self.cache_client_response(request_id, response.clone());
+        (
+            Operation::ClientBatch {
+                request_id,
+                request,
+                write_time,
+                max_memory,
+                max_batch_memory,
+            },
+            response,
+        )
+    }
+
+    /// Prepare a sequence of independent pipeline writes against one staged
+    /// state-machine snapshot. The resulting commands execute in Raft apply
+    /// order, so interleaved clients cannot invalidate prepared responses.
+    pub fn prepare_client_batch_with_ids(
+        &self,
+        request_ids: &[ClientRequestId],
+        requests: &[Request],
+        write_time: u64,
+    ) -> Result<(Vec<Operation>, Vec<Frame>)> {
+        self.prepare_client_batch_with_limits(
+            request_ids,
+            requests,
+            write_time,
+            self.max_memory,
+            1 + 1_024 * 4_096,
+        )
+    }
+
+    pub fn prepare_client_batch_with_limits(
+        &self,
+        request_ids: &[ClientRequestId],
+        requests: &[Request],
+        write_time: u64,
+        max_memory: Option<u64>,
+        max_batch_memory: u64,
+    ) -> Result<(Vec<Operation>, Vec<Frame>)> {
+        if request_ids.len() != requests.len() {
+            return Err(Error::server(
+                "client batch request IDs and requests have different lengths",
+            ));
+        }
+
+        let mut staged = self.clone();
+        let mut operations = Vec::with_capacity(requests.len());
+        let mut responses = Vec::with_capacity(requests.len());
+
+        for (request_id, request) in request_ids.iter().copied().zip(requests.iter()) {
+            let (operation, response) = staged.prepare_batch_item(
+                request_id,
+                request.clone(),
+                write_time,
+                max_memory,
+                max_batch_memory,
+            );
+            operations.push(operation);
+            responses.push(response);
+        }
+
+        Ok((operations, responses))
+    }
+
     fn prepare_request_inner(&self, request: Request) -> Result<(Option<Operation>, Frame)> {
         let Request::Command(arguments) = request;
         let command = arguments
@@ -1422,6 +1602,16 @@ impl StateMachine {
             .collect()
     }
 
+    fn cache_client_response(&mut self, request_id: ClientRequestId, response: Frame) {
+        self.client_results.insert(request_id, response);
+        while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
+            let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id) else {
+                break;
+            };
+            self.client_results.remove(&oldest);
+        }
+    }
+
     fn bump_version(&mut self, key: &Bytes) {
         *self.versions.entry(key.clone()).or_insert(0) += 1;
     }
@@ -1452,6 +1642,10 @@ impl StateMachine {
         self.max_memory = max_memory;
     }
 
+    pub fn max_memory_limit(&self) -> Option<u64> {
+        self.max_memory
+    }
+
     /// Recompute the memory counter from live data (used after recovery).
     pub fn recompute_memory(&mut self) {
         self.memory_bytes = self
@@ -1474,11 +1668,19 @@ impl StateMachine {
     /// gate may refuse a write slightly early but never admits one that
     /// overshoots. Reads and deletions always pass.
     fn check_memory(&self, operation: &Operation) -> Result<()> {
-        let Some(max) = self.max_memory else {
+        self.check_memory_with_limit(operation, self.max_memory)
+    }
+
+    fn check_memory_with_limit(
+        &self,
+        operation: &Operation,
+        max_memory: Option<u64>,
+    ) -> Result<()> {
+        let Some(max_memory) = max_memory else {
             return Ok(());
         };
         let incoming = incoming_bytes(operation);
-        if self.memory_bytes.saturating_add(incoming) > max {
+        if self.memory_bytes.saturating_add(incoming) > max_memory {
             return Err(Error::protocol(
                 "OOM command not allowed when used memory > 'maxmemory'",
             ));
@@ -4699,22 +4901,280 @@ mod tests {
     }
 
     #[test]
-    fn operations_round_trip_through_serialization() {
-        let operation = Operation::MultiSet {
-            pairs: vec![
-                (Bytes::from_static(b"a"), Bytes::from_static(b"one")),
-                (Bytes::from_static(b"b"), Bytes::from_static(b"two")),
-            ],
-        };
-        let encoded = bincode::serialize(&operation).unwrap();
-        let decoded: Operation = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(decoded, operation);
+    fn client_batch_preserves_order_errors_and_retry_responses() {
+        let state = StateMachine::default();
+        let ids = [1, 2, 3, 4, 5];
+        let requests = [
+            command(&[b"SET", b"counter", b"10"]),
+            command(&[b"INCRBY", b"counter", b"2"]),
+            command(&[b"INCRBY", b"counter", b"invalid"]),
+            command(&[b"INCRBY", b"counter", b"3"]),
+            command(&[b"SET", b"counter", b"ignored", b"NX"]),
+        ];
+        let before = state.clone();
+        let (operations, responses) = state
+            .prepare_client_batch_with_ids(&ids, &requests, 1_000)
+            .unwrap();
 
-        let mut first = StateMachine::default();
-        let mut second = StateMachine::default();
-        first.apply(operation.clone());
-        second.apply(decoded);
-        assert_eq!(first, second);
+        assert_eq!(
+            state, before,
+            "batch preparation must not mutate live state"
+        );
+        assert_eq!(
+            responses,
+            vec![
+                Frame::simple_string("OK"),
+                Frame::Integer(12),
+                Frame::error("ERR protocol error: value is not an integer or out of range"),
+                Frame::Integer(15),
+                Frame::Null,
+            ]
+        );
+
+        let mut replayed = StateMachine::default();
+        let applied: Vec<_> = operations
+            .iter()
+            .cloned()
+            .map(|operation| match replayed.apply(operation) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("client batch item must have a response"),
+            })
+            .collect();
+        assert_eq!(applied, responses);
+        assert_eq!(
+            replayed
+                .prepare_request(command(&[b"GET", b"counter"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("15")
+        );
+
+        let changed_requests = [
+            command(&[b"SET", b"counter", b"changed"]),
+            command(&[b"INCRBY", b"counter", b"100"]),
+            command(&[b"INCRBY", b"counter", b"1"]),
+            command(&[b"INCRBY", b"counter", b"100"]),
+            command(&[b"SET", b"counter", b"changed", b"NX"]),
+        ];
+        let (retry_operations, retry_responses) = replayed
+            .prepare_client_batch_with_ids(&ids, &changed_requests, 2_000)
+            .unwrap();
+        assert_eq!(retry_responses, responses);
+        let retried: Vec<_> = retry_operations
+            .into_iter()
+            .map(|operation| match replayed.apply(operation) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("client batch retry must have a response"),
+            })
+            .collect();
+        assert_eq!(retried, responses);
+        assert_eq!(
+            replayed
+                .prepare_request(command(&[b"GET", b"counter"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("15")
+        );
+    }
+
+    #[test]
+    fn client_batch_preserves_set_get_previous_value() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[b"SET", b"key", b"before"]))
+            .unwrap();
+        let (operations, expected) = state
+            .prepare_client_batch_with_ids(
+                &[71],
+                &[command(&[b"SET", b"key", b"after", b"GET"])],
+                2_000,
+            )
+            .unwrap();
+        let actual: Vec<_> = operations
+            .into_iter()
+            .map(|operation| match state.apply(operation) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("SET GET batch item must respond"),
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![Frame::bulk_string("before")]);
+    }
+
+    #[test]
+    fn client_batch_evaluates_commands_at_their_actual_log_position() {
+        let state = StateMachine::default();
+        let (operations, staged_responses) = state
+            .prepare_client_batch_with_ids(
+                &[21, 22],
+                &[
+                    command(&[b"SET", b"counter", b"one", b"NX"]),
+                    command(&[b"INCRBY", b"counter", b"1"]),
+                ],
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(
+            staged_responses,
+            vec![
+                Frame::simple_string("OK"),
+                Frame::error("ERR protocol error: value is not an integer or out of range"),
+            ]
+        );
+
+        let (external_operation, _) = state
+            .prepare_request_at_with_id(command(&[b"SET", b"counter", b"5"]), 1_000, None)
+            .unwrap();
+        let mut replayed = StateMachine::default();
+        replayed.apply(external_operation.expect("external SET must be logged"));
+
+        let responses: Vec<_> = operations
+            .iter()
+            .cloned()
+            .map(|operation| match replayed.apply(operation) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("client batch item must have a response"),
+            })
+            .collect();
+        assert_eq!(responses, vec![Frame::Null, Frame::Integer(6)]);
+        assert_eq!(
+            replayed
+                .prepare_request(command(&[b"GET", b"counter"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("6")
+        );
+
+        for operation in &operations {
+            assert!(matches!(
+                replayed.apply(operation.clone()),
+                ApplyResult::Response(_)
+            ));
+        }
+        assert_eq!(
+            replayed
+                .prepare_request(command(&[b"GET", b"counter"]))
+                .unwrap()
+                .1,
+            Frame::bulk_string("6")
+        );
+    }
+
+    #[test]
+    fn client_batch_oom_rejection_does_not_consume_later_capacity() {
+        let mut leader = StateMachine::default();
+        leader.set_max_memory(Some(4));
+        let (operations, responses) = leader
+            .prepare_client_batch_with_ids(
+                &[10, 11, 12],
+                &[
+                    command(&[b"SET", b"a", b"x"]),
+                    command(&[b"SET", b"b", b"y"]),
+                    command(&[b"SET", b"c", b"z"]),
+                ],
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![
+                Frame::simple_string("OK"),
+                Frame::simple_string("OK"),
+                Frame::error(
+                    "ERR protocol error: OOM command not allowed when used memory > 'maxmemory'"
+                ),
+            ]
+        );
+
+        // The applied entry carries the leader's limit, not the follower's
+        // local setting, so all replicas make the same admission decision.
+        let mut state = StateMachine::default();
+        state.set_max_memory(None);
+        for operation in operations {
+            let _ = state.apply(operation);
+        }
+        assert_eq!(state.memory_usage(), 4);
+        assert_eq!(state.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn client_batch_uses_captured_admission_limits_on_each_replica() {
+        let mut leader = StateMachine::default();
+        leader.set_max_memory(Some(4));
+        let requests = [
+            command(&[b"SET", b"a", b"x"]),
+            command(&[b"SET", b"b", b"y"]),
+            command(&[b"SET", b"c", b"z"]),
+        ];
+        let (operations, leader_responses) = leader
+            .prepare_client_batch_with_limits(&[31, 32, 33], &requests, 1_000, Some(4), 1_024)
+            .unwrap();
+
+        let mut follower = StateMachine::default();
+        follower.set_max_memory(None);
+        let follower_responses: Vec<_> = operations
+            .into_iter()
+            .map(|operation| match follower.apply(operation) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("batch item must produce a response"),
+            })
+            .collect();
+        assert_eq!(follower_responses, leader_responses);
+        assert_eq!(follower.memory_usage(), 4);
+    }
+
+    #[test]
+    fn client_batch_rejects_oversized_command_deterministically() {
+        let oversized = command(&[b"SET", b"key", &vec![b'x'; 1_025]]);
+        let requests = [oversized];
+        let (operations, responses) = StateMachine::default()
+            .prepare_client_batch_with_limits(&[41], &requests, 1_000, None, 1_024)
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![Frame::error(
+                "ERR client batch command exceeds the memory admission limit"
+            )]
+        );
+        let mut replayed = StateMachine::default();
+        assert_eq!(
+            replayed.apply(operations.into_iter().next().unwrap()),
+            ApplyResult::Response(Frame::error(
+                "ERR client batch command exceeds the memory admission limit"
+            ))
+        );
+        assert_eq!(replayed.memory_usage(), 0);
+    }
+
+    #[test]
+    fn operations_round_trip_through_serialization() {
+        let operations = [
+            Operation::MultiSet {
+                pairs: vec![
+                    (Bytes::from_static(b"a"), Bytes::from_static(b"one")),
+                    (Bytes::from_static(b"b"), Bytes::from_static(b"two")),
+                ],
+            },
+            Operation::ClientBatch {
+                request_id: 42,
+                request: command(&[b"SET", b"c", b"three"]),
+                write_time: 1_000,
+                max_memory: Some(256),
+                max_batch_memory: 1 + 1_024 * 4_096,
+            },
+        ];
+
+        for operation in operations {
+            let encoded = bincode::serialize(&operation).unwrap();
+            let decoded: Operation = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded, operation);
+
+            let mut first = StateMachine::default();
+            let mut second = StateMachine::default();
+            first.apply(operation.clone());
+            second.apply(decoded);
+            assert_eq!(first, second);
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use crate::client::{Command, WorkerStats};
+use crate::client::{Command, Mode, WorkerStats};
 
 /// Load generator for RESP2-compatible cache servers.
 #[derive(Debug, Parser)]
@@ -30,6 +30,10 @@ struct Args {
     /// Commands batched into one write per client.
     #[arg(long, default_value_t = 1)]
     pipeline: usize,
+
+    /// Request flow: wait for each batch or stream continuously.
+    #[arg(long, value_enum, default_value = "batch")]
+    mode: Mode,
 
     /// Benchmark duration in seconds.
     #[arg(long, default_value_t = 10)]
@@ -57,13 +61,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let command = Command::parse(&args.command)
         .ok_or_else(|| format!("unknown command '{}'; use set, get, or ping", args.command))?;
-    if args.clients == 0 || args.pipeline == 0 || args.time == 0 {
-        return Err("clients, pipeline, and time must be greater than zero".into());
+    if args.clients == 0
+        || args.pipeline == 0
+        || args.pipeline > 1_024
+        || args.time == 0
+        || args.key_space == 0
+        || args.sample_rate == 0
+    {
+        return Err(
+            "clients, time, key-space, and sample-rate must be positive; pipeline must be 1..=1024"
+                .into(),
+        );
     }
 
     println!(
-        "benchmark: command={} clients={} pipeline={} value_size={} key_space={} duration={}s target={}",
+        "benchmark: command={} mode={:?} clients={} pipeline={} value_size={} key_space={} duration={}s target={}",
         args.command,
+        args.mode,
         args.clients,
         args.pipeline,
         args.value_size,
@@ -72,10 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.address
     );
 
+    let benchmark_started = std::time::Instant::now();
     let mut handles = Vec::with_capacity(args.clients);
     let config = std::sync::Arc::new(client::WorkerConfig {
         address: args.address.clone(),
         command,
+        mode: args.mode,
         value_size: args.value_size,
         pipeline_depth: args.pipeline,
         key_space: args.key_space,
@@ -99,7 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let percentiles = client::percentiles(&totals.latencies, &[0.50, 0.95, 0.99, 1.0]);
-    let seconds = args.time as f64;
+    let elapsed = benchmark_started.elapsed();
+    let seconds = elapsed.as_secs_f64();
+    println!("elapsed: {:.3}s", seconds);
     println!("throughput: {:.0} ops/s", totals.completed as f64 / seconds);
     println!(
         "latency us: p50={} p95={} p99={} max={}",

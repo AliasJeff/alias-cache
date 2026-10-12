@@ -13,7 +13,7 @@ use bytes::Bytes;
 use openraft::rt::WatchReceiver;
 
 use crate::protocol::{Frame, Request};
-use crate::raft::{NodeId, RaftHandle};
+use crate::raft::{LogStoreMetrics, NodeId, RaftHandle};
 
 /// Runtime counters and file locations backing the `INFO stats` section.
 #[derive(Clone, Debug)]
@@ -28,6 +28,8 @@ pub struct StatsContext {
     pub data_dir: PathBuf,
     /// Total client commands handled since startup.
     pub requests_served: Arc<AtomicU64>,
+    /// Raft WAL append and fsync counters for this node.
+    pub log_store_metrics: Arc<LogStoreMetrics>,
 }
 
 impl StatsContext {
@@ -42,6 +44,7 @@ impl StatsContext {
             max_memory,
             data_dir: data_dir.into(),
             requests_served: Arc::new(AtomicU64::new(0)),
+            log_store_metrics: Arc::new(LogStoreMetrics::default()),
         }
     }
 
@@ -203,6 +206,49 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
             "client_requests:{}",
             stats.requests_served.load(Ordering::SeqCst)
         );
+        let log_metrics = stats.log_store_metrics.snapshot();
+        let _ = writeln!(output, "raft_log_append_calls:{}", log_metrics.append_calls);
+        let _ = writeln!(
+            output,
+            "raft_log_appended_entries:{}",
+            log_metrics.appended_entries
+        );
+        let _ = writeln!(
+            output,
+            "raft_log_append_batch_entries_max:{}",
+            log_metrics.append_batch_entries_max
+        );
+        // Counters are sampled independently; treat their view as approximate.
+        let average_batch_entries = log_metrics
+            .appended_entries
+            .checked_div(log_metrics.append_calls)
+            .unwrap_or(0);
+        let _ = writeln!(
+            output,
+            "raft_log_append_batch_entries_avg:{}",
+            average_batch_entries
+        );
+        let _ = writeln!(
+            output,
+            "raft_log_sync_data_calls:{}",
+            log_metrics.sync_data_calls
+        );
+        let _ = writeln!(
+            output,
+            "raft_log_sync_data_total_us:{}",
+            log_metrics.sync_data_nanos / 1_000
+        );
+        let _ = writeln!(
+            output,
+            "raft_log_sync_data_max_us:{}",
+            log_metrics.sync_data_nanos_max / 1_000
+        );
+        let average_sync_us = log_metrics
+            .sync_data_nanos
+            .checked_div(log_metrics.sync_data_calls)
+            .unwrap_or(0)
+            / 1_000;
+        let _ = writeln!(output, "raft_log_sync_data_avg_us:{average_sync_us}");
     }
     if wants("cluster") {
         let _ = writeln!(output, "# Cluster");
@@ -281,10 +327,16 @@ mod tests {
     #[tokio::test]
     async fn stats_section_reports_memory_files_and_requests() {
         let data_dir = temp_dir("stats");
-        let raft = open_single_node(9, &data_dir, "127.0.0.1:1", Some(1_048_576))
-            .await
-            .unwrap();
-        let stats = StatsContext::new(&data_dir, 12, Some(1_048_576));
+        let (raft, log_store_metrics) = crate::raft::open_single_node_with_metrics(
+            9,
+            &data_dir,
+            "127.0.0.1:1",
+            Some(1_048_576),
+        )
+        .await
+        .unwrap();
+        let mut stats = StatsContext::new(&data_dir, 12, Some(1_048_576));
+        stats.log_store_metrics = log_store_metrics;
 
         // Serve a few writes through the state machine first so the raft log
         // file and memory counter have content.
@@ -323,6 +375,8 @@ mod tests {
             "raft log size must be present: {text}"
         );
         assert!(text.contains("client_requests:3"));
+        assert!(text.contains("raft_log_append_calls:"));
+        assert!(text.contains("raft_log_sync_data_calls:"));
 
         // The three writes each hold "key-N" (6-7 bytes) plus "value" (5):
         // at least 30 bytes of live payload must be counted.
@@ -335,6 +389,27 @@ mod tests {
         assert!(
             memory >= 30,
             "memory counter must track writes, got {memory}"
+        );
+        let append_calls: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("raft_log_append_calls:"))
+            .expect("raft_log_append_calls line")
+            .parse()
+            .unwrap();
+        let appended_entries: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("raft_log_appended_entries:"))
+            .expect("raft_log_appended_entries line")
+            .parse()
+            .unwrap();
+        assert!(append_calls > 0, "Raft log append counter should advance");
+        assert!(
+            appended_entries >= 3,
+            "Raft entry counter should include the writes"
+        );
+        assert!(
+            text.contains("raft_log_sync_data_total_us:"),
+            "sync duration counter must be reported"
         );
 
         raft.shutdown().await.unwrap();

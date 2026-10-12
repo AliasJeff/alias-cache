@@ -12,16 +12,20 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::node_state::{NodeState, SharedNodeState};
-use crate::protocol::{Decoder, Frame, RespVersion, command_from_frame};
+use crate::protocol::{Decoder, Frame, Request, RespVersion, command_from_frame};
 use crate::raft::{
-    ClientRequestOutcome, RaftHandle, enable_raft_runtime, execute_client_request_with_id,
-    execute_transaction_request_with_id, new_client_request_id, new_tcp_raft_for_server,
-    open_single_node, run_expiration_worker, run_leader_time_worker, send_client_request_with_id,
-    send_transaction_request_with_id, serve_raft_rpc_with_tls, wait_for_any_leader,
-    watch_key_versions,
+    ClientBatchOutcome, ClientRequestOutcome, RaftHandle, client_batch_fits, enable_raft_runtime,
+    execute_client_batch_request_with_ids, execute_client_request_with_id,
+    execute_transaction_request_with_id, new_client_request_id,
+    new_tcp_raft_for_server_with_metrics, open_single_node_with_metrics, run_expiration_worker,
+    run_leader_time_worker, send_client_batch_request_with_ids, send_client_request_with_id,
+    send_transaction_request_with_id, serve_raft_rpc_with_tls, split_client_batch_requests,
+    wait_for_any_leader, watch_key_versions,
 };
 use crate::sentinel::{self, SentinelContext};
-use crate::state_machine::is_replicated_write;
+use crate::state_machine::{
+    batch_request_has_unique_keys, is_batchable_write, is_replicated_write,
+};
 use crate::tls::TlsContext;
 
 pub struct Server {
@@ -44,19 +48,19 @@ impl Server {
     async fn open_raft(
         &self,
         tls_connector: Option<tokio_rustls::TlsConnector>,
-    ) -> Result<Arc<RaftHandle>> {
+    ) -> Result<(Arc<RaftHandle>, Arc<crate::raft::LogStoreMetrics>)> {
         let max_memory = self.config.max_memory_non_zero();
         if self.config.cluster_nodes.is_empty() {
-            let raft = open_single_node(
+            let (raft, metrics) = open_single_node_with_metrics(
                 self.config.node_id,
                 &self.config.data_dir,
                 self.config.raft_addr.to_string(),
                 max_memory,
             )
             .await?;
-            return Ok(Arc::new(raft));
+            return Ok((Arc::new(raft), metrics));
         }
-        let raft = new_tcp_raft_for_server(
+        let (raft, metrics) = new_tcp_raft_for_server_with_metrics(
             self.config.node_id,
             &self.config.data_dir,
             self.config.cluster_nodes.clone(),
@@ -69,7 +73,7 @@ impl Server {
         if !self.config.bootstrap {
             enable_raft_runtime(&raft);
         }
-        Ok(Arc::new(raft))
+        Ok((Arc::new(raft), metrics))
     }
 
     pub async fn run(self) -> Result<()> {
@@ -86,7 +90,7 @@ impl Server {
         let raft_listener = TcpListener::bind(self.config.raft_addr)
             .await
             .map_err(|source| Error::io("bind raft listener", source))?;
-        let raft = self.open_raft(tls_connector.clone()).await?;
+        let (raft, log_store_metrics) = self.open_raft(tls_connector.clone()).await?;
         let shutdown = Arc::new(self.shutdown);
         let raft_shutdown = shutdown.as_ref().clone();
         let rpc_raft = raft.clone();
@@ -118,11 +122,12 @@ impl Server {
         let expiration_worker_shutdown = shutdown.as_ref().clone();
         let node_id = self.config.node_id;
         let sentinel_context = SentinelContext::from_config(&self.config);
-        let stats = crate::info::StatsContext::new(
+        let mut stats = crate::info::StatsContext::new(
             &self.config.data_dir,
             self.config.max_connections,
             self.config.max_memory_non_zero(),
         );
+        stats.log_store_metrics = log_store_metrics;
         let live_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             run_expiration_worker(
@@ -336,43 +341,56 @@ async fn handle_raft_connection(
                 let parallel = transaction.is_none()
                     && parsed.iter().all(|result| {
                         matches!(result, Ok(request) if is_pipeline_safe(request))
-                    });
+                });
                 if parallel {
-                    // Writes submit concurrently so one fsync batch covers a
-                    // whole pipeline run; reads execute strictly in order
-                    // after every prior write has been applied, matching
-                    // Redis pipeline semantics. Concurrent ReadIndex barriers
-                    // contend inside openraft, so ordered reads are the
-                    // measured throughput winner. Replies stay in order.
-                    let mut in_flight: Vec<tokio::task::JoinHandle<Frame>> = Vec::new();
+                    // Consecutive writes share one OpenRaft client_write_many
+                    // call. Reads and response-heavy writes remain barriers so
+                    // later commands observe the same order as a Redis
+                    // pipeline. Replies are still written FIFO.
+                    let mut write_batch = Vec::new();
                     for result in parsed {
-                        let Ok(request) = result else {
+                        let Ok(request) = result else { continue };
+                        let command = request.command_name();
+                        if is_batchable_write(command, &request)
+                            && batch_request_has_unique_keys(command, &request)
+                        {
+                            write_batch.push(request);
                             continue;
-                        };
-                        if !is_replicated_write(request.command_name()) {
-                            for handle in std::mem::take(&mut in_flight) {
-                                let response = handle
-                                    .await
-                                    .unwrap_or_else(|error| Frame::error(format!("ERR {error}")));
+                        }
+
+                        if !write_batch.is_empty() {
+                            for response in execute_client_batch_with_tls(
+                                &raft,
+                                std::mem::take(&mut write_batch),
+                                tls_connector.clone(),
+                            )
+                            .await
+                            {
                                 write_frame(&mut stream, response, resp_version).await?;
                             }
+                        }
+                        if is_replicated_write(command) {
                             let response =
                                 execute_client_command_with_tls(&raft, request, tls_connector.clone())
                                     .await;
                             write_frame(&mut stream, response, resp_version).await?;
                             continue;
                         }
-                        let raft = Arc::clone(&raft);
-                        let tls = tls_connector.clone();
-                        in_flight.push(tokio::spawn(async move {
-                            execute_client_command_with_tls(&raft, request, tls).await
-                        }));
-                    }
-                    for handle in std::mem::take(&mut in_flight) {
-                        let response = handle
-                            .await
-                            .unwrap_or_else(|error| Frame::error(format!("ERR {error}")));
+                        let response =
+                            execute_client_command_with_tls(&raft, request, tls_connector.clone())
+                                .await;
                         write_frame(&mut stream, response, resp_version).await?;
+                    }
+                    if !write_batch.is_empty() {
+                        for response in execute_client_batch_with_tls(
+                            &raft,
+                            write_batch,
+                            tls_connector.clone(),
+                        )
+                        .await
+                        {
+                            write_frame(&mut stream, response, resp_version).await?;
+                        }
                     }
                     continue;
                 }
@@ -429,8 +447,10 @@ fn is_pipeline_safe(request: &crate::protocol::Request) -> bool {
 }
 
 /// Connection-level command names that must stay on the ordered path.
-const fn connection_command_names() -> &'static [&'static [u8]; 6] {
-    &[b"HELLO", b"AUTH", b"QUIT", b"SELECT", b"PING", b"ECHO"]
+const fn connection_command_names() -> &'static [&'static [u8]; 7] {
+    &[
+        b"HELLO", b"AUTH", b"QUIT", b"SELECT", b"PING", b"ECHO", b"CONFIG",
+    ]
 }
 
 /// Connection-level commands that never touch the replicated state machine.
@@ -482,7 +502,33 @@ fn connection_command(
             _ => Frame::error("ERR wrong number of arguments for 'echo' command"),
         });
     }
+    if command.eq_ignore_ascii_case(b"CONFIG") {
+        return Some(config_command(arguments));
+    }
     None
+}
+
+/// Read-only CONFIG subset used by Redis-compatible clients and benchmarks.
+///
+/// Persistence is always through the Raft WAL; snapshots are controlled by
+/// `--snapshot-policy`, not Redis RDB save intervals.
+fn config_command(arguments: &[Bytes]) -> Frame {
+    let [_, subcommand, pattern] = arguments else {
+        return Frame::error("ERR wrong number of arguments for 'config|get' command");
+    };
+    if !subcommand.eq_ignore_ascii_case(b"GET") {
+        return Frame::error("ERR CONFIG only supports the read-only GET subcommand");
+    }
+
+    let settings: [(&[u8], &[u8]); 2] = [(b"save", b""), (b"appendonly", b"no")];
+    let mut response = Vec::with_capacity(settings.len() * 2);
+    for (name, value) in settings {
+        if pattern.as_ref() == b"*" || pattern.eq_ignore_ascii_case(name) {
+            response.push(Frame::bulk_string(Bytes::copy_from_slice(name)));
+            response.push(Frame::bulk_string(Bytes::copy_from_slice(value)));
+        }
+    }
+    Frame::Array(response)
 }
 
 fn auth_command(
@@ -749,6 +795,76 @@ async fn execute_client_command_with_tls(
     }
 }
 
+async fn execute_client_batch_with_tls(
+    raft: &RaftHandle,
+    requests: Vec<Request>,
+    tls_connector: Option<TlsConnector>,
+) -> Vec<Frame> {
+    let mut responses = Vec::with_capacity(requests.len());
+    for chunk in split_client_batch_requests(requests) {
+        if !client_batch_fits(&chunk) {
+            for request in chunk {
+                responses.push(
+                    execute_client_command_with_tls(raft, request, tls_connector.clone()).await,
+                );
+            }
+            continue;
+        }
+        let items = chunk
+            .into_iter()
+            .map(|request| (new_client_request_id(), request))
+            .collect();
+        responses
+            .extend(execute_client_batch_chunk_with_tls(raft, items, tls_connector.clone()).await);
+    }
+    responses
+}
+
+async fn execute_client_batch_chunk_with_tls(
+    raft: &RaftHandle,
+    items: Vec<(crate::state_machine::ClientRequestId, Request)>,
+    tls_connector: Option<TlsConnector>,
+) -> Vec<Frame> {
+    let request_count = items.len();
+    let option = openraft::network::RPCOption::new(std::time::Duration::from_secs(1));
+    match execute_client_batch_request_with_ids(raft, items.clone()).await {
+        Ok(ClientBatchOutcome::Applied(responses)) if responses.len() == request_count => responses,
+        Ok(ClientBatchOutcome::Applied(responses)) => batch_error_frames(
+            request_count,
+            format!(
+                "ERR client batch response count mismatch: expected {}, got {}",
+                request_count,
+                responses.len()
+            ),
+        ),
+        Ok(ClientBatchOutcome::Redirect(address)) => {
+            match send_client_batch_request_with_ids(&address, items, &option, tls_connector).await
+            {
+                Ok(ClientBatchOutcome::Applied(responses)) if responses.len() == request_count => {
+                    responses
+                }
+                Ok(ClientBatchOutcome::Applied(responses)) => batch_error_frames(
+                    request_count,
+                    format!(
+                        "ERR client batch response count mismatch: expected {}, got {}",
+                        request_count,
+                        responses.len()
+                    ),
+                ),
+                Ok(ClientBatchOutcome::Redirect(address)) => {
+                    batch_error_frames(request_count, format!("MOVED {address}"))
+                }
+                Err(error) => batch_error_frames(request_count, format!("ERR {error}")),
+            }
+        }
+        Err(error) => batch_error_frames(request_count, format!("ERR {error}")),
+    }
+}
+
+fn batch_error_frames(count: usize, message: String) -> Vec<Frame> {
+    (0..count).map(|_| Frame::error(message.clone())).collect()
+}
+
 async fn write_frame(
     stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     frame: Frame,
@@ -774,7 +890,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::raft::serve_raft_rpc;
+    use crate::raft::{open_single_node, serve_raft_rpc};
 
     fn unique_server_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -871,7 +987,7 @@ mod tests {
                 ..Config::default()
             };
             let server = Server::new(config.clone(), watch::channel(false).1).unwrap();
-            let raft = server.open_raft(None).await.unwrap();
+            let (raft, _) = server.open_raft(None).await.unwrap();
             let rpc_raft = raft.clone();
             let rpc_shutdown = shutdown_tx.subscribe();
             rpc_tasks.push((
@@ -1025,6 +1141,14 @@ mod tests {
         assert!(
             text.contains("raft_log_bytes:"),
             "log size must be reported: {text}"
+        );
+        assert!(
+            text.contains("raft_log_append_calls:"),
+            "log append count must be reported: {text}"
+        );
+        assert!(
+            text.contains("raft_log_sync_data_avg_us:"),
+            "log sync latency must be reported: {text}"
         );
         assert!(
             text.contains("client_requests:"),
@@ -1545,6 +1669,37 @@ mod tests {
         assert!(matches!(response, Frame::Map(_)));
     }
 
+    #[test]
+    fn config_get_reports_raft_persistence_without_exposing_mutation() {
+        assert_eq!(
+            config_command(&[
+                Bytes::from_static(b"CONFIG"),
+                Bytes::from_static(b"GET"),
+                Bytes::from_static(b"save"),
+            ]),
+            Frame::Array(vec![Frame::bulk_string("save"), Frame::bulk_string("")])
+        );
+        assert_eq!(
+            config_command(&[
+                Bytes::from_static(b"CONFIG"),
+                Bytes::from_static(b"GET"),
+                Bytes::from_static(b"appendonly"),
+            ]),
+            Frame::Array(vec![
+                Frame::bulk_string("appendonly"),
+                Frame::bulk_string("no"),
+            ])
+        );
+        assert_eq!(
+            config_command(&[
+                Bytes::from_static(b"CONFIG"),
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"maxmemory"),
+            ]),
+            Frame::error("ERR CONFIG only supports the read-only GET subcommand")
+        );
+    }
+
     #[tokio::test]
     async fn connection_cap_rejects_new_clients_with_error_reply() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1762,7 +1917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipelined_writes_submit_concurrently_and_reply_in_order() {
+    async fn pipelined_write_batch_preserves_order_and_per_command_errors() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = Config {
             client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1803,24 +1958,16 @@ mod tests {
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut frames = FrameReader::new();
-        // One segment mixing SET, GET and INCRBY must execute concurrently
-        // yet reply in request order.
-        client
-            .write_all(&encode_command(&[b"SET", b"a", b"10"]))
-            .await
-            .unwrap();
-        client
-            .write_all(&encode_command(&[b"INCRBY", b"a", b"5"]))
-            .await
-            .unwrap();
-        client
-            .write_all(&encode_command(&[b"GET", b"a"]))
-            .await
-            .unwrap();
-        client
-            .write_all(&encode_command(&[b"SET", b"b", b"tail"]))
-            .await
-            .unwrap();
+        let pipeline = [
+            encode_command(&[b"SET", b"a", b"10"]),
+            encode_command(&[b"INCRBY", b"a", b"5"]),
+            encode_command(&[b"INCRBY", b"a", b"invalid"]),
+            encode_command(&[b"INCRBY", b"a", b"2"]),
+            encode_command(&[b"GET", b"a"]),
+            encode_command(&[b"SET", b"b", b"tail"]),
+        ]
+        .concat();
+        client.write_all(&pipeline).await.unwrap();
         assert_eq!(
             frames.next_frame(&mut client).await,
             Frame::simple_string("OK")
@@ -1828,7 +1975,12 @@ mod tests {
         assert_eq!(frames.next_frame(&mut client).await, Frame::Integer(15));
         assert_eq!(
             frames.next_frame(&mut client).await,
-            Frame::bulk_string("15")
+            Frame::error("ERR protocol error: value is not an integer or out of range")
+        );
+        assert_eq!(frames.next_frame(&mut client).await, Frame::Integer(17));
+        assert_eq!(
+            frames.next_frame(&mut client).await,
+            Frame::bulk_string("17")
         );
         assert_eq!(
             frames.next_frame(&mut client).await,
@@ -2117,7 +2269,7 @@ mod tests {
                 ..Config::default()
             };
             let server = Server::new(config, watch::channel(false).1).unwrap();
-            let raft = server.open_raft(None).await.unwrap();
+            let (raft, _) = server.open_raft(None).await.unwrap();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let rpc_raft = raft.clone();
             rpc_tasks.push((

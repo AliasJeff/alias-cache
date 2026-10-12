@@ -100,3 +100,11 @@ cache-cat 的指标和管理命令不能自动视为 alias-cache 的公开 API�
   至此 plans/10 要求的"连接、命令、Raft、WAL/快照、TTL、错误指标"由
   stats + replication + health 三段覆盖：连接与命令计数在 stats，Raft
   与复制滞后在 replication，TTL/错误以命令级测试为证据。
+- 2026-10（续）：`INFO stats` 增加本机 WAL append/fsync 剖析计数：
+  `raft_log_append_calls`、`raft_log_appended_entries`、成功 append 平均/
+  最大批次大小、`sync_data` 调用数及平均/累计/最大耗时。计数器共享自
+  OpenRaft 实际持有的 `FileLogStore`，用 relaxed 原子量更新，不额外打开
+  日志文件、不输出逐次日志。指标只覆盖成功 append 和成功 `sync_data`，
+  不含 vote、rewrite/purge、目录同步或失败 sync；本地 fsync 耗时不等于
+  Raft quorum 写延迟。已增加存储单测和集群 INFO 断言；用于闭环
+  plans/12 与 plans/13 的批次合并粒度和本机 WAL fsync 诊断。

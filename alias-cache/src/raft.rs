@@ -2,7 +2,10 @@
 
 use crate::error::{Error, Result as CacheResult};
 use crate::protocol::{Frame, Request};
-use crate::state_machine::{ClientRequestId, Operation, StateMachine};
+use crate::state_machine::{
+    ClientRequestId, Operation, StateMachine, batchable_write_has_bounded_response,
+    is_replicated_write,
+};
 use bytes::Bytes;
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption};
@@ -27,8 +30,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, watch};
@@ -115,6 +117,9 @@ enum NetworkRequest {
         offset: u64,
         meta: openraft::SnapshotMeta<<TypeConfig as RaftTypeConfig>::LeaderId, NodeId, Node>,
     },
+    ClientBatch {
+        items: Vec<(ClientRequestId, Request)>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,14 +129,17 @@ enum NetworkResponse {
     Snapshot(Result<SnapshotResponse<TypeConfig>, String>),
     SnapshotResume(Result<u64, String>),
     Client(Result<Frame, String>),
+    ClientBatch(Result<ClientBatchOutcome, String>),
 }
 
 const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
+pub const CLIENT_BATCH_MAX_ITEMS: usize = 1_024;
+pub const CLIENT_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_CHUNK_SIZE: usize = 256 * 1024;
 const NETWORK_MAX_SNAPSHOT_SIZE: u64 = 512 * 1024 * 1024;
 const SNAPSHOT_CHECKSUM_OFFSET: u64 = 0xcbf29ce484222325;
 const SNAPSHOT_CHECKSUM_PRIME: u64 = 0x100000001b3;
-const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 3;
+const RAFT_SNAPSHOT_PAYLOAD_VERSION: u16 = 4;
 const RAFT_SNAPSHOT_FILE_MAGIC: [u8; 4] = *b"ARSS";
 const RAFT_SNAPSHOT_FILE_VERSION: u16 = 1;
 const RAFT_SNAPSHOT_FILE_HEADER_LEN: usize = 4 + 2 + 8;
@@ -278,12 +286,66 @@ const RAFT_LOG_VERSION: u16 = 1;
 const RAFT_LOG_HEADER_LEN: usize = 4 + 2 + 1 + 8;
 const RAFT_LOG_CHECKSUM_LEN: usize = 4;
 
+#[derive(Debug, Default)]
+pub struct LogStoreMetrics {
+    append_calls: AtomicU64,
+    appended_entries: AtomicU64,
+    append_batch_entries_max: AtomicU64,
+    sync_data_calls: AtomicU64,
+    sync_data_nanos: AtomicU64,
+    sync_data_nanos_max: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogStoreMetricsSnapshot {
+    pub append_calls: u64,
+    pub appended_entries: u64,
+    pub append_batch_entries_max: u64,
+    pub sync_data_calls: u64,
+    pub sync_data_nanos: u64,
+    pub sync_data_nanos_max: u64,
+}
+
+impl LogStoreMetrics {
+    pub fn snapshot(&self) -> LogStoreMetricsSnapshot {
+        LogStoreMetricsSnapshot {
+            append_calls: self.append_calls.load(Ordering::Relaxed),
+            appended_entries: self.appended_entries.load(Ordering::Relaxed),
+            append_batch_entries_max: self.append_batch_entries_max.load(Ordering::Relaxed),
+            sync_data_calls: self.sync_data_calls.load(Ordering::Relaxed),
+            sync_data_nanos: self.sync_data_nanos.load(Ordering::Relaxed),
+            sync_data_nanos_max: self.sync_data_nanos_max.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_append(&self, entries: usize) {
+        if entries == 0 {
+            return;
+        }
+        self.append_calls.fetch_add(1, Ordering::Relaxed);
+        self.appended_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        self.append_batch_entries_max
+            .fetch_max(entries as u64, Ordering::Relaxed);
+    }
+
+    fn record_sync_data(&self, elapsed: Duration) {
+        let elapsed_nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.sync_data_calls.fetch_add(1, Ordering::Relaxed);
+        self.sync_data_nanos
+            .fetch_add(elapsed_nanos, Ordering::Relaxed);
+        self.sync_data_nanos_max
+            .fetch_max(elapsed_nanos, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 pub struct FileLogStore {
     path: PathBuf,
     file: Option<File>,
     committed_path: PathBuf,
     inner: Arc<Mutex<FileLog>>,
+    metrics: Arc<LogStoreMetrics>,
     #[cfg(test)]
     fail_next_sync_data: bool,
     #[cfg(test)]
@@ -342,6 +404,7 @@ impl FileLogStore {
             file: Some(file),
             committed_path,
             inner: Arc::new(Mutex::new(inner)),
+            metrics: Arc::new(LogStoreMetrics::default()),
             #[cfg(test)]
             fail_next_sync_data: false,
             #[cfg(test)]
@@ -351,6 +414,10 @@ impl FileLogStore {
             #[cfg(test)]
             fail_next_rewrite_directory_sync: false,
         })
+    }
+
+    pub fn metrics(&self) -> Arc<LogStoreMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     pub fn path(&self) -> &Path {
@@ -400,10 +467,14 @@ impl FileLogStore {
         if std::mem::take(&mut self.fail_next_sync_data) {
             return Err(io::Error::other("injected raft log sync_data failure"));
         }
-        self.file
+        let started = Instant::now();
+        let result = self
+            .file
             .as_ref()
             .ok_or_else(|| io::Error::other("raft log file handle is unavailable"))?
-            .sync_data()
+            .sync_data();
+        self.metrics.record_sync_data(started.elapsed());
+        result
     }
 
     fn write_record(&mut self, file_record: &FileRecord) -> CacheResult<()> {
@@ -724,6 +795,11 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
         I: IntoIterator<Item = Entry> + Send,
     {
         let entries: Vec<Entry> = entries.into_iter().collect();
+        let entry_count = entries.len();
+        if entry_count == 0 {
+            callback.io_completed(Ok(()));
+            return Ok(());
+        }
         let original_len = self
             .file
             .as_ref()
@@ -752,6 +828,7 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
                 )),
             });
         }
+        self.metrics.record_append(entry_count);
         self.inner.lock().await.entries.extend(entries);
         callback.io_completed(Ok(()));
         Ok(())
@@ -1148,6 +1225,12 @@ pub enum ClientRequestOutcome {
     Redirect(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ClientBatchOutcome {
+    Applied(Vec<Frame>),
+    Redirect(String),
+}
+
 pub async fn execute_client_request(
     raft: &RaftHandle,
     request: Request,
@@ -1204,6 +1287,189 @@ pub async fn execute_client_request_with_id(
             Err(format!("raft write failed: {error}"))
         }
     }
+}
+
+/// Return whether a set of independent pipeline writes fits one batch RPC.
+///
+/// The limit is deliberately smaller than the generic Raft frame limit so a
+/// client pipeline cannot consume the same memory budget as a snapshot.
+pub fn client_batch_fits(requests: &[Request]) -> bool {
+    if requests.is_empty()
+        || requests.len() > CLIENT_BATCH_MAX_ITEMS
+        || requests.iter().any(|request| {
+            request.command_name().len() + request_memory_bytes(request) > CLIENT_BATCH_MAX_BYTES
+        })
+    {
+        return false;
+    }
+    let items = requests
+        .iter()
+        .cloned()
+        .map(|request| (0, request))
+        .collect::<Vec<_>>();
+    client_batch_items_fit(&items)
+}
+
+fn request_memory_bytes(request: &Request) -> usize {
+    match request {
+        Request::Command(arguments) => arguments.iter().skip(1).map(Bytes::len).sum(),
+    }
+}
+
+pub fn split_client_batch_requests(requests: Vec<Request>) -> Vec<Vec<Request>> {
+    let base_size = bincode::serialized_size(&NetworkRequest::ClientBatch { items: Vec::new() })
+        .ok()
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(CLIENT_BATCH_MAX_BYTES);
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_size = base_size;
+
+    for request in requests {
+        let item_size = bincode::serialized_size(&(0_u128, &request))
+            .ok()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(CLIENT_BATCH_MAX_BYTES);
+        if request.command_name().len() + request_memory_bytes(&request) > CLIENT_BATCH_MAX_BYTES {
+            if !chunk.is_empty() {
+                chunks.push(std::mem::take(&mut chunk));
+                chunk_size = base_size;
+            }
+            chunks.push(vec![request]);
+            continue;
+        }
+        if !chunk.is_empty()
+            && (chunk.len() == CLIENT_BATCH_MAX_ITEMS
+                || chunk_size.saturating_add(item_size) > CLIENT_BATCH_MAX_BYTES)
+        {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_size = base_size;
+        }
+        chunk_size = chunk_size.saturating_add(item_size);
+        chunk.push(request);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+fn client_batch_items_fit(items: &[(ClientRequestId, Request)]) -> bool {
+    if items.is_empty() || items.len() > CLIENT_BATCH_MAX_ITEMS {
+        return false;
+    }
+    bincode::serialized_size(&NetworkRequest::ClientBatch {
+        items: items.to_vec(),
+    })
+    .is_ok_and(|size| size <= CLIENT_BATCH_MAX_BYTES as u64)
+}
+
+pub async fn execute_client_batch_request(
+    raft: &RaftHandle,
+    requests: Vec<Request>,
+) -> Result<ClientBatchOutcome, String> {
+    let items = requests
+        .into_iter()
+        .map(|request| (new_client_request_id(), request))
+        .collect();
+    execute_client_batch_request_with_ids(raft, items).await
+}
+
+pub async fn execute_client_batch_request_with_ids(
+    raft: &RaftHandle,
+    items: Vec<(ClientRequestId, Request)>,
+) -> Result<ClientBatchOutcome, String> {
+    if items.is_empty() || items.len() > CLIENT_BATCH_MAX_ITEMS {
+        return Err(format!(
+            "client batch must contain 1..={} requests",
+            CLIENT_BATCH_MAX_ITEMS
+        ));
+    }
+    let requests: Vec<Request> = items.iter().map(|(_, request)| request.clone()).collect();
+    if !client_batch_fits(&requests) {
+        return Err(format!(
+            "client batch exceeds {} bytes",
+            CLIENT_BATCH_MAX_BYTES
+        ));
+    }
+    if items.iter().any(|(_, request)| {
+        !is_replicated_write(request.command_name())
+            || !batchable_write_has_bounded_response(request.command_name(), request)
+            || request.command_name().len() + request_memory_bytes(request) > CLIENT_BATCH_MAX_BYTES
+    }) {
+        return Err("client batch accepts bounded replicated writes only".to_string());
+    }
+    let mut unique_ids = BTreeSet::new();
+    if items
+        .iter()
+        .any(|(request_id, _)| !unique_ids.insert(*request_id))
+    {
+        return Err("client batch request IDs must be unique".to_string());
+    }
+    if let Err(forward) = raft.as_leader() {
+        return forward
+            .leader_node
+            .map(|node| ClientBatchOutcome::Redirect(node.addr))
+            .ok_or_else(|| "raft leader is not known".to_string());
+    }
+    let request_ids: Vec<ClientRequestId> =
+        items.iter().map(|(request_id, _)| *request_id).collect();
+    let write_time = current_time_millis();
+    let max_batch_memory = (CLIENT_BATCH_MAX_BYTES.min(1 + CLIENT_BATCH_MAX_ITEMS * 4_096)) as u64;
+    let (operations, prepared_responses) = raft
+        .with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                let state = state_machine.state().await;
+                state.prepare_client_batch_with_limits(
+                    &request_ids,
+                    &requests,
+                    write_time,
+                    state.max_memory_limit(),
+                    max_batch_memory,
+                )
+            })
+        })
+        .await
+        .map_err(|error| format!("read raft state machine: {error}"))?
+        .map_err(|error| error.to_string())?;
+
+    let payloads = operations
+        .into_iter()
+        .map(RaftRequest::Apply)
+        .collect::<Vec<_>>();
+    let mut stream = raft
+        .client_write_many(payloads)
+        .await
+        .map_err(|error| format!("raft batch write failed: {error}"))?;
+    let mut responses = Vec::with_capacity(prepared_responses.len());
+    while let Some(result) = tokio_stream::StreamExt::next(&mut stream).await {
+        let result =
+            match result.map_err(|error| format!("raft batch response stream failed: {error}"))? {
+                Ok(result) => result,
+                Err(forward) => {
+                    return Ok(ClientBatchOutcome::Redirect(
+                        forward
+                            .leader_node
+                            .map(|node| node.addr)
+                            .ok_or_else(|| "raft leader is not known".to_string())?,
+                    ));
+                }
+            };
+        match result.response {
+            RaftResponse::Applied(response) => responses.push(response),
+            RaftResponse::Noop => {
+                return Err("raft batch item produced no response".to_string());
+            }
+        }
+    }
+    if responses.len() != prepared_responses.len() {
+        return Err(format!(
+            "raft batch returned {} responses for {} requests",
+            responses.len(),
+            prepared_responses.len()
+        ));
+    }
+    Ok(ClientBatchOutcome::Applied(responses))
 }
 
 pub async fn execute_transaction_request(
@@ -1977,6 +2243,42 @@ pub async fn send_transaction_request_with_id(
     }
 }
 
+pub async fn send_client_batch_request(
+    address: &str,
+    requests: Vec<Request>,
+    option: &RPCOption,
+) -> CacheResult<ClientBatchOutcome> {
+    let items = requests
+        .into_iter()
+        .map(|request| (new_client_request_id(), request))
+        .collect();
+    send_client_batch_request_with_ids(address, items, option, None).await
+}
+
+pub async fn send_client_batch_request_with_ids(
+    address: &str,
+    items: Vec<(ClientRequestId, Request)>,
+    option: &RPCOption,
+    tls_connector: Option<TlsConnector>,
+) -> CacheResult<ClientBatchOutcome> {
+    if !client_batch_items_fit(&items) {
+        return Err(Error::protocol("client batch exceeds configured limits"));
+    }
+    let response = send_rpc(
+        address,
+        NetworkRequest::ClientBatch { items },
+        option,
+        tls_connector,
+    )
+    .await
+    .map_err(|error| Error::server(format!("send client batch request: {error}")))?;
+    match response {
+        NetworkResponse::ClientBatch(Ok(outcome)) => Ok(outcome),
+        NetworkResponse::ClientBatch(Err(error)) => Err(Error::server(error)),
+        _ => Err(Error::server("unexpected client batch rpc response")),
+    }
+}
+
 fn rpc_response_error(error: String) -> RPCError<TypeConfig> {
     RPCError::Network(openraft::error::NetworkError::from_string(error))
 }
@@ -2173,6 +2475,9 @@ async fn handle_raft_rpc(
                         }
                     });
             NetworkResponse::Client(response)
+        }
+        NetworkRequest::ClientBatch { items } => {
+            NetworkResponse::ClientBatch(execute_client_batch_request_with_ids(&raft, items).await)
         }
         NetworkRequest::Snapshot {
             vote,
@@ -2564,6 +2869,17 @@ pub async fn new_file_raft(
     peers: PeerMap,
     max_memory: Option<u64>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_file_raft_with_metrics(node_id, data_dir, peers, max_memory)
+        .await
+        .map(|(raft, _)| raft)
+}
+
+pub async fn new_file_raft_with_metrics(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    peers: PeerMap,
+    max_memory: Option<u64>,
+) -> Result<(RaftHandle, Arc<LogStoreMetrics>), openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
         heartbeat_interval: 50,
@@ -2578,6 +2894,7 @@ pub async fn new_file_raft(
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
     let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let metrics = log_store.metrics();
     let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     state_machine
@@ -2595,15 +2912,15 @@ pub async fn new_file_raft(
     )
     .await?;
     peers.lock().await.insert(node_id, raft.clone());
-    Ok(raft)
+    Ok((raft, metrics))
 }
 
-pub async fn new_tcp_raft(
+pub async fn new_tcp_raft_with_metrics(
     node_id: NodeId,
     data_dir: impl AsRef<Path>,
     nodes: BTreeMap<NodeId, Node>,
-) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_tcp_raft_inner(
+) -> Result<(RaftHandle, Arc<LogStoreMetrics>), openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner_with_metrics(
         node_id,
         data_dir,
         nodes,
@@ -2616,6 +2933,16 @@ pub async fn new_tcp_raft(
     .await
 }
 
+pub async fn new_tcp_raft(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_with_metrics(node_id, data_dir, nodes)
+        .await
+        .map(|(raft, _)| raft)
+}
+
 pub async fn new_tcp_raft_with_control(
     node_id: NodeId,
     data_dir: impl AsRef<Path>,
@@ -2623,6 +2950,15 @@ pub async fn new_tcp_raft_with_control(
     control: TcpNetworkControl,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
     new_tcp_raft_inner(node_id, data_dir, nodes, true, control, None, None, 64).await
+}
+
+pub async fn new_tcp_raft_with_control_and_metrics(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    control: TcpNetworkControl,
+) -> Result<(RaftHandle, Arc<LogStoreMetrics>), openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner_with_metrics(node_id, data_dir, nodes, true, control, None, None, 64).await
 }
 
 pub async fn new_tcp_raft_joiner(
@@ -2663,6 +2999,31 @@ async fn new_tcp_raft_inner(
     max_memory: Option<u64>,
     snapshot_policy: u64,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
+    new_tcp_raft_inner_with_metrics(
+        node_id,
+        data_dir,
+        nodes,
+        bootstrap,
+        control,
+        tls_connector,
+        max_memory,
+        snapshot_policy,
+    )
+    .await
+    .map(|(raft, _)| raft)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn new_tcp_raft_inner_with_metrics(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    bootstrap: bool,
+    control: TcpNetworkControl,
+    tls_connector: Option<TlsConnector>,
+    max_memory: Option<u64>,
+    snapshot_policy: u64,
+) -> Result<(RaftHandle, Arc<LogStoreMetrics>), openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
         heartbeat_interval: 50,
@@ -2678,6 +3039,7 @@ async fn new_tcp_raft_inner(
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
     let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let metrics = log_store.metrics();
     let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     state_machine
@@ -2702,7 +3064,7 @@ async fn new_tcp_raft_inner(
     {
         initialize_if_pristine(&raft, nodes).await?;
     }
-    Ok(raft)
+    Ok((raft, metrics))
 }
 
 async fn initialize_if_pristine(
@@ -2742,8 +3104,30 @@ pub async fn new_tcp_raft_for_server(
     max_memory: Option<u64>,
     snapshot_policy: u64,
 ) -> CacheResult<RaftHandle> {
+    new_tcp_raft_for_server_with_metrics(
+        node_id,
+        data_dir,
+        nodes,
+        bootstrap,
+        tls_connector,
+        max_memory,
+        snapshot_policy,
+    )
+    .await
+    .map(|(raft, _)| raft)
+}
+
+pub async fn new_tcp_raft_for_server_with_metrics(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    nodes: BTreeMap<NodeId, Node>,
+    bootstrap: bool,
+    tls_connector: Option<TlsConnector>,
+    max_memory: Option<u64>,
+    snapshot_policy: u64,
+) -> CacheResult<(RaftHandle, Arc<LogStoreMetrics>)> {
     let raft = if bootstrap {
-        new_tcp_raft_inner(
+        new_tcp_raft_inner_with_metrics(
             node_id,
             data_dir,
             nodes,
@@ -2756,7 +3140,7 @@ pub async fn new_tcp_raft_for_server(
         .await
         .map_err(|error| Error::server(format!("open bootstrap raft node: {error}")))?
     } else {
-        new_tcp_raft_inner(
+        new_tcp_raft_inner_with_metrics(
             node_id,
             data_dir,
             nodes,
@@ -3135,10 +3519,22 @@ pub async fn open_single_node(
     raft_addr: impl Into<String>,
     max_memory: Option<u64>,
 ) -> CacheResult<RaftHandle> {
-    let peers = Arc::new(Mutex::new(BTreeMap::new()));
-    let raft = new_file_raft(node_id, data_dir, Arc::clone(&peers), max_memory)
+    open_single_node_with_metrics(node_id, data_dir, raft_addr, max_memory)
         .await
-        .map_err(|error| Error::server(format!("open raft node: {error}")))?;
+        .map(|(raft, _)| raft)
+}
+
+pub async fn open_single_node_with_metrics(
+    node_id: NodeId,
+    data_dir: impl AsRef<Path>,
+    raft_addr: impl Into<String>,
+    max_memory: Option<u64>,
+) -> CacheResult<(RaftHandle, Arc<LogStoreMetrics>)> {
+    let peers = Arc::new(Mutex::new(BTreeMap::new()));
+    let (raft, metrics) =
+        new_file_raft_with_metrics(node_id, data_dir, Arc::clone(&peers), max_memory)
+            .await
+            .map_err(|error| Error::server(format!("open raft node: {error}")))?;
     if !raft
         .is_initialized()
         .await
@@ -3157,7 +3553,7 @@ pub async fn open_single_node(
         .current_leader(node_id, "single-node raft leader election")
         .await
         .map_err(|error| Error::server(format!("wait for raft leader: {error}")))?;
-    Ok(raft)
+    Ok((raft, metrics))
 }
 
 #[cfg(test)]
@@ -3249,6 +3645,34 @@ mod tests {
         }
     }
 
+    fn request(parts: &[&[u8]]) -> Request {
+        Request::Command(
+            parts
+                .iter()
+                .map(|part| Bytes::copy_from_slice(part))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn client_batch_limits_split_by_item_and_serialized_size() {
+        let small = request(&[b"SET", b"key", b"value"]);
+        let mut by_count = vec![small.clone(); CLIENT_BATCH_MAX_ITEMS + 1];
+        assert!(!client_batch_fits(&[]));
+        assert!(!client_batch_fits(&by_count));
+        let chunks = split_client_batch_requests(std::mem::take(&mut by_count));
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [1024, 1]);
+        assert!(chunks.iter().all(|chunk| client_batch_fits(chunk)));
+
+        let oversized = request(&[b"SET", b"key", &vec![b'x'; CLIENT_BATCH_MAX_BYTES]]);
+        assert!(!client_batch_fits(std::slice::from_ref(&oversized)));
+        let chunks = split_client_batch_requests(vec![oversized, small]);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1);
+        assert!(!client_batch_fits(&chunks[0]));
+        assert!(client_batch_fits(&chunks[1]));
+    }
+
     #[tokio::test]
     async fn memory_log_store_supports_append_read_and_truncate() {
         let mut store = MemLogStore::default();
@@ -3323,6 +3747,75 @@ mod tests {
             .expect("entries should recover");
         assert_eq!(entries, vec![first, second]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn file_log_store_metrics_count_entries_and_sync_latency() {
+        let path = std::env::temp_dir().join(format!(
+            "alias-cache-file-log-metrics-{}-{}.log",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let mut store = FileLogStore::open(&path).expect("file log should open");
+        let metrics = store.metrics();
+        let before = metrics.snapshot();
+
+        store
+            .append(
+                vec![
+                    entry(1, EntryPayload::Blank),
+                    entry(2, EntryPayload::Blank),
+                    entry(3, EntryPayload::Blank),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect("append batch should succeed");
+
+        let after = metrics.snapshot();
+        assert_eq!(after.append_calls - before.append_calls, 1);
+        assert_eq!(after.appended_entries - before.appended_entries, 3);
+        assert_eq!(after.appended_entries - before.appended_entries, 3);
+        assert!(after.append_batch_entries_max >= 3);
+        assert_eq!(after.sync_data_calls - before.sync_data_calls, 1);
+        assert!(after.sync_data_nanos >= before.sync_data_nanos);
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tcp_file_raft_metrics_follow_the_live_log_store() {
+        let root = std::env::temp_dir().join(format!(
+            "alias-cache-live-log-metrics-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let address = "127.0.0.1:1".to_string();
+        let nodes = BTreeMap::from([(1, Node { addr: address })]);
+        let (raft, metrics) = new_tcp_raft_with_metrics(1, &root, nodes)
+            .await
+            .expect("tcp file-backed raft should open");
+        raft.wait(None)
+            .current_leader(1, "live metrics test leader")
+            .await
+            .expect("single node should become leader");
+
+        raft.client_write(RaftRequest::Apply(Operation::Set {
+            key: Bytes::from_static(b"metrics-key"),
+            value: Bytes::from_static(b"metrics-value"),
+        }))
+        .await
+        .expect("write should commit");
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.append_calls > 0);
+        assert!(snapshot.appended_entries > 0);
+        assert!(snapshot.sync_data_calls >= snapshot.append_calls);
+        assert!(snapshot.sync_data_nanos > 0);
+
+        raft.shutdown().await.expect("raft node should shut down");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -5953,6 +6446,109 @@ mod tests {
         .await
         .expect("leader forwarding should succeed");
         assert_eq!(response, Frame::simple_string("OK"));
+
+        let batch_items = vec![
+            (
+                9_001,
+                Request::Command(vec![
+                    Bytes::from_static(b"INCRBY"),
+                    Bytes::from_static(b"batch-counter"),
+                    Bytes::from_static(b"2"),
+                ]),
+            ),
+            (
+                9_002,
+                Request::Command(vec![
+                    Bytes::from_static(b"INCRBY"),
+                    Bytes::from_static(b"batch-counter"),
+                    Bytes::from_static(b"invalid"),
+                ]),
+            ),
+            (
+                9_003,
+                Request::Command(vec![
+                    Bytes::from_static(b"INCRBY"),
+                    Bytes::from_static(b"batch-counter"),
+                    Bytes::from_static(b"3"),
+                ]),
+            ),
+        ];
+        assert_eq!(
+            send_client_batch_request_with_ids(
+                &nodes[&2].addr,
+                batch_items.clone(),
+                &RPCOption::new(Duration::from_secs(1)),
+                None,
+            )
+            .await
+            .expect("follower batch rpc should return a redirect"),
+            ClientBatchOutcome::Redirect(nodes[&1].addr.clone())
+        );
+        let batch_response = send_client_batch_request_with_ids(
+            &nodes[&1].addr,
+            batch_items.clone(),
+            &RPCOption::new(Duration::from_secs(1)),
+            None,
+        )
+        .await
+        .expect("leader should apply the batch");
+        assert_eq!(
+            batch_response,
+            ClientBatchOutcome::Applied(vec![
+                Frame::Integer(2),
+                Frame::error("ERR protocol error: value is not an integer or out of range"),
+                Frame::Integer(5),
+            ])
+        );
+        let retry_items = vec![
+            (
+                9_001,
+                Request::Command(vec![
+                    Bytes::from_static(b"INCRBY"),
+                    Bytes::from_static(b"batch-counter"),
+                    Bytes::from_static(b"100"),
+                ]),
+            ),
+            (
+                9_002,
+                Request::Command(vec![
+                    Bytes::from_static(b"INCRBY"),
+                    Bytes::from_static(b"batch-counter"),
+                    Bytes::from_static(b"1"),
+                ]),
+            ),
+            (
+                9_003,
+                Request::Command(vec![
+                    Bytes::from_static(b"INCRBY"),
+                    Bytes::from_static(b"batch-counter"),
+                    Bytes::from_static(b"100"),
+                ]),
+            ),
+        ];
+        assert_eq!(
+            send_client_batch_request_with_ids(
+                &nodes[&1].addr,
+                retry_items,
+                &RPCOption::new(Duration::from_secs(1)),
+                None,
+            )
+            .await
+            .expect("duplicate batch should return cached responses"),
+            batch_response
+        );
+        assert_eq!(
+            execute_client_request(
+                &rafts[0],
+                Request::Command(vec![
+                    Bytes::from_static(b"GET"),
+                    Bytes::from_static(b"batch-counter"),
+                ]),
+            )
+            .await
+            .expect("batch state should be readable"),
+            ClientRequestOutcome::Applied(Frame::bulk_string("5"))
+        );
 
         for raft in rafts {
             raft.shutdown().await.expect("raft should stop");

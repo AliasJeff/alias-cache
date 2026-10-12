@@ -33,6 +33,15 @@ pre-1.0; formats and guarantees may change between minor versions (see
   pipeline writes submitted concurrently with in-order replies —
   three-node SET 461→2352 ops/s, linearizable GET 4.4k→17.7k ops/s on
   the reference machine.
+- Bounded client batch RPC with per-command deduplication and apply-time
+  evaluation, ordered RESP pipeline batching, and a streaming `pwrite`
+  benchmark mode with per-request latency samples. The 20k ops/s three-node
+  write target remains unmet; measured throughput and tail latency are recorded
+  in `plans/13-batch-write-pipeline.md`.
+- Read-only `CONFIG GET save|appendonly|*` compatibility for Redis benchmark
+  clients; configuration mutations remain unsupported.
+- Storage format version 4 for the replicated batch operation. Existing
+  version 3 data is rejected and requires the documented 0.x rebuild procedure.
 - Configurability: CLI flags for cluster topology (`--peer`,
   `--bootstrap`), resource limits, and `--snapshot-policy`.
 - Packaging: Dockerfile (pinned toolchain, non-root), docker-compose
