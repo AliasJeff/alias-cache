@@ -177,7 +177,10 @@ CHANGELOG、依赖 SPDX 许可证白名单门禁。
 计划 13 的批量写入口、RESP pipeline 批处理和 pwrite 压测模式已实现，
 `redis-benchmark -t set,get -P 16` 三节点交叉验证：SET 17,440 ops/s
 （合批 + 快照策略修正 + prepare 去 clone 后；p50 14.5ms）、线性一致
-GET 16,242 ops/s、PING_INLINE 22.4 万 ops/s。
+GET 16,242 ops/s、PING_INLINE 22.4 万 ops/s。自研压测 8 轮中位数
+16,086 ops/s（峰值 20,707；对比优化前基线 2,355 = 6.8×）。稳定吞吐与
+峰值的差距来自全量快照 IO 周期，20k 稳定中位数门禁转移至增量快照
+计划完成后复测（plans/13 完成标准修订留档）。
 
 第二阶段扩展已交付（plans/14-15）：Bitmap（SETBIT/GETBIT/BITCOUNT/
 BITPOS/BITOP，String 位寻址）、Bloom Filter（BF.RESERVE/ADD/EXISTS/
