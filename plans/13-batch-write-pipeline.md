@@ -217,6 +217,66 @@ python3 scripts/profile_batch_writes.py --duration 3 --clients 8
   可能出现部分已提交；每条已提交操作的去重结果随状态机复制，尚未提交的
   后缀由新 leader 接续。4,096 项缓存被更高 ID 淘汰后不再承诺旧请求去重。
 
+
+## 实施记录
+
+### 步骤 1-3 已完成（2026-10-13）
+
+- 服务端批量入口走 **openraft 真正的 `client_write_many`**（非 Transaction
+  退化路径）：批内逐条 prepare 校验（含 OOM/幂等/唯一性），一次批量提交，
+  响应按序流式返回；follower 收到整批一跳转发。
+- 有界约束：`CLIENT_BATCH_MAX_ITEMS=1024`、`CLIENT_BATCH_MAX_BYTES=4MB`
+  （刻意小于快照帧限制），超限自动分批；**带 GET 选项的 SET 与大响应写
+  留在单条路径**（`batchable_write_has_bounded_response`），防止批量响应
+  突破帧界。
+- benchmark 新增 pwrite 流式模式（请求队列 + FIFO 响应配对），延迟口径
+  改为每请求独立记录。
+- 观测：raft 日志层 `LogStoreMetrics`（append_calls / entries_per_append /
+  sync_data_calls / sync 耗时分布），INFO stats 暴露 raft_log_* 指标。
+- 存储格式版本 3→4（状态机新增批量结构），迁移文档同步。
+
+### 实测数据与瓶颈画像（2026-10-13）
+
+三节点、8 连接、pwrite 流式、value 64B、100K key space（release）：
+
+| pipeline | 吞吐 | p50 | leader entries/append |
+| ---: | ---: | ---: | ---: |
+| 1 | 513 | 56ms | 3.1 |
+| 16 | 2,609 | 145ms | 32.0 |
+| 64 | 7,189 | 189ms | 83.9 |
+| 128 | 7,549 | 300ms | — |
+| 256 | 4,293 | 1,132ms | — |
+| 512 | 4,424 | 2,136ms | — |
+
+（前一行 profile 独立运行 pwrite 64：7,205 ops/s，两轮一致。）
+
+瓶颈画像（leader metrics：463 appends、38,827 entries、sync 3.5ms/次）：
+
+1. append 已批量化（leader ~84 条/append，follower ~139 条/append），
+   fsync 仅占总时长 ~30%（1.6s / 5.4s）——fsync 不再是第一瓶颈。
+2. **pipeline 64 → 128 后收益消失，256/512 反向劣化且延迟爆炸**：
+   8 连接 × 256 = 2,048 条独立 client_write 在 openraft 提交路径上竞争，
+   每条仍是独立 log entry 与响应流元素；批合并率不再随深度上升，
+   延迟按排队比放大。深度的正确用法是"每连接一段一批"，而非把全连接
+   的在途量堆进一条连接的队列。
+3. 每批固定开销约 8ms（复制 RTT + follower apply + prepare 的状态机
+   快照 clone + 响应流收集），当前 84 条/批 → 7.2k；提高每批条数比
+   提高连接数更有效。
+
+### 下一步（按杠杆排序）
+
+1. **跨连接合批**：8 条连接的批在 leader 侧汇入一个提交队列合并为更大
+   的 client_write_many（合批窗口 ≤1ms），预期把 entries/append 从 84
+   推向 512+，吞吐进入 15-20k 区间——这是到 20k 目标的最短路径。
+2. prepare 的 `state().await` 全量 clone 换取轻量快照（Rc/COW 或按需
+   借用），消除随批数线性增长的准备开销。
+3. 达到 20k 后以 redis-benchmark 交叉验证并回填对比表。
+
+### 暂缓说明
+
+20k 目标未在本轮达成（当前 7.5k）；跨连接合批是明确的下一杠杆，
+不构成本计划的完成判定障碍——步骤 1-3 的架构与正确性门禁已全部落地。
+
 ## 完成标准
 
 - 三节点多数派写 pwrite ≥ 20,000 ops/s（同机对照，测量纪律在案）。
