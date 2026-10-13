@@ -1380,17 +1380,15 @@ pub async fn execute_client_batch_request_with_ids(
     items: Vec<(ClientRequestId, Request)>,
 ) -> Result<ClientBatchOutcome, String> {
     if items.is_empty() || items.len() > CLIENT_BATCH_MAX_ITEMS {
+        let max_items = CLIENT_BATCH_MAX_ITEMS;
         return Err(format!(
-            "client batch must contain 1..={} requests",
-            CLIENT_BATCH_MAX_ITEMS
+            "client batch must contain 1..={max_items} requests"
         ));
     }
     let requests: Vec<Request> = items.iter().map(|(_, request)| request.clone()).collect();
     if !client_batch_fits(&requests) {
-        return Err(format!(
-            "client batch exceeds {} bytes",
-            CLIENT_BATCH_MAX_BYTES
-        ));
+        let max_bytes = CLIENT_BATCH_MAX_BYTES;
+        return Err(format!("client batch exceeds {max_bytes} bytes"));
     }
     if items.iter().any(|(_, request)| {
         !is_replicated_write(request.command_name())

@@ -207,7 +207,8 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
             stats.requests_served.load(Ordering::SeqCst)
         );
         let log_metrics = stats.log_store_metrics.snapshot();
-        let _ = writeln!(output, "raft_log_append_calls:{}", log_metrics.append_calls);
+        let raft_log_append_calls = log_metrics.append_calls;
+        let _ = writeln!(output, "raft_log_append_calls:{raft_log_append_calls}");
         let _ = writeln!(
             output,
             "raft_log_appended_entries:{}",
@@ -225,8 +226,7 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
             .unwrap_or(0);
         let _ = writeln!(
             output,
-            "raft_log_append_batch_entries_avg:{}",
-            average_batch_entries
+            "raft_log_append_batch_entries_avg:{average_batch_entries}"
         );
         let _ = writeln!(
             output,

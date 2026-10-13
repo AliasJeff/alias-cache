@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let percentiles = client::percentiles(&totals.latencies, &[0.50, 0.95, 0.99, 1.0]);
     let elapsed = benchmark_started.elapsed();
     let seconds = elapsed.as_secs_f64();
-    println!("elapsed: {:.3}s", seconds);
+    println!("elapsed: {seconds:.3}s");
     println!("throughput: {:.0} ops/s", totals.completed as f64 / seconds);
     println!(
         "latency us: p50={} p95={} p99={} max={}",
