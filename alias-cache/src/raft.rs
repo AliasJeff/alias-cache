@@ -1448,59 +1448,40 @@ impl BatchCommitterHandle {
                     }
                 }
 
-                // Commit the coalesced backlog in rounds of at most
-                // CLIENT_BATCH_MAX_ITEMS, keeping per-submitter response
-                // order: submitter i's slice is filled from every round that
-                // contained its requests, in submission order.
-                let mut submitter_frames: Vec<Vec<Frame>> =
-                    group.iter().map(|_| Vec::new()).collect();
-                let mut submitter_error: Vec<Option<String>> = group.iter().map(|_| None).collect();
-                let mut submitter_redirect: Vec<Option<String>> =
-                    group.iter().map(|_| None).collect();
-
-                let mut round: Vec<(ClientRequestId, Request)> = Vec::new();
-                // (submitter index, item index within the submitter's batch)
-                let mut round_owners: Vec<(usize, usize)> = Vec::new();
-                for (submitter, queued) in group.iter().enumerate() {
-                    for (item_index, item) in queued.items.iter().enumerate() {
-                        round.push(item.clone());
-                        round_owners.push((submitter, item_index));
-                        if round.len() == CLIENT_BATCH_MAX_ITEMS {
-                            commit_round(
-                                &raft,
-                                &mut round,
-                                &mut round_owners,
-                                &mut submitter_frames,
-                                &mut submitter_error,
-                                &mut submitter_redirect,
-                            )
-                            .await;
-                        }
+                // Split the backlog into chunks of at most
+                // CLIENT_BATCH_MAX_ITEMS, then commit the chunks
+                // concurrently: spawning each chunk lets openraft merge
+                // concurrent appends into large batches, and responses reach
+                // submitters via their oneshots when the chunk finishes.
+                type CommitChunk = (Vec<(ClientRequestId, Request)>, Vec<QueuedBatch>);
+                let mut chunks: Vec<CommitChunk> = Vec::new();
+                let mut current_items: Vec<(ClientRequestId, Request)> = Vec::new();
+                let mut current_group: Vec<QueuedBatch> = Vec::new();
+                for queued in group {
+                    let item_count = queued.items.len();
+                    if current_items.len() + item_count > CLIENT_BATCH_MAX_ITEMS
+                        && !current_items.is_empty()
+                    {
+                        chunks.push((
+                            std::mem::take(&mut current_items),
+                            std::mem::take(&mut current_group),
+                        ));
                     }
+                    current_items.extend(queued.items.iter().cloned());
+                    current_group.push(queued);
                 }
-                if !round.is_empty() {
-                    commit_round(
-                        &raft,
-                        &mut round,
-                        &mut round_owners,
-                        &mut submitter_frames,
-                        &mut submitter_error,
-                        &mut submitter_redirect,
-                    )
-                    .await;
+                if !current_items.is_empty() {
+                    chunks.push((current_items, current_group));
                 }
 
-                for (submitter, queued) in group.into_iter().enumerate() {
-                    let outcome = if let Some(message) = &submitter_error[submitter] {
-                        Err(message.clone())
-                    } else if let Some(address) = &submitter_redirect[submitter] {
-                        Ok(ClientBatchOutcome::Redirect(address.clone()))
-                    } else {
-                        Ok(ClientBatchOutcome::Applied(std::mem::take(
-                            &mut submitter_frames[submitter],
-                        )))
-                    };
-                    let _ = queued.response.send(outcome);
+                for (chunk_items, chunk_group) in chunks {
+                    let raft = raft.clone();
+                    tokio::spawn(async move {
+                        let outcome = commit_batch_items(&raft, chunk_items).await;
+                        for queued in chunk_group {
+                            let _ = queued.response.send(outcome.clone());
+                        }
+                    });
                 }
             }
         });
@@ -1541,44 +1522,6 @@ pub async fn execute_client_batch_request_with_ids(
     items: Vec<(ClientRequestId, Request)>,
 ) -> Result<ClientBatchOutcome, String> {
     commit_batch_items(raft, items).await
-}
-
-/// Commit one coalescing round and distribute each reply to the submitter
-/// that owns its request. A round failure marks every submitter it touched:
-/// per-submitter errors win over redirects, and a redirect poisons only the
-/// round's submitters (their clients retry the whole batch on idempotent
-/// request IDs).
-async fn commit_round(
-    raft: &RaftHandle,
-    round: &mut Vec<(ClientRequestId, Request)>,
-    round_owners: &mut Vec<(usize, usize)>,
-    submitter_frames: &mut [Vec<Frame>],
-    submitter_error: &mut [Option<String>],
-    submitter_redirect: &mut [Option<String>],
-) {
-    let round_items = std::mem::take(round);
-    let owners = std::mem::take(round_owners);
-    match commit_batch_items(raft, round_items).await {
-        Ok(ClientBatchOutcome::Applied(responses)) => {
-            for ((submitter, _), response) in owners.iter().zip(responses) {
-                submitter_frames[*submitter].push(response);
-            }
-        }
-        Ok(ClientBatchOutcome::Redirect(address)) => {
-            for (submitter, _) in owners {
-                if submitter_redirect[submitter].is_none() && submitter_error[submitter].is_none() {
-                    submitter_redirect[submitter] = Some(address.clone());
-                }
-            }
-        }
-        Err(message) => {
-            for (submitter, _) in owners {
-                if submitter_error[submitter].is_none() {
-                    submitter_error[submitter] = Some(message.clone());
-                }
-            }
-        }
-    }
 }
 
 /// Leader-side commit of one batch: prepare on the current state machine

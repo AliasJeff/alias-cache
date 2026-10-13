@@ -425,6 +425,20 @@ entries/append avg 416、sync_data 1,325 次 avg 3.1ms——fsync 占比 ~5%，
 证明架构上限已过线；稳定值与峰值的 25% 差距即全量快照的周期成本。
 
 
+
+### 步骤 2 完成：提交轮重叠（2026-10-13）
+
+合批器从"逐轮内联提交"改为**分块并发提交**：排空的积压按
+CLIENT_BATCH_MAX_ITEMS（1024）切块，每块 spawn 独立任务走
+`client_write_many`——openraft 把并发 append 合并为大批次，块间不再
+互相阻塞。响应经每提交者的 oneshot 回送；连接层的 FIFO 写序由连接
+任务自己保证（每连接顺序等响应）。原逐轮内联路径的
+`commit_round`/submitter 数组随语义变化移除。
+
+实测（16 连接 × pipeline 128，三节点）：14,200 → **16,300-18,800
+ops/s**（p128），32c×256 达 14,013。剩余瓶颈：openraft apply 逐条
+执行（每条含版本 bump/内存计费/响应 Frame 构造）与全量快照周期。
+
 ### 深管线扩展重测（2026-10-13，clone 消除后）
 
 16 连接 pwrite、policy 4096、10s 每轮：
