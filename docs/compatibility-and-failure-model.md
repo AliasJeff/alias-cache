@@ -102,6 +102,19 @@ Bitmap 当前约束：
 - `BITFIELD`、`BITCOUNT` 的 BIT 位模式、`BITOP` 的耗时保护尚未纳入
   稳定兼容范围。
 
+Bloom Filter 当前约束：
+
+- `BF.RESERVE key error_rate capacity`（0 < error_rate < 1，capacity > 0；
+  重复保留返回 `ERR item exists`）、`BF.ADD`（未保留的 key 隐式按默认
+  容量 1024/1% 创建）、`BF.EXISTS`、`BF.INFO`；
+- **确定性 hash**：双重 FNV-1a 64 派生 `h_i = (h1 + i·h2) mod m`——
+  无随机盐，同输入在所有副本产生相同位索引，这是复制一致性的关键；
+- ADD 返回 1（本实现不区分 may-exist 与新建）；容量写满后继续写入
+  不扩容（错误率超出声明值，RedisBloom noScale 行为）；TYPE 返回
+  `MBbloom--`；
+- `BF.MADD`/`BF.MEXISTS`/`BF.SCANDUMP`/`BF.LOADCHUNK` 尚未纳入稳定
+  兼容范围。
+
 遍历当前约束：
 
 - 游标是已返回成员数的十进制文本，语义为快照内偏移：同一批数据反复迭代

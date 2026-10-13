@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -79,14 +80,44 @@ pub fn batchable_write_has_bounded_response(command: &[u8], request: &Request) -
 /// Replicated write commands, mirroring the write arms of
 /// `prepare_request_inner` one-to-one.
 const WRITES: &[&[u8]] = &[
-    b"SET", b"DEL", b"MSET", b"INCRBY", b"HSET", b"HMSET", b"HSETNX", b"HINCRBY", b"HDEL",
-    b"LPUSH", b"RPUSH", b"LPOP", b"RPOP", b"LREM", b"LSET", b"LTRIM", b"SADD", b"SREM", b"ZADD",
-    b"ZINCRBY", b"ZREM", b"EXPIRE", b"PEXPIRE", b"PERSIST", b"SETBIT", b"BITOP",
+    b"SET",
+    b"DEL",
+    b"MSET",
+    b"INCRBY",
+    b"HSET",
+    b"HMSET",
+    b"HSETNX",
+    b"HINCRBY",
+    b"HDEL",
+    b"LPUSH",
+    b"RPUSH",
+    b"LPOP",
+    b"RPOP",
+    b"LREM",
+    b"LSET",
+    b"LTRIM",
+    b"SADD",
+    b"SREM",
+    b"ZADD",
+    b"ZINCRBY",
+    b"ZREM",
+    b"EXPIRE",
+    b"PEXPIRE",
+    b"PERSIST",
+    b"SETBIT",
+    b"BITOP",
+    b"BF.RESERVE",
+    b"BF.ADD",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(Bytes),
+    BloomFilter {
+        bits: Bytes,
+        hash_count: u8,
+        inserted: u64,
+    },
     Hash(BTreeMap<Bytes, Bytes>),
     List(VecDeque<Bytes>),
     Set(BTreeSet<Bytes>),
@@ -190,6 +221,15 @@ pub enum Operation {
         offset: u64,
         bit: bool,
     },
+    BloomReserve {
+        key: Bytes,
+        error_rate_numerator: u32,
+        capacity: u64,
+    },
+    BloomAdd {
+        key: Bytes,
+        item: Bytes,
+    },
     BitmapOp {
         operation: Bytes,
         dest: Bytes,
@@ -267,6 +307,8 @@ impl Operation {
             | Self::Increment { .. }
             | Self::BitmapSet { .. }
             | Self::BitmapOp { .. }
+            | Self::BloomReserve { .. }
+            | Self::BloomAdd { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -299,6 +341,8 @@ impl Operation {
             | Self::Increment { .. }
             | Self::BitmapSet { .. }
             | Self::BitmapOp { .. }
+            | Self::BloomReserve { .. }
+            | Self::BloomAdd { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -392,6 +436,43 @@ fn request_memory_bytes(request: &Request) -> u64 {
         .sum()
 }
 
+/// Default capacity for BF.ADD on an unreserved key.
+const DEFAULT_BF_CAPACITY: u64 = 1_024;
+/// Default error-rate numerator over 1,000 (i.e. one percent).
+const DEFAULT_BF_ERROR_NUMERATOR: u32 = 10;
+
+/// Bits required for `capacity` items at an error rate of
+/// `numerator / 1000` (capped to sane bounds).
+fn bloom_bit_count(capacity: u64, error_rate_numerator: u32) -> u64 {
+    let numerator = error_rate_numerator.clamp(1, 500) as f64;
+    let p = numerator / 1_000.0;
+    let capacity = capacity.max(1) as f64;
+    let bits = -capacity * p.ln() / (2.0_f64.ln() * 2.0_f64.ln());
+    (bits.ceil() as u64).max(8)
+}
+
+/// Hash functions per item for the same error rate.
+fn bloom_hash_count(error_rate_numerator: u32) -> u8 {
+    let numerator = error_rate_numerator.clamp(1, 500) as f64;
+    let p = numerator / 1_000.0;
+    let k = (2.0_f64.ln() / p.ln()).round();
+    k.clamp(1.0, 16.0) as u8
+}
+
+/// Deterministic double hash over an item: FNV-1a 64 with two distinct
+/// offset bases. Every replica derives identical bit indexes.
+fn bloom_hash(item: &Bytes, m: u64) -> (u64, u64) {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x6c62_272e_07bb_0142;
+    for byte in item {
+        h1 ^= u64::from(*byte);
+        h1 = h1.wrapping_mul(0x100_0000_01b3);
+        h2 ^= u64::from(*byte);
+        h2 = h2.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    (h1 % m, h2 % m)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BitLogic {
     And,
@@ -404,6 +485,7 @@ enum BitLogic {
 fn entry_size(key: &Bytes, entry: &Entry) -> u64 {
     let value_size = match &entry.value {
         Value::String(bytes) => bytes.len() as u64,
+        Value::BloomFilter { bits, .. } => bits.len() as u64 + 8,
         Value::Hash(map) => map
             .iter()
             .map(|(field, value)| (field.len() + value.len()) as u64)
@@ -466,6 +548,8 @@ impl StateMachine {
             | Operation::Increment { .. }
             | Operation::BitmapSet { .. }
             | Operation::BitmapOp { .. }
+            | Operation::BloomReserve { .. }
+            | Operation::BloomAdd { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -1229,6 +1313,86 @@ impl StateMachine {
                 }
                 ApplyResult::Response(Frame::Integer(dest_len))
             }
+            Operation::BloomReserve {
+                key,
+                error_rate_numerator,
+                capacity,
+            } => {
+                if self
+                    .values
+                    .get(&key)
+                    .is_some_and(|entry| !self.is_expired(entry))
+                {
+                    return ApplyResult::Response(Frame::error("ERR item exists"));
+                }
+                // Bits sized for the declared capacity at the declared error
+                // rate using the deterministic double-hash layout below.
+                let bits_needed = bloom_bit_count(capacity, error_rate_numerator);
+                let hash_count = bloom_hash_count(error_rate_numerator);
+                let entry = Entry {
+                    value: Value::BloomFilter {
+                        bits: Bytes::from(vec![0_u8; bits_needed.div_ceil(8) as usize]),
+                        hash_count,
+                        inserted: 0,
+                    },
+                    expire_at: None,
+                };
+                self.insert_entry(key, entry);
+                ApplyResult::Response(Frame::simple_string("OK"))
+            }
+            Operation::BloomAdd { key, item } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let had_existing = existing.is_some();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let default_bits =
+                    bloom_bit_count(DEFAULT_BF_CAPACITY, DEFAULT_BF_ERROR_NUMERATOR).div_ceil(8);
+                let mut filter = match existing.map(|entry| entry.value) {
+                    None => Value::BloomFilter {
+                        bits: Bytes::from(vec![0_u8; default_bits as usize]),
+                        hash_count: bloom_hash_count(DEFAULT_BF_ERROR_NUMERATOR),
+                        inserted: 0,
+                    },
+                    Some(value @ Value::BloomFilter { .. }) => value,
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                let Value::BloomFilter {
+                    bits,
+                    hash_count,
+                    inserted,
+                } = &mut filter
+                else {
+                    unreachable!("matched above");
+                };
+                let m = bits.len() as u64 * 8;
+                let (h1, h2) = bloom_hash(&item, m);
+                let mut bits_mut = BytesMut::from(&bits[..]);
+                let mut changed = false;
+                for index in 0..*hash_count as u64 {
+                    let bit_index = (h1 + index.wrapping_mul(h2)) % m;
+                    let byte = (bit_index / 8) as usize;
+                    let mask = 0x80 >> (bit_index % 8);
+                    if bits_mut[byte] & mask == 0 {
+                        bits_mut[byte] |= mask;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    *inserted += 1;
+                }
+                let value = Value::BloomFilter {
+                    bits: bits_mut.freeze(),
+                    hash_count: *hash_count,
+                    inserted: *inserted,
+                };
+                if changed || !had_existing {
+                    self.insert_entry(key, Entry { value, expire_at });
+                }
+                ApplyResult::Response(Frame::Integer(1))
+            }
             Operation::Delete { keys } => {
                 let mut removed = 0;
                 for key in keys {
@@ -1554,6 +1718,18 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"BITOP") {
             return self.prepare_bitmap_op(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BF.RESERVE") {
+            return self.execute_bloom_reserve(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BF.ADD") {
+            return self.prepare_bloom_add(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BF.EXISTS") {
+            return self.execute_bloom_exists(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BF.INFO") {
+            return self.execute_bloom_info(arguments);
         }
         if command.eq_ignore_ascii_case(b"HSET") {
             return self.execute_hash_set(arguments, false);
@@ -2127,10 +2303,116 @@ impl StateMachine {
         ))
     }
 
+    fn execute_bloom_reserve(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("BF.RESERVE", &arguments, 4)?;
+        let key = arguments[1].clone();
+        let error_rate_numerator = match std::str::from_utf8(&arguments[2])
+            .map_err(|_| Error::protocol("ERR error rate is not a valid number"))?
+            .parse::<f64>()
+        {
+            Ok(rate) if rate > 0.0 && rate < 1.0 => (rate * 1_000.0).round() as u32,
+            _ => {
+                return Err(Error::protocol("ERR error rate must be between 0 and 1"));
+            }
+        };
+        let capacity = parse_bit_offset(&arguments[3])?;
+        if capacity == 0 {
+            return Err(Error::protocol("ERR capacity must be positive"));
+        }
+        if self
+            .values
+            .get(&key)
+            .is_some_and(|entry| !self.is_expired(entry))
+        {
+            return Err(Error::protocol("ERR item exists"));
+        }
+        Ok((
+            Some(Operation::BloomReserve {
+                key,
+                error_rate_numerator,
+                capacity,
+            }),
+            Frame::simple_string("OK"),
+        ))
+    }
+
+    fn prepare_bloom_add(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("BF.ADD", &arguments, 3)?;
+        let key = arguments[1].clone();
+        self.bloom_bits(&key)?;
+        Ok((
+            Some(Operation::BloomAdd {
+                key,
+                item: arguments[2].clone(),
+            }),
+            Frame::Integer(1),
+        ))
+    }
+
+    /// Current bit vector of a bloom filter key; an absent key is an
+    /// implicit default filter, other types are WRONGTYPE.
+    fn bloom_bits(&self, key: &Bytes) -> Result<Option<(Bytes, u8)>> {
+        match self.values.get(key) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::BloomFilter {
+                    bits, hash_count, ..
+                } => Ok(Some((bits.clone(), *hash_count))),
+                _ => Err(Error::protocol(WRONG_TYPE)),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn execute_bloom_exists(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("BF.EXISTS", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let Some((bits, hash_count)) = self.bloom_bits(&key)? else {
+            return Ok((None, Frame::Integer(0)));
+        };
+        let m = bits.len() as u64 * 8;
+        let (h1, h2) = bloom_hash(&arguments[2], m);
+        let present = (0..hash_count as u64).all(|index| {
+            let bit_index = (h1 + index.wrapping_mul(h2)) % m;
+            bits[(bit_index / 8) as usize] & (0x80 >> (bit_index % 8)) != 0
+        });
+        Ok((None, Frame::Integer(present as i64)))
+    }
+
+    fn execute_bloom_info(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("BF.INFO", &arguments, 2)?;
+        let key = arguments[1].clone();
+        let Some((bits, hash_count)) = self.bloom_bits(&key)? else {
+            return Err(Error::protocol("ERR not found"));
+        };
+        let inserted = match self.values.get(&key) {
+            Some(entry) => match &entry.value {
+                Value::BloomFilter { inserted, .. } => *inserted,
+                _ => 0,
+            },
+            None => 0,
+        };
+        let mut output = String::new();
+        let capacity = DEFAULT_BF_CAPACITY;
+        let _ = writeln!(output, "Capacity:{capacity}");
+        let _ = writeln!(output, "Size:{}", bits.len());
+        let _ = writeln!(output, "Number of filters:1");
+        let _ = writeln!(output, "Number of items inserted:{inserted}");
+        let _ = writeln!(output, "Number of hash functions:{hash_count}");
+        let _ = writeln!(output, "Hash function:fnv1a-double");
+        Ok((
+            None,
+            Frame::VerbatimString {
+                format: Bytes::from_static(b"txt"),
+                data: Bytes::from(output),
+            },
+        ))
+    }
+
     fn bitmap_bytes(&self, key: &Bytes) -> Result<Option<Vec<u8>>> {
         match self.values.get(key) {
             Some(entry) if !self.is_expired(entry) => match &entry.value {
                 Value::String(bytes) => Ok(Some(bytes.to_vec())),
+                Value::BloomFilter { .. } => Err(Error::protocol(WRONG_TYPE)),
                 _ => Err(Error::protocol(WRONG_TYPE)),
             },
             _ => Ok(None),
@@ -2364,6 +2646,7 @@ impl StateMachine {
         let value = match self.values.get(&arguments[1]) {
             Some(entry) if !self.is_expired(entry) => match entry.value {
                 Value::String(_) => "string",
+                Value::BloomFilter { .. } => "MBbloom--",
                 Value::Hash(_) => "hash",
                 Value::List(_) => "list",
                 Value::Set(_) => "set",
@@ -2443,6 +2726,9 @@ impl StateMachine {
                         return Err(Error::protocol(WRONG_TYPE.to_string()));
                     }
                     set.iter().cloned().collect()
+                }
+                Value::BloomFilter { .. } => {
+                    return Err(Error::protocol(WRONG_TYPE.to_string()));
                 }
                 Value::SortedSet(sorted_set) => {
                     if value_type != "zset" {
@@ -4080,6 +4366,139 @@ mod tests {
     /// Compatibility matrix for every SET option combination and the
     /// EXPIRE/PEXPIRE protocol boundary, driven by an explicit table so the
     /// supported surface is readable in one place.
+
+    #[test]
+    fn bloom_filter_adds_queries_and_replays_deterministically() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BF.RESERVE", b"bf", b"0.01", b"1000"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+        // Double reserve fails like RedisBloom.
+        let duplicate = state
+            .execute_request(command(&[b"BF.RESERVE", b"bf", b"0.01", b"1000"]))
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("item exists"));
+
+        // ADD always returns 1 in this implementation (we do not track
+        // may-exist-vs-new).
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BF.ADD", b"bf", b"alpha"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BF.EXISTS", b"bf", b"alpha"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BF.EXISTS", b"bf", b"not-added"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+
+        // Replay determinism: a fresh replica applying the same operations
+        // reports identical membership, including the false-positive
+        // boundary.
+        let (reserve, _) = state
+            .prepare_request(command(&[b"BF.RESERVE", b"bf2", b"0.01", b"1000"]))
+            .unwrap();
+        let (add, _) = state
+            .prepare_request(command(&[b"BF.ADD", b"bf2", b"alpha"]))
+            .unwrap();
+        let mut replay = StateMachine::default();
+        replay.apply(reserve.expect("reserve must replicate"));
+        replay.apply(add.expect("add must replicate"));
+        assert_eq!(
+            replay
+                .execute_request(command(&[b"BF.EXISTS", b"bf2", b"alpha"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            replay
+                .execute_request(command(&[b"BF.EXISTS", b"bf2", b"not-added"]))
+                .unwrap()
+                .1,
+            state
+                .execute_request(command(&[b"BF.EXISTS", b"bf", b"not-added"]))
+                .unwrap()
+                .1,
+            "identical hash inputs must give identical not-added behavior"
+        );
+
+        // Implicit filter via BF.ADD without reserve.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BF.ADD", b"implicit", b"x"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BF.EXISTS", b"implicit", b"x"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+
+        // Errors: bad error rate, zero capacity, wrong type.
+        assert!(
+            state
+                .execute_request(command(&[b"BF.RESERVE", b"bad", b"1.5", b"100"]))
+                .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"BF.RESERVE", b"bad", b"0.01", b"0"]))
+                .is_err()
+        );
+        state
+            .execute_request(command(&[b"SET", b"text", b"plain"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"BF.ADD", b"text", b"x"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
+
+        // TYPE reports the RedisBloom-style type string.
+        assert_eq!(
+            state.execute_request(command(&[b"TYPE", b"bf"])).unwrap().1,
+            Frame::simple_string("MBbloom--")
+        );
+
+        // False-positive smoke: at 1 percent over 1000 items, querying
+        // 1000 never-inserted items must misfire well under 5 percent.
+        let mut false_positives = 0;
+        for index in 0..1_000_u64 {
+            let item = Bytes::from(format!("probe-{index}"));
+            if let Frame::Integer(1) = state
+                .execute_request(command(&[b"BF.EXISTS", b"bf", &item]))
+                .unwrap()
+                .1
+            {
+                false_positives += 1;
+            }
+        }
+        assert!(
+            false_positives < 50,
+            "false-positive rate must stay below 5 percent, got {false_positives}/1000"
+        );
+    }
 
     #[test]
     fn bitmap_commands_are_deterministic_across_replay_and_ranges() {
