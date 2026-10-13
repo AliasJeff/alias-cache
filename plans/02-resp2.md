@@ -49,6 +49,13 @@ cache-cat 的命令执行路径与 Raft 状态机耦合较深。alias-cache 的 
 - 协议测试覆盖正常、边界和恶意输入。
 - Redis CLI 或等价客户端可以完成协议级 PING/echo 测试。
 
+## 完成记录（2026-10 补）
+
+- inline 命令支持已补齐（RESP2 规范要求，redis-benchmark 以 inline PING
+  开场探测）：Decoder 对非特殊首字节的行按空格分词为命令，空行静默
+  跳过、不完整行等待更多数据；带单测覆盖多命令段、空白行规则与跨段
+  拼接。
+
 ## 完成记录
 
 - 2026-10：PING/ECHO 已在连接层实现（`alias-cache/src/server.rs::connection_command`），

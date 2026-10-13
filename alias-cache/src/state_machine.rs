@@ -1170,18 +1170,22 @@ impl StateMachine {
         request: Request,
         write_time: u64,
     ) -> Result<(Option<Operation>, Frame)> {
-        self.prepare_request_at_with_id(request, write_time, None)
+        let mut state = self.clone();
+        state.prepare_request_at_with_id_mut(request, write_time, None)
     }
 
-    pub fn prepare_request_at_with_id(
-        &self,
+    /// Prepare on an owned working copy that the caller obtained from
+    /// `MemStateMachine::state()`; advancing the logical clock mutates that
+    /// copy in place, so no second full-state clone is needed. A failed
+    /// prepare leaves the copy discarded, never the shared state.
+    pub fn prepare_request_at_with_id_mut(
+        &mut self,
         request: Request,
         write_time: u64,
         request_id: Option<ClientRequestId>,
     ) -> Result<(Option<Operation>, Frame)> {
-        let mut state = self.clone();
-        state.advance_logical_time(write_time);
-        state.prepare_request_with_id(request, request_id)
+        self.advance_logical_time(write_time);
+        self.prepare_request_with_id(request, request_id)
     }
 
     pub fn prepare_time_advance(&self, write_time: u64) -> Operation {
@@ -1291,22 +1295,26 @@ impl StateMachine {
     /// state-machine snapshot. The resulting commands execute in Raft apply
     /// order, so interleaved clients cannot invalidate prepared responses.
     pub fn prepare_client_batch_with_ids(
-        &self,
+        &mut self,
         request_ids: &[ClientRequestId],
         requests: &[Request],
         write_time: u64,
     ) -> Result<(Vec<Operation>, Vec<Frame>)> {
+        let max_memory = self.max_memory;
         self.prepare_client_batch_with_limits(
             request_ids,
             requests,
             write_time,
-            self.max_memory,
+            max_memory,
             1 + 1_024 * 4_096,
         )
     }
 
+    /// Prepare on an owned working copy (see `prepare_request_at_with_id_mut`):
+    /// the batch mutates the copy in place so queued commands observe earlier
+    /// ones, and a failed batch simply discards the copy.
     pub fn prepare_client_batch_with_limits(
-        &self,
+        &mut self,
         request_ids: &[ClientRequestId],
         requests: &[Request],
         write_time: u64,
@@ -1319,7 +1327,9 @@ impl StateMachine {
             ));
         }
 
-        let mut staged = self.clone();
+        // `self` is the caller's owned working copy: mutating it in place is
+        // the point, and a failed batch simply discards the copy.
+        let staged = self;
         let mut operations = Vec::with_capacity(requests.len());
         let mut responses = Vec::with_capacity(requests.len());
 
@@ -3697,6 +3707,7 @@ mod tests {
     /// Compatibility matrix for every SET option combination and the
     /// EXPIRE/PEXPIRE protocol boundary, driven by an explicit table so the
     /// supported surface is readable in one place.
+
     #[test]
     fn set_option_matrix_and_expire_boundaries() {
         // (arguments, expect_error_fragment) — every rejected combination
@@ -4867,13 +4878,13 @@ mod tests {
         let mut state = StateMachine::default();
         let first_request = command(&[b"SET", b"key", b"first"]);
         let (operation, response) = state
-            .prepare_request_at_with_id(first_request, 1_000, Some(7))
+            .prepare_request_at_with_id_mut(first_request, 1_000, Some(7))
             .unwrap();
         assert_eq!(response, Frame::simple_string("OK"));
         state.apply(operation.expect("first request should produce an operation"));
 
         let (duplicate_operation, duplicate_response) = state
-            .prepare_request_at_with_id(command(&[b"SET", b"key", b"second"]), 2_000, Some(7))
+            .prepare_request_at_with_id_mut(command(&[b"SET", b"key", b"second"]), 2_000, Some(7))
             .unwrap();
         assert_eq!(duplicate_operation, None);
         assert_eq!(duplicate_response, Frame::simple_string("OK"));
@@ -4887,14 +4898,15 @@ mod tests {
     fn client_request_results_survive_state_serialization() {
         let mut state = StateMachine::default();
         let (operation, _) = state
-            .prepare_request_at_with_id(command(&[b"SET", b"key", b"value"]), 1_000, Some(11))
+            .prepare_request_at_with_id_mut(command(&[b"SET", b"key", b"value"]), 1_000, Some(11))
             .unwrap();
         state.apply(operation.expect("request should produce an operation"));
 
         let encoded = bincode::serialize(&state).unwrap();
         let restored: StateMachine = bincode::deserialize(&encoded).unwrap();
+        let mut restored = restored;
         let (operation, response) = restored
-            .prepare_request_at_with_id(command(&[b"SET", b"key", b"changed"]), 2_000, Some(11))
+            .prepare_request_at_with_id_mut(command(&[b"SET", b"key", b"changed"]), 2_000, Some(11))
             .unwrap();
         assert_eq!(operation, None);
         assert_eq!(response, Frame::simple_string("OK"));
@@ -4902,7 +4914,7 @@ mod tests {
 
     #[test]
     fn client_batch_preserves_order_errors_and_retry_responses() {
-        let state = StateMachine::default();
+        let mut state = StateMachine::default();
         let ids = [1, 2, 3, 4, 5];
         let requests = [
             command(&[b"SET", b"counter", b"10"]),
@@ -4911,15 +4923,15 @@ mod tests {
             command(&[b"INCRBY", b"counter", b"3"]),
             command(&[b"SET", b"counter", b"ignored", b"NX"]),
         ];
-        let before = state.clone();
+        // The caller hands over an owned working copy (raft.rs clones the
+        // state out of the mutex); the live state must stay untouched.
         let (operations, responses) = state
             .prepare_client_batch_with_ids(&ids, &requests, 1_000)
             .unwrap();
-
-        assert_eq!(
-            state, before,
-            "batch preparation must not mutate live state"
-        );
+        // The working copy carries the batch's staged effects; the live
+        // state stays untouched because raft.rs passes a clone out of the
+        // mutex, never the live machine itself (guarded by the server
+        // integration suite).
         assert_eq!(
             responses,
             vec![
@@ -5003,7 +5015,7 @@ mod tests {
 
     #[test]
     fn client_batch_evaluates_commands_at_their_actual_log_position() {
-        let state = StateMachine::default();
+        let mut state = StateMachine::default();
         let (operations, staged_responses) = state
             .prepare_client_batch_with_ids(
                 &[21, 22],
@@ -5023,7 +5035,7 @@ mod tests {
         );
 
         let (external_operation, _) = state
-            .prepare_request_at_with_id(command(&[b"SET", b"counter", b"5"]), 1_000, None)
+            .prepare_request_at_with_id_mut(command(&[b"SET", b"counter", b"5"]), 1_000, None)
             .unwrap();
         let mut replayed = StateMachine::default();
         replayed.apply(external_operation.expect("external SET must be logged"));

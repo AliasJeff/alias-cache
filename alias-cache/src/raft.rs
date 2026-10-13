@@ -1247,8 +1247,8 @@ pub async fn execute_client_request_with_id(
     let (operation, response) = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
-                let state = state_machine.state().await;
-                state.prepare_request_at_with_id(request, write_time, Some(request_id))
+                let mut state = state_machine.state().await;
+                state.prepare_request_at_with_id_mut(request, write_time, Some(request_id))
             })
         })
         .await
@@ -1413,21 +1413,13 @@ impl BatchCommitterHandle {
                 let mut group: Vec<QueuedBatch> = vec![QueuedBatch { items, response }];
                 loop {
                     match rx.try_recv() {
-                        Ok(queued) => {
-                            group.push(queued);
-                            if group.len() >= MAX_COALESCED_BATCHES {
-                                break;
-                            }
-                        }
+                        Ok(queued) => group.push(queued),
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                             // One more short grace pass: segments that were
                             // mid-flight when the first drain hit empty.
                             tokio::time::sleep(BATCH_COALESCE_WINDOW).await;
                             match rx.try_recv() {
-                                Ok(queued) if group.len() < MAX_COALESCED_BATCHES => {
-                                    group.push(queued);
-                                    continue;
-                                }
+                                Ok(queued) => group.push(queued),
                                 _ => break,
                             }
                         }
@@ -1435,27 +1427,59 @@ impl BatchCommitterHandle {
                     }
                 }
 
-                let merged: Vec<(ClientRequestId, Request)> = group
-                    .iter()
-                    .flat_map(|queued| queued.items.iter().cloned())
-                    .collect();
-                let outcome = commit_batch_items(&raft, merged).await;
-                // Split the shared outcome back per submitter, preserving each
-                // batch's own response order.
-                let mut offset = 0;
-                for QueuedBatch { items, response } in group {
-                    let count = items.len();
-                    let split = match &outcome {
-                        Ok(ClientBatchOutcome::Applied(responses)) => Ok(
-                            ClientBatchOutcome::Applied(responses[offset..offset + count].to_vec()),
-                        ),
-                        Ok(ClientBatchOutcome::Redirect(addr)) => {
-                            Ok(ClientBatchOutcome::Redirect(addr.clone()))
+                // Commit the coalesced backlog in rounds of at most
+                // CLIENT_BATCH_MAX_ITEMS, keeping per-submitter response
+                // order: submitter i's slice is filled from every round that
+                // contained its requests, in submission order.
+                let mut submitter_frames: Vec<Vec<Frame>> =
+                    group.iter().map(|_| Vec::new()).collect();
+                let mut submitter_error: Vec<Option<String>> = group.iter().map(|_| None).collect();
+                let mut submitter_redirect: Vec<Option<String>> =
+                    group.iter().map(|_| None).collect();
+
+                let mut round: Vec<(ClientRequestId, Request)> = Vec::new();
+                // (submitter index, item index within the submitter's batch)
+                let mut round_owners: Vec<(usize, usize)> = Vec::new();
+                for (submitter, queued) in group.iter().enumerate() {
+                    for (item_index, item) in queued.items.iter().enumerate() {
+                        round.push(item.clone());
+                        round_owners.push((submitter, item_index));
+                        if round.len() == CLIENT_BATCH_MAX_ITEMS {
+                            commit_round(
+                                &raft,
+                                &mut round,
+                                &mut round_owners,
+                                &mut submitter_frames,
+                                &mut submitter_error,
+                                &mut submitter_redirect,
+                            )
+                            .await;
                         }
-                        Err(message) => Err(message.clone()),
+                    }
+                }
+                if !round.is_empty() {
+                    commit_round(
+                        &raft,
+                        &mut round,
+                        &mut round_owners,
+                        &mut submitter_frames,
+                        &mut submitter_error,
+                        &mut submitter_redirect,
+                    )
+                    .await;
+                }
+
+                for (submitter, queued) in group.into_iter().enumerate() {
+                    let outcome = if let Some(message) = &submitter_error[submitter] {
+                        Err(message.clone())
+                    } else if let Some(address) = &submitter_redirect[submitter] {
+                        Ok(ClientBatchOutcome::Redirect(address.clone()))
+                    } else {
+                        Ok(ClientBatchOutcome::Applied(std::mem::take(
+                            &mut submitter_frames[submitter],
+                        )))
                     };
-                    offset += count;
-                    let _ = response.send(split);
+                    let _ = queued.response.send(outcome);
                 }
             }
         });
@@ -1483,10 +1507,6 @@ impl BatchCommitterHandle {
     }
 }
 
-/// Maximum number of queued batches merged into one commit round; bounds a
-/// single round's memory while still allowing deep coalescing.
-const MAX_COALESCED_BATCHES: usize = 64;
-
 /// How long the committer waits for in-flight segments before committing.
 /// Two passes of this window bound the added latency at well under 1ms.
 const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(350);
@@ -1500,6 +1520,44 @@ pub async fn execute_client_batch_request_with_ids(
     items: Vec<(ClientRequestId, Request)>,
 ) -> Result<ClientBatchOutcome, String> {
     commit_batch_items(raft, items).await
+}
+
+/// Commit one coalescing round and distribute each reply to the submitter
+/// that owns its request. A round failure marks every submitter it touched:
+/// per-submitter errors win over redirects, and a redirect poisons only the
+/// round's submitters (their clients retry the whole batch on idempotent
+/// request IDs).
+async fn commit_round(
+    raft: &RaftHandle,
+    round: &mut Vec<(ClientRequestId, Request)>,
+    round_owners: &mut Vec<(usize, usize)>,
+    submitter_frames: &mut [Vec<Frame>],
+    submitter_error: &mut [Option<String>],
+    submitter_redirect: &mut [Option<String>],
+) {
+    let round_items = std::mem::take(round);
+    let owners = std::mem::take(round_owners);
+    match commit_batch_items(raft, round_items).await {
+        Ok(ClientBatchOutcome::Applied(responses)) => {
+            for ((submitter, _), response) in owners.iter().zip(responses) {
+                submitter_frames[*submitter].push(response);
+            }
+        }
+        Ok(ClientBatchOutcome::Redirect(address)) => {
+            for (submitter, _) in owners {
+                if submitter_redirect[submitter].is_none() && submitter_error[submitter].is_none() {
+                    submitter_redirect[submitter] = Some(address.clone());
+                }
+            }
+        }
+        Err(message) => {
+            for (submitter, _) in owners {
+                if submitter_error[submitter].is_none() {
+                    submitter_error[submitter] = Some(message.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Leader-side commit of one batch: prepare on the current state machine
@@ -1540,7 +1598,7 @@ async fn commit_batch_items(
     let (operations, prepared_responses) = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
-                let state = state_machine.state().await;
+                let mut state = state_machine.state().await;
                 state.prepare_client_batch_with_limits(
                     &request_ids,
                     &requests,

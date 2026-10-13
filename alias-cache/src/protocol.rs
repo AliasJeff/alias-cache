@@ -323,6 +323,11 @@ impl Decoder {
                 break;
             };
             self.buffer.advance(cursor);
+            // Empty arrays only come from blank inline lines, which Redis
+            // answers with silence; `*0` is equally a no-op.
+            if frame == Frame::Array(vec![]) {
+                continue;
+            }
             segment_frames += 1;
             if segment_frames > self.limits.max_pipeline_len {
                 return Err(Error::protocol("pipeline exceeds configured limit"));
@@ -373,9 +378,22 @@ fn parse_frame(
         b'~' => parse_set(input, cursor, depth, limits, frame_start),
         b'>' => parse_push(input, cursor, depth, limits, frame_start),
         b'|' => parse_attribute(input, cursor, depth, limits, frame_start),
-        _ => Err(Error::protocol(format!(
-            "unsupported RESP type byte: {kind}"
-        ))),
+        _ => {
+            // Inline commands ( RESP2 spec ): a bare line whose arguments are
+            // split on whitespace. The first byte was already consumed, so
+            // step the cursor back before parsing the whole line. A missing
+            // terminator means the command is incomplete, not invalid.
+            *cursor -= 1;
+            let Some(arguments) = parse_inline(input, cursor)? else {
+                return Ok(None);
+            };
+            Ok(Some(Frame::Array(
+                arguments
+                    .into_iter()
+                    .map(|argument| Frame::BulkString(Bytes::copy_from_slice(argument)))
+                    .collect(),
+            )))
+        }
     }
 }
 
@@ -392,6 +410,30 @@ fn parse_line<'a>(
     let value = &input[*cursor..end];
     *cursor = end + 2;
     Ok(Some(value))
+}
+
+/// Parse an inline command: one CRLF-terminated line split on whitespace.
+///
+/// Empty lines are skipped by returning an empty argument list, matching
+/// Redis's treatment of blank inline input. Returns `None` when the line is
+/// not yet terminated.
+fn parse_inline<'a>(input: &'a [u8], cursor: &mut usize) -> Result<Option<Vec<&'a [u8]>>> {
+    let remaining = &input[*cursor..];
+    let Some(line_end) = remaining.iter().position(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+    let line = &remaining[..line_end];
+    let line = if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    *cursor += line_end + 1;
+    let arguments = line
+        .split(|byte| *byte == b' ' || *byte == b'\t')
+        .filter(|argument| !argument.is_empty())
+        .collect();
+    Ok(Some(arguments))
 }
 
 fn parse_bulk_string(
@@ -798,6 +840,42 @@ mod tests {
                 Frame::SimpleString(Bytes::from_static(b"OK")),
                 Frame::Integer(42)
             ]
+        );
+    }
+
+    #[test]
+    fn decodes_inline_commands_with_redis_whitespace_rules() {
+        let mut decoder = Decoder::new(ProtocolLimits::default());
+        // redis-benchmark opens with inline PING.
+        assert_eq!(
+            decoder.push(b"PING\r\n").unwrap(),
+            vec![Frame::Array(vec![Frame::bulk_string("PING")])]
+        );
+        // Multiple inline commands in one segment; blank and whitespace-only
+        // lines are silently skipped, matching Redis.
+        let decoded = decoder
+            .push(b"SET key value\r\n\r\n   \r\nGET  key \r\n")
+            .unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded[0],
+            Frame::Array(vec![
+                Frame::bulk_string("SET"),
+                Frame::bulk_string("key"),
+                Frame::bulk_string("value")
+            ])
+        );
+        assert_eq!(
+            decoded[1],
+            Frame::Array(vec![Frame::bulk_string("GET"), Frame::bulk_string("key")])
+        );
+        // Inline split across segments lands as one complete command.
+        let mut split = Decoder::new(ProtocolLimits::default());
+        assert!(split.push(b"SET k").unwrap().is_empty());
+        assert_eq!(
+            split.push(b" v\r\n").unwrap().len(),
+            1,
+            "the tail segment completes the inline command"
         );
     }
 
