@@ -1178,6 +1178,27 @@ impl MemStateMachine {
         self.inner.lock().await.state.clone()
     }
 
+    /// Validate and wrap a client batch against the live state machine
+    /// without cloning it: prepare is pure validation and operation
+    /// generation, so it can run under the state lock directly.
+    pub async fn prepare_client_batch_with_limits(
+        &self,
+        request_ids: Vec<ClientRequestId>,
+        requests: Vec<Request>,
+        write_time: u64,
+        max_batch_memory: u64,
+    ) -> CacheResult<Vec<Operation>> {
+        let guard = self.inner.lock().await;
+        let max_memory = guard.state.max_memory_limit();
+        guard.state.prepare_client_batch_with_limits(
+            &request_ids,
+            &requests,
+            write_time,
+            max_memory,
+            max_batch_memory,
+        )
+    }
+
     pub async fn state_with_applied_index(&self) -> (StateMachine, Option<LogId>) {
         let inner = self.inner.lock().await;
         (inner.state.clone(), inner.last_applied)
@@ -1595,32 +1616,33 @@ async fn commit_batch_items(
         items.iter().map(|(request_id, _)| *request_id).collect();
     let write_time = current_time_millis();
     let max_batch_memory = (CLIENT_BATCH_MAX_BYTES.min(1 + CLIENT_BATCH_MAX_ITEMS * 4_096)) as u64;
-    let (operations, prepared_responses) = raft
+    // Pure validation + wrapping executed under the live state lock (no
+    // clone, no trial execution): the authoritative responses come from the
+    // applied stream.
+    let request_count = requests.len();
+    let operations: Vec<Operation> = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
-                let mut state = state_machine.state().await;
-                state.prepare_client_batch_with_limits(
-                    &request_ids,
-                    &requests,
-                    write_time,
-                    state.max_memory_limit(),
-                    max_batch_memory,
-                )
+                state_machine
+                    .prepare_client_batch_with_limits(
+                        request_ids,
+                        requests,
+                        write_time,
+                        max_batch_memory,
+                    )
+                    .await
+                    .map_err(|error| format!("prepare client batch: {error}"))
             })
         })
         .await
-        .map_err(|error| format!("read raft state machine: {error}"))?
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("raft state machine: {error}"))??;
 
-    let payloads = operations
-        .into_iter()
-        .map(RaftRequest::Apply)
-        .collect::<Vec<_>>();
+    let payloads: Vec<RaftRequest> = operations.into_iter().map(RaftRequest::Apply).collect();
     let mut stream = raft
         .client_write_many(payloads)
         .await
         .map_err(|error| format!("raft batch write failed: {error}"))?;
-    let mut responses = Vec::with_capacity(prepared_responses.len());
+    let mut responses = Vec::with_capacity(request_count);
     while let Some(result) = tokio_stream::StreamExt::next(&mut stream).await {
         let result =
             match result.map_err(|error| format!("raft batch response stream failed: {error}"))? {
@@ -1641,11 +1663,11 @@ async fn commit_batch_items(
             }
         }
     }
-    if responses.len() != prepared_responses.len() {
+    if responses.len() != request_count {
         return Err(format!(
             "raft batch returned {} responses for {} requests",
             responses.len(),
-            prepared_responses.len()
+            request_count
         ));
     }
     Ok(ClientBatchOutcome::Applied(responses))

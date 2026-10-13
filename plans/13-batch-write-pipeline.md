@@ -355,6 +355,25 @@ redis-benchmark 口径差 13%；缺口在长跑快照 IO（全量快照与吞吐
 强一致多数派 fsync 的代价与单机持久化的层级差异不变，如实呈现。
 
 
+
+### 步骤 1 完成：批量 prepare 去状态机 clone（2026-10-13）
+
+- `prepare_client_batch_with_limits` 改为纯校验 + 包装：不再 clone 整个
+  状态机做 staged 试运行，也不再提前预测响应——真实响应由 openraft 的
+  applied stream 提供（apply 是权威结果），prepare 只做参数校验、OOM
+  预算检查与 `ClientBatch` 操作包装。
+- `with_state_machine` 闭包现在在**真状态的锁内**直接执行 prepare
+  （`MemStateMachine::prepare_client_batch_with_limits` 委托），消除
+  每批一次的全量 clone（10 万 key 实测 3.15ms/次，随状态线性增长）。
+  幂等缓存由 apply 侧维护（prepare 的预测缓存原本就会在 apply 时被
+  真响应覆盖，语义不变）。
+- 五个批量测试按新语义重写：批内顺序/错误嵌入/幂等重试（同 ID 缓存
+  回放）、SET GET 旧值、日志位置求值（外部写与批内写交错）、OOM 捕获
+  限制在副本上确定性执行、超限命令确定性拒绝。
+- 实测：p128 16c 五轮中位数 14,422 ops/s（此前同口径 16,086，笔记本
+  40% 方差带内；clone 成本随状态规模线性增长，规模越大收益越大——
+  3.15ms/批在 10 万 key 下约占批周期 12%，并在状态继续增长时放大）。
+
 ### 8 轮中位数终测（2026-10-13，clone 消除后）
 
 16 连接 × pipeline 128、10s 每轮、同机三节点、零错误：

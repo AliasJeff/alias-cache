@@ -1711,78 +1711,15 @@ impl StateMachine {
         Ok((operation, response))
     }
 
-    fn prepare_batch_item(
-        &mut self,
-        request_id: ClientRequestId,
-        request: Request,
-        write_time: u64,
-        max_memory: Option<u64>,
-        max_batch_memory: u64,
-    ) -> (Operation, Frame) {
-        if let Some(response) = self.client_results.get(&request_id) {
-            return (
-                Operation::ClientBatch {
-                    request_id,
-                    request,
-                    write_time,
-                    max_memory,
-                    max_batch_memory,
-                },
-                response.clone(),
-            );
-        }
-
-        self.advance_logical_time(write_time);
-        let (operation, response) = if request_memory_bytes(&request) > max_batch_memory {
-            (
-                None,
-                Frame::error("ERR client batch command exceeds the memory admission limit"),
-            )
-        } else {
-            match self.prepare_request_inner(request.clone()) {
-                Ok(result) => result,
-                Err(error) => (None, Frame::error(format!("ERR {error}"))),
-            }
-        };
-        let response = if let Some(operation) = operation {
-            if max_memory.is_some_and(|limit| {
-                self.check_memory_with_limit(&operation, Some(limit))
-                    .is_err()
-            }) {
-                Frame::error(
-                    "ERR protocol error: OOM command not allowed when used memory > 'maxmemory'",
-                )
-            } else {
-                match self.apply(operation) {
-                    ApplyResult::Response(response) => response,
-                    ApplyResult::NoResponse => Frame::Null,
-                }
-            }
-        } else {
-            response
-        };
-        self.cache_client_response(request_id, response.clone());
-        (
-            Operation::ClientBatch {
-                request_id,
-                request,
-                write_time,
-                max_memory,
-                max_batch_memory,
-            },
-            response,
-        )
-    }
-
     /// Prepare a sequence of independent pipeline writes against one staged
     /// state-machine snapshot. The resulting commands execute in Raft apply
     /// order, so interleaved clients cannot invalidate prepared responses.
     pub fn prepare_client_batch_with_ids(
-        &mut self,
+        &self,
         request_ids: &[ClientRequestId],
         requests: &[Request],
         write_time: u64,
-    ) -> Result<(Vec<Operation>, Vec<Frame>)> {
+    ) -> Result<Vec<Operation>> {
         let max_memory = self.max_memory;
         self.prepare_client_batch_with_limits(
             request_ids,
@@ -1796,39 +1733,36 @@ impl StateMachine {
     /// Prepare on an owned working copy (see `prepare_request_at_with_id_mut`):
     /// the batch mutates the copy in place so queued commands observe earlier
     /// ones, and a failed batch simply discards the copy.
+    /// Validate and wrap each request into a `ClientBatch` operation without
+    /// any trial execution: responses are produced by the real apply on the
+    /// replicas (openraft streams them back after commit), so the prepare
+    /// path never clones or mutates state. Idempotency caching, OOM gating
+    /// and per-command validation all re-run under apply, which is the
+    /// authoritative outcome.
     pub fn prepare_client_batch_with_limits(
-        &mut self,
+        &self,
         request_ids: &[ClientRequestId],
         requests: &[Request],
         write_time: u64,
         max_memory: Option<u64>,
         max_batch_memory: u64,
-    ) -> Result<(Vec<Operation>, Vec<Frame>)> {
+    ) -> Result<Vec<Operation>> {
         if request_ids.len() != requests.len() {
             return Err(Error::server(
                 "client batch request IDs and requests have different lengths",
             ));
         }
-
-        // `self` is the caller's owned working copy: mutating it in place is
-        // the point, and a failed batch simply discards the copy.
-        let staged = self;
         let mut operations = Vec::with_capacity(requests.len());
-        let mut responses = Vec::with_capacity(requests.len());
-
         for (request_id, request) in request_ids.iter().copied().zip(requests.iter()) {
-            let (operation, response) = staged.prepare_batch_item(
+            operations.push(Operation::ClientBatch {
                 request_id,
-                request.clone(),
+                request: request.clone(),
                 write_time,
                 max_memory,
                 max_batch_memory,
-            );
-            operations.push(operation);
-            responses.push(response);
+            });
         }
-
-        Ok((operations, responses))
+        Ok(operations)
     }
 
     fn prepare_request_inner(&self, request: Request) -> Result<(Option<Operation>, Frame)> {
@@ -6504,7 +6438,7 @@ mod tests {
 
     #[test]
     fn client_batch_preserves_order_errors_and_retry_responses() {
-        let mut state = StateMachine::default();
+        let state = StateMachine::default();
         let ids = [1, 2, 3, 4, 5];
         let requests = [
             command(&[b"SET", b"counter", b"10"]),
@@ -6513,15 +6447,23 @@ mod tests {
             command(&[b"INCRBY", b"counter", b"3"]),
             command(&[b"SET", b"counter", b"ignored", b"NX"]),
         ];
-        // The caller hands over an owned working copy (raft.rs clones the
-        // state out of the mutex); the live state must stay untouched.
-        let (operations, responses) = state
+        // Prepare is pure validation + wrapping: the live state stays
+        // untouched, and the real responses come from apply.
+        let live_before = state.clone();
+        let operations = state
             .prepare_client_batch_with_ids(&ids, &requests, 1_000)
             .unwrap();
-        // The working copy carries the batch's staged effects; the live
-        // state stays untouched because raft.rs passes a clone out of the
-        // mutex, never the live machine itself (guarded by the server
-        // integration suite).
+        assert_eq!(state, live_before);
+
+        let mut replayed = StateMachine::default();
+        let responses: Vec<_> = operations
+            .iter()
+            .cloned()
+            .map(|operation| match replayed.apply(operation) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("client batch item must have a response"),
+            })
+            .collect();
         assert_eq!(
             responses,
             vec![
@@ -6532,17 +6474,6 @@ mod tests {
                 Frame::Null,
             ]
         );
-
-        let mut replayed = StateMachine::default();
-        let applied: Vec<_> = operations
-            .iter()
-            .cloned()
-            .map(|operation| match replayed.apply(operation) {
-                ApplyResult::Response(response) => response,
-                ApplyResult::NoResponse => panic!("client batch item must have a response"),
-            })
-            .collect();
-        assert_eq!(applied, responses);
         assert_eq!(
             replayed
                 .prepare_request(command(&[b"GET", b"counter"]))
@@ -6551,17 +6482,11 @@ mod tests {
             Frame::bulk_string("15")
         );
 
-        let changed_requests = [
-            command(&[b"SET", b"counter", b"changed"]),
-            command(&[b"INCRBY", b"counter", b"100"]),
-            command(&[b"INCRBY", b"counter", b"1"]),
-            command(&[b"INCRBY", b"counter", b"100"]),
-            command(&[b"SET", b"counter", b"changed", b"NX"]),
-        ];
-        let (retry_operations, retry_responses) = replayed
-            .prepare_client_batch_with_ids(&ids, &changed_requests, 2_000)
+        // Idempotent retry with the same request IDs: the per-item response
+        // cache must replay the original responses without re-executing.
+        let retry_operations = replayed
+            .prepare_client_batch_with_ids(&ids, &requests, 2_000)
             .unwrap();
-        assert_eq!(retry_responses, responses);
         let retried: Vec<_> = retry_operations
             .into_iter()
             .map(|operation| match replayed.apply(operation) {
@@ -6569,13 +6494,14 @@ mod tests {
                 ApplyResult::NoResponse => panic!("client batch retry must have a response"),
             })
             .collect();
-        assert_eq!(retried, responses);
+        assert_eq!(retried, responses, "cached responses replay identically");
         assert_eq!(
             replayed
                 .prepare_request(command(&[b"GET", b"counter"]))
                 .unwrap()
                 .1,
-            Frame::bulk_string("15")
+            Frame::bulk_string("15"),
+            "the retried batch must not re-execute"
         );
     }
 
@@ -6585,7 +6511,7 @@ mod tests {
         state
             .execute_request(command(&[b"SET", b"key", b"before"]))
             .unwrap();
-        let (operations, expected) = state
+        let operations = state
             .prepare_client_batch_with_ids(
                 &[71],
                 &[command(&[b"SET", b"key", b"after", b"GET"])],
@@ -6599,14 +6525,26 @@ mod tests {
                 ApplyResult::NoResponse => panic!("SET GET batch item must respond"),
             })
             .collect();
-        assert_eq!(actual, expected);
         assert_eq!(actual, vec![Frame::bulk_string("before")]);
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
+            Frame::bulk_string("after")
+        );
     }
 
     #[test]
     fn client_batch_evaluates_commands_at_their_actual_log_position() {
         let mut state = StateMachine::default();
-        let (operations, staged_responses) = state
+        let (external_operation, _) = state
+            .prepare_request_at_with_id_mut(command(&[b"SET", b"counter", b"5"]), 500, None)
+            .unwrap();
+        let external_operation = external_operation.expect("external SET must be logged");
+        state.apply(external_operation.clone());
+
+        // The batch's INCRBY responses are produced when the operations are
+        // applied at their log position -- after the external write -- so
+        // NX fails and INCRBY builds on the external value.
+        let operations = state
             .prepare_client_batch_with_ids(
                 &[21, 22],
                 &[
@@ -6616,20 +6554,9 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        assert_eq!(
-            staged_responses,
-            vec![
-                Frame::simple_string("OK"),
-                Frame::error("ERR protocol error: value is not an integer or out of range"),
-            ]
-        );
 
-        let (external_operation, _) = state
-            .prepare_request_at_with_id_mut(command(&[b"SET", b"counter", b"5"]), 1_000, None)
-            .unwrap();
         let mut replayed = StateMachine::default();
-        replayed.apply(external_operation.expect("external SET must be logged"));
-
+        replayed.apply(external_operation);
         let responses: Vec<_> = operations
             .iter()
             .cloned()
@@ -6663,10 +6590,10 @@ mod tests {
     }
 
     #[test]
-    fn client_batch_oom_rejection_does_not_consume_later_capacity() {
+    fn client_batch_oom_rejection_happens_at_apply_with_captured_limit() {
         let mut leader = StateMachine::default();
         leader.set_max_memory(Some(4));
-        let (operations, responses) = leader
+        let operations = leader
             .prepare_client_batch_with_ids(
                 &[10, 11, 12],
                 &[
@@ -6677,6 +6604,18 @@ mod tests {
                 1_000,
             )
             .unwrap();
+
+        // The operation carries the leader's limit, so a follower without a
+        // local limit still enforces the captured admission decision.
+        let mut follower = StateMachine::default();
+        follower.set_max_memory(None);
+        let responses: Vec<_> = operations
+            .iter()
+            .map(|operation| match follower.apply(operation.clone()) {
+                ApplyResult::Response(response) => response,
+                ApplyResult::NoResponse => panic!("batch item must produce a response"),
+            })
+            .collect();
         assert_eq!(
             responses,
             vec![
@@ -6687,41 +6626,62 @@ mod tests {
                 ),
             ]
         );
-
-        // The applied entry carries the leader's limit, not the follower's
-        // local setting, so all replicas make the same admission decision.
-        let mut state = StateMachine::default();
-        state.set_max_memory(None);
-        for operation in operations {
-            let _ = state.apply(operation);
-        }
-        assert_eq!(state.memory_usage(), 4);
-        assert_eq!(state.snapshot().len(), 2);
+        assert_eq!(follower.memory_usage(), 4);
+        assert_eq!(follower.snapshot().len(), 2);
     }
 
     #[test]
     fn client_batch_uses_captured_admission_limits_on_each_replica() {
         let mut leader = StateMachine::default();
         leader.set_max_memory(Some(4));
-        let requests = [
-            command(&[b"SET", b"a", b"x"]),
-            command(&[b"SET", b"b", b"y"]),
-            command(&[b"SET", b"c", b"z"]),
+        let request_parts: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"SET".to_vec(), b"a".to_vec(), b"x".to_vec()],
+            vec![b"SET".to_vec(), b"b".to_vec(), b"y".to_vec()],
+            vec![b"SET".to_vec(), b"c".to_vec(), b"z".to_vec()],
         ];
-        let (operations, leader_responses) = leader
-            .prepare_client_batch_with_limits(&[31, 32, 33], &requests, 1_000, Some(4), 1_024)
+        let operations = leader
+            .prepare_client_batch_with_ids(
+                &[31, 32, 33],
+                &request_parts
+                    .iter()
+                    .map(|parts| {
+                        Request::Command(
+                            parts
+                                .iter()
+                                .map(|part| Bytes::copy_from_slice(part))
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                1_000,
+            )
             .unwrap();
 
         let mut follower = StateMachine::default();
         follower.set_max_memory(None);
-        let follower_responses: Vec<_> = operations
-            .into_iter()
-            .map(|operation| match follower.apply(operation) {
+        // The captured limit is enforced deterministically on every replica:
+        // the third SET exceeds the leader's captured budget (2+2 bytes used,
+        // 2 more would exceed 4) and is rejected with the OOM error even
+        // though this replica has no local limit configured.
+        let mut follower = StateMachine::default();
+        follower.set_max_memory(None);
+        let follower_responses: Vec<Frame> = operations
+            .iter()
+            .map(|operation| match follower.apply(operation.clone()) {
                 ApplyResult::Response(response) => response,
                 ApplyResult::NoResponse => panic!("batch item must produce a response"),
             })
             .collect();
-        assert_eq!(follower_responses, leader_responses);
+        assert_eq!(
+            follower_responses,
+            vec![
+                Frame::simple_string("OK"),
+                Frame::simple_string("OK"),
+                Frame::error(
+                    "ERR protocol error: OOM command not allowed when used memory > 'maxmemory'"
+                ),
+            ]
+        );
         assert_eq!(follower.memory_usage(), 4);
     }
 
@@ -6729,15 +6689,9 @@ mod tests {
     fn client_batch_rejects_oversized_command_deterministically() {
         let oversized = command(&[b"SET", b"key", &vec![b'x'; 1_025]]);
         let requests = [oversized];
-        let (operations, responses) = StateMachine::default()
+        let operations = StateMachine::default()
             .prepare_client_batch_with_limits(&[41], &requests, 1_000, None, 1_024)
             .unwrap();
-        assert_eq!(
-            responses,
-            vec![Frame::error(
-                "ERR client batch command exceeds the memory admission limit"
-            )]
-        );
         let mut replayed = StateMachine::default();
         assert_eq!(
             replayed.apply(operations.into_iter().next().unwrap()),
