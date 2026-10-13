@@ -14,13 +14,12 @@ use crate::error::{Error, Result};
 use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, Request, RespVersion, command_from_frame};
 use crate::raft::{
-    ClientBatchOutcome, ClientRequestOutcome, RaftHandle, client_batch_fits, enable_raft_runtime,
-    execute_client_batch_request_with_ids, execute_client_request_with_id,
-    execute_transaction_request_with_id, new_client_request_id,
-    new_tcp_raft_for_server_with_metrics, open_single_node_with_metrics, run_expiration_worker,
-    run_leader_time_worker, send_client_batch_request_with_ids, send_client_request_with_id,
-    send_transaction_request_with_id, serve_raft_rpc_with_tls, split_client_batch_requests,
-    wait_for_any_leader, watch_key_versions,
+    BatchCommitterHandle, ClientBatchOutcome, ClientRequestOutcome, RaftHandle, client_batch_fits,
+    enable_raft_runtime, execute_client_request_with_id, execute_transaction_request_with_id,
+    new_client_request_id, new_tcp_raft_for_server_with_metrics, open_single_node_with_metrics,
+    run_expiration_worker, run_leader_time_worker, send_client_batch_request_with_ids,
+    send_client_request_with_id, send_transaction_request_with_id, serve_raft_rpc_with_tls,
+    split_client_batch_requests, wait_for_any_leader, watch_key_versions,
 };
 use crate::sentinel::{self, SentinelContext};
 use crate::state_machine::{
@@ -138,6 +137,10 @@ impl Server {
             )
             .await;
         });
+        // One coalescing committer per node: every connection's batch joins
+        // whatever is already queued, so raft appends grow with load instead
+        // of connection count.
+        let batch_committer = BatchCommitterHandle::spawn((*raft).clone());
         if !self.config.cluster_nodes.is_empty() {
             wait_for_any_leader(&raft).await?;
         }
@@ -154,6 +157,7 @@ impl Server {
                     let tls_acceptor = client_tls_acceptor.clone();
                     let tls_connector = tls_connector.clone();
                     let connection_stats = stats.clone();
+                    let connection_committer = batch_committer.clone();
                     let max_connections = self.config.max_connections as usize;
                     let live_connections = Arc::clone(&live_connections);
                     tokio::spawn(async move {
@@ -184,6 +188,7 @@ impl Server {
                                         password,
                                         tls_connector.clone(),
                                         connection_stats.clone(),
+                                        connection_committer.clone(),
                                     )
                                     .await
                                 }
@@ -201,6 +206,7 @@ impl Server {
                                     password,
                                     tls_connector.clone(),
                                     connection_stats,
+                                    connection_committer,
                                 )
                                 .await
                             }
@@ -307,6 +313,7 @@ async fn handle_raft_connection(
     password: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     stats: crate::info::StatsContext,
+    batch_committer: BatchCommitterHandle,
 ) -> Result<()> {
     let mut decoder = Decoder::new(limits);
     let mut input = [0_u8; 8 * 1024];
@@ -362,6 +369,7 @@ async fn handle_raft_connection(
                             for response in execute_client_batch_with_tls(
                                 &raft,
                                 std::mem::take(&mut write_batch),
+                                &batch_committer,
                                 tls_connector.clone(),
                             )
                             .await
@@ -385,6 +393,7 @@ async fn handle_raft_connection(
                         for response in execute_client_batch_with_tls(
                             &raft,
                             write_batch,
+                            &batch_committer,
                             tls_connector.clone(),
                         )
                         .await
@@ -798,6 +807,7 @@ async fn execute_client_command_with_tls(
 async fn execute_client_batch_with_tls(
     raft: &RaftHandle,
     requests: Vec<Request>,
+    batch_committer: &BatchCommitterHandle,
     tls_connector: Option<TlsConnector>,
 ) -> Vec<Frame> {
     let mut responses = Vec::with_capacity(requests.len());
@@ -814,8 +824,15 @@ async fn execute_client_batch_with_tls(
             .into_iter()
             .map(|request| (new_client_request_id(), request))
             .collect();
-        responses
-            .extend(execute_client_batch_chunk_with_tls(raft, items, tls_connector.clone()).await);
+        responses.extend(
+            execute_client_batch_chunk_with_tls(
+                raft,
+                items,
+                batch_committer,
+                tls_connector.clone(),
+            )
+            .await,
+        );
     }
     responses
 }
@@ -823,11 +840,12 @@ async fn execute_client_batch_with_tls(
 async fn execute_client_batch_chunk_with_tls(
     raft: &RaftHandle,
     items: Vec<(crate::state_machine::ClientRequestId, Request)>,
+    batch_committer: &BatchCommitterHandle,
     tls_connector: Option<TlsConnector>,
 ) -> Vec<Frame> {
     let request_count = items.len();
     let option = openraft::network::RPCOption::new(std::time::Duration::from_secs(1));
-    match execute_client_batch_request_with_ids(raft, items.clone()).await {
+    match batch_committer.execute(raft, items.clone()).await {
         Ok(ClientBatchOutcome::Applied(responses)) if responses.len() == request_count => responses,
         Ok(ClientBatchOutcome::Applied(responses)) => batch_error_frames(
             request_count,
@@ -1021,6 +1039,7 @@ mod tests {
                                     password,
                                     None,
                                     crate::info::StatsContext::new("target/stats-test", 0, None),
+                                    BatchCommitterHandle::direct(),
                                 )
                                 .await;
                             });
@@ -1446,6 +1465,7 @@ mod tests {
                 None,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
@@ -1606,6 +1626,7 @@ mod tests {
                 password,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
@@ -1759,6 +1780,7 @@ mod tests {
                                 None,
                                 None,
                                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                                BatchCommitterHandle::direct(),
                             )
                             .await;
                             live_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1840,6 +1862,7 @@ mod tests {
                 None,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
@@ -1952,6 +1975,7 @@ mod tests {
                 None,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
@@ -2029,6 +2053,7 @@ mod tests {
                 None,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
@@ -2127,6 +2152,7 @@ mod tests {
                 None,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
@@ -2196,6 +2222,7 @@ mod tests {
                 None,
                 None,
                 crate::info::StatsContext::new("target/stats-test", 0, None),
+                BatchCommitterHandle::direct(),
             )
             .await
         });
