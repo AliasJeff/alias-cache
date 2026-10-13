@@ -711,6 +711,26 @@ async fn handle_transaction_command(
         watched.clear();
         return Frame::simple_string("OK");
     }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"EVALSHA")) {
+        // EVALSHA source lookup is out of scope for the first version; the
+        // stable error matches Redis so clients fall back to EVAL.
+        return Frame::error("NOSCRIPT No matching script. Please use EVAL.");
+    }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"SCRIPT")) {
+        return Frame::error("ERR SCRIPT is not supported; use EVAL directly");
+    }
+    if command.is_some_and(|command| command.eq_ignore_ascii_case(b"EVAL")) {
+        if arguments.len() < 3 {
+            return Frame::error("ERR wrong number of arguments for 'eval' command");
+        }
+        let (source, keys, args) = match crate::lua::parse_eval_arguments(arguments) {
+            Ok(parts) => parts,
+            Err(message) => return Frame::error(message),
+        };
+        return crate::lua::eval_on_leader(raft, source, &keys, &args)
+            .await
+            .unwrap_or_else(Frame::error);
+    }
     if command.is_some_and(|command| command.eq_ignore_ascii_case(b"WATCH")) {
         if arguments.len() < 2 {
             return Frame::error("ERR wrong number of arguments for 'watch' command");

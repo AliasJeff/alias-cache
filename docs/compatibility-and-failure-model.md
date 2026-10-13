@@ -127,6 +127,19 @@ Stream 当前约束（非阻塞骨干）：
   范围；
 - 空流删除 key；XDEL 不回退 last_id；TYPE 返回 `stream`。
 
+Lua 脚本当前约束：
+
+- `EVAL script numkeys key... arg...`：脚本在 Leader 上执行一次，
+  `redis.call`/`redis.pcall` 产生的写作为确定性 Operation 进入一个 Raft
+  事务——副本只重放操作、不执行脚本，`math.random`/`os.time` 等
+  非确定性只在 Leader 侧生效一次，不影响一致性；
+- 沙箱：64 MiB 内存上限、每 1000 指令的中断钩子 + 5 秒执行预算、
+  io/os/require/loadfile 全局被移除；`redis.call` 首版仅接受写命令
+  （脚本内读返回错误，读语义与 MULTI/EXEC 相同）；
+- `EVALSHA` 返回 `NOSCRIPT`（脚本缓存未实现）、`SCRIPT` 返回不支持
+  错误——客户端回退 EVAL 即可；脚本写超过批量上限（1024 条）返回
+  稳定错误。
+
 遍历当前约束：
 
 - 游标是已返回成员数的十进制文本，语义为快照内偏移：同一批数据反复迭代

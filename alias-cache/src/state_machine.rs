@@ -2723,7 +2723,7 @@ impl StateMachine {
         for pair in arguments[3..].chunks_exact(2) {
             fields.push((pair[0].clone(), pair[1].clone()));
         }
-        if arguments[3..].len() % 2 != 0 {
+        if !arguments[3..].len().is_multiple_of(2) {
             return Err(Error::protocol(
                 "ERR wrong number of arguments for 'xadd' command",
             ));
@@ -2741,14 +2741,12 @@ impl StateMachine {
             self.values
                 .get(&key)
                 .filter(|entry| !self.is_expired(entry)),
-        ) {
-            if let Value::Stream { last_id, .. } = &entry.value {
-                if explicit <= *last_id {
-                    return Err(Error::protocol(
-                        "ERR The ID specified in XADD is equal or smaller than the target stream top item",
-                    ));
-                }
-            }
+        ) && let Value::Stream { last_id, .. } = &entry.value
+            && explicit <= *last_id
+        {
+            return Err(Error::protocol(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+            ));
         }
         // The response (the concrete ID) is computed by apply, so the reply
         // here mirrors it via the logical clock when auto.

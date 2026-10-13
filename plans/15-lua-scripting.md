@@ -118,6 +118,23 @@
 - 收集器模型不支持脚本内读的首版限制若被真实场景需要 → 迭代二：
   leader 快照同步读（依旧零 unsafe），作为独立小步提交。
 
+## 完成记录（2026-10-13 已交付首版）
+
+- mlua（lua51 vendored + send）沙箱：64 MiB 内存上限、每 1000 指令中断
+  钩子 + 5 秒执行预算（spawn_blocking 外层 timeout 置位中断标志）、
+  io/os/require/dofile/loadfile 全局移除——三护栏各有测试。
+- 收集器模型：`redis.call`/`pcall` 把命令记录进收集器，脚本结束后统一
+  在状态机工作副本上 prepare，打包为一条 raft 事务（复用事务提交、
+  幂等与一致性检查）——零 unsafe，消除了 cache-cat 的裸指针桥接。
+- `redis.call` 首版仅接受写命令与字符串/整数参数（脚本内读暂不支持，
+  与 MULTI/EXEC 的读限制一致）；KEYS/ARGV 以显式 1-based 表注入
+  （mlua 的 Vec 直转会破坏形状，实测踩坑）。
+- EVAL 端到端：leader 上收集两条写 → 单事务提交 → 副本状态一致；
+  死循环脚本被钩子中断；内存滥用被拒。EVALSHA 返回 NOSCRIPT、SCRIPT
+  返回不支持（客户端回退 EVAL）；兼容文档新增 Lua 约束章节。
+- 裁剪项（后续迭代）：脚本缓存（EVALSHA 完整实现）、脚本内读、
+  SCRIPT FLUSH/LOAD。
+
 ## 完成标准
 
 - 沙箱三护栏（超时/内存/io 隔离）测试在案。

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod info;
+pub mod lua;
 pub mod node_state;
 pub mod protocol;
 pub mod raft;

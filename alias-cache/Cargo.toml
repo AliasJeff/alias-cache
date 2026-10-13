@@ -17,6 +17,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
+mlua.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
