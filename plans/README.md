@@ -28,11 +28,13 @@
 13. [批量写管线与性能主张](13-batch-write-pipeline.md)
 14. [Bitmap、Bloom Filter 与 Stream](14-bitmap-bf-stream.md)
 15. [Lua 脚本（EVAL / EVALSHA / SCRIPT）](15-lua-scripting.md)
+16. [写吞吐对等实测：分层消除瓶颈，对齐 cache-cat 测量口径](16-benchmark-parity.md)
 
-13-15 为第二轮扩展：13 的批量提交架构与 redis-benchmark 兼容检查已实现，
-但高吞吐目标未达成，当前应先补齐性能剖析与尾延迟治理；随后按
-风险递增做 14（Bitmap → BF → Stream 非阻塞骨干）；15 收尾（leader
-执行/结果复制模型 + mlua 沙箱，消除 cache-cat 的 unsafe 桥接）。
+13 已交付批量提交架构与 redis-benchmark 交叉验证（SET 17,440 ops/s），
+吞吐门禁按 8 轮实测修订并留档；14/15 已全部交付（Bitmap/BF/Stream、
+Lua 收集器模型）。16 为第三阶段：以 cache-cat 本体的对等实测替代宣传
+数字，分层消除批量路径软件瓶颈（状态机 clone、快照 IO、管线深度），
+建立"RESP 产品口径 / raft 直连诊断口径"的双口径测量体系。
 
 核心契约见：
 
