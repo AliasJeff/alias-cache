@@ -2625,123 +2625,143 @@ async fn handle_raft_rpc(
     raft: RaftHandle,
     shutdown: Arc<tokio::sync::watch::Receiver<bool>>,
 ) -> CacheResult<()> {
-    let request = tokio::select! {
-        result = read_network_message(&mut stream) => result?,
-        result = wait_for_raft_shutdown(shutdown) => {
-            result?;
-            return Ok(());
-        }
-    };
-    let response = match request {
-        NetworkRequest::Append(request) => NetworkResponse::Append(
-            raft.append_entries(request)
-                .await
-                .map_err(|error| error.to_string()),
-        ),
-        NetworkRequest::Vote(request) => {
-            NetworkResponse::Vote(raft.vote(request).await.map_err(|error| error.to_string()))
-        }
-        NetworkRequest::PreVote(request) => NetworkResponse::Vote(
-            raft.pre_vote(request)
-                .await
-                .map_err(|error| error.to_string()),
-        ),
-        NetworkRequest::Client {
-            request_id,
-            request,
-        } => {
-            let response = execute_client_request_with_id(&raft, request_id, request)
-                .await
-                .map(|outcome| match outcome {
-                    ClientRequestOutcome::Applied(frame) => frame,
-                    ClientRequestOutcome::Redirect(address) => {
-                        // Client forwarding is intentionally one hop. The edge server
-                        // resolves the next leader and owns the retry boundary.
-                        Frame::error(format!("MOVED {address}"))
-                    }
-                });
-            NetworkResponse::Client(response)
-        }
-        NetworkRequest::Transaction {
-            request_id,
-            requests,
-        } => {
-            let response =
-                execute_transaction_request_with_id(&raft, request_id, requests, Vec::new())
+    // Persistent session: one connection serves many raft RPCs. Clean client
+    // EOF (no bytes) ends the session; partial frames surface as errors.
+    loop {
+        let shutdown = Arc::clone(&shutdown);
+        let request = tokio::select! {
+            result = read_network_message(&mut stream) => match result {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    eprintln!("RAFT_RPC_DEBUG: client EOF, closing session");
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!("RAFT_RPC_DEBUG: read error {error}");
+                    return Err(error);
+                }
+            },
+            result = wait_for_raft_shutdown(shutdown) => {
+                result?;
+                return Ok(());
+            }
+        };
+        let response = match request {
+            NetworkRequest::Append(request) => NetworkResponse::Append(
+                raft.append_entries(request)
+                    .await
+                    .map_err(|error| error.to_string()),
+            ),
+            NetworkRequest::Vote(request) => {
+                NetworkResponse::Vote(raft.vote(request).await.map_err(|error| error.to_string()))
+            }
+            NetworkRequest::PreVote(request) => NetworkResponse::Vote(
+                raft.pre_vote(request)
+                    .await
+                    .map_err(|error| error.to_string()),
+            ),
+            NetworkRequest::Client {
+                request_id,
+                request,
+            } => {
+                let response = execute_client_request_with_id(&raft, request_id, request)
                     .await
                     .map(|outcome| match outcome {
                         ClientRequestOutcome::Applied(frame) => frame,
                         ClientRequestOutcome::Redirect(address) => {
+                            // Client forwarding is intentionally one hop. The edge server
+                            // resolves the next leader and owns the retry boundary.
                             Frame::error(format!("MOVED {address}"))
                         }
                     });
-            NetworkResponse::Client(response)
-        }
-        NetworkRequest::ClientBatch { items } => {
-            NetworkResponse::ClientBatch(execute_client_batch_request_with_ids(&raft, items).await)
-        }
-        NetworkRequest::Snapshot {
-            vote,
-            snapshot,
-            meta,
-        } => {
-            let response = raft
-                .install_full_snapshot(
-                    vote,
-                    openraft::Snapshot {
-                        meta,
-                        snapshot: std::io::Cursor::new(snapshot),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string());
-            NetworkResponse::Snapshot(response)
-        }
-        NetworkRequest::SnapshotStart {
-            vote,
-            total_len,
-            checksum,
-            offset: _requested_offset,
-            meta,
-        } => {
-            let path = snapshot_transfer_path(total_len, checksum);
-            let resume = prepare_snapshot_transfer(&path, total_len, checksum)
-                .map_err(|error| error.to_string());
-            write_network_message(&mut stream, &NetworkResponse::SnapshotResume(resume)).await?;
-            let offset = match prepare_snapshot_transfer(&path, total_len, checksum) {
-                Ok(offset) => offset,
-                Err(_) => return Ok(()),
-            };
-            let snapshot =
-                receive_snapshot_chunks(&mut stream, total_len, checksum, &path, offset).await?;
-            let response = raft
-                .install_full_snapshot(
-                    vote,
-                    openraft::Snapshot {
-                        meta,
-                        snapshot: std::io::Cursor::new(snapshot),
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string());
-            if response.is_ok() {
-                let _ = fs::remove_file(&path);
+                NetworkResponse::Client(response)
             }
-            write_network_message(&mut stream, &NetworkResponse::Snapshot(response)).await?;
-            return Ok(());
-        }
-    };
-    write_network_message(&mut stream, &response).await
+            NetworkRequest::Transaction {
+                request_id,
+                requests,
+            } => {
+                let response =
+                    execute_transaction_request_with_id(&raft, request_id, requests, Vec::new())
+                        .await
+                        .map(|outcome| match outcome {
+                            ClientRequestOutcome::Applied(frame) => frame,
+                            ClientRequestOutcome::Redirect(address) => {
+                                Frame::error(format!("MOVED {address}"))
+                            }
+                        });
+                NetworkResponse::Client(response)
+            }
+            NetworkRequest::ClientBatch { items } => NetworkResponse::ClientBatch(
+                execute_client_batch_request_with_ids(&raft, items).await,
+            ),
+            NetworkRequest::Snapshot {
+                vote,
+                snapshot,
+                meta,
+            } => {
+                let response = raft
+                    .install_full_snapshot(
+                        vote,
+                        openraft::Snapshot {
+                            meta,
+                            snapshot: std::io::Cursor::new(snapshot),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                NetworkResponse::Snapshot(response)
+            }
+            NetworkRequest::SnapshotStart {
+                vote,
+                total_len,
+                checksum,
+                offset: _requested_offset,
+                meta,
+            } => {
+                let path = snapshot_transfer_path(total_len, checksum);
+                let resume = prepare_snapshot_transfer(&path, total_len, checksum)
+                    .map_err(|error| error.to_string());
+                write_network_message(&mut stream, &NetworkResponse::SnapshotResume(resume))
+                    .await?;
+                let offset = match prepare_snapshot_transfer(&path, total_len, checksum) {
+                    Ok(offset) => offset,
+                    Err(_) => return Ok(()),
+                };
+                let snapshot =
+                    receive_snapshot_chunks(&mut stream, total_len, checksum, &path, offset)
+                        .await?;
+                let response = raft
+                    .install_full_snapshot(
+                        vote,
+                        openraft::Snapshot {
+                            meta,
+                            snapshot: std::io::Cursor::new(snapshot),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                if response.is_ok() {
+                    let _ = fs::remove_file(&path);
+                }
+                write_network_message(&mut stream, &NetworkResponse::Snapshot(response)).await?;
+                return Ok(());
+            }
+        };
+        write_network_message(&mut stream, &response).await?;
+        eprintln!("RAFT_RPC_DEBUG: response written");
+    }
 }
 
 async fn read_network_message<T: for<'de> Deserialize<'de>>(
     stream: &mut (impl AsyncRead + Unpin),
-) -> CacheResult<T> {
+) -> CacheResult<Option<T>> {
     let mut header = [0_u8; 4];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(|error| Error::io("read raft rpc frame header", error))?;
+    if let Err(error) = stream.read_exact(&mut header).await
+        && error.kind() == std::io::ErrorKind::UnexpectedEof
+    {
+        // Clean client close before any byte: end of session.
+        return Ok(None);
+    }
     let length = u32::from_be_bytes(header) as usize;
     if length > NETWORK_MAX_FRAME {
         return Err(Error::protocol("raft rpc frame exceeds maximum size"));
@@ -2752,6 +2772,7 @@ async fn read_network_message<T: for<'de> Deserialize<'de>>(
         .await
         .map_err(|error| Error::io("read raft rpc frame", error))?;
     bincode::deserialize(&payload)
+        .map(Some)
         .map_err(|error| Error::server(format!("decode raft rpc frame: {error}")))
 }
 
@@ -4843,9 +4864,10 @@ mod tests {
                 .accept()
                 .await
                 .expect("snapshot client should connect");
-            let request: NetworkRequest = read_network_message(&mut stream)
+            let request: Option<NetworkRequest> = read_network_message(&mut stream)
                 .await
                 .expect("snapshot start should decode");
+            let request = request.expect("frame should decode");
             let NetworkRequest::SnapshotStart {
                 vote: received_vote,
                 total_len,
@@ -4917,9 +4939,10 @@ mod tests {
                 .accept()
                 .await
                 .expect("first client should connect");
-            let first_request: NetworkRequest = read_network_message(&mut first_stream)
+            let first_request: Option<NetworkRequest> = read_network_message(&mut first_stream)
                 .await
                 .expect("first snapshot start should decode");
+            let first_request = first_request.expect("frame should decode");
             let NetworkRequest::SnapshotStart {
                 vote: first_vote,
                 total_len: first_total_len,
@@ -4970,9 +4993,10 @@ mod tests {
                 .accept()
                 .await
                 .expect("second client should connect");
-            let second_request: NetworkRequest = read_network_message(&mut second_stream)
+            let second_request: Option<NetworkRequest> = read_network_message(&mut second_stream)
                 .await
                 .expect("second snapshot start should decode");
+            let second_request = second_request.expect("frame should decode");
             let NetworkRequest::SnapshotStart { .. } = second_request else {
                 panic!("second request should start a snapshot");
             };
