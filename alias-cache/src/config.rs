@@ -114,7 +114,7 @@ impl Default for Config {
             max_pipeline_len: 1_024,
             max_memory_bytes: 0,
             max_connections: 0,
-            snapshot_policy_logs: 64,
+            snapshot_policy_logs: 4096,
         }
     }
 }
@@ -300,10 +300,10 @@ impl Config {
     }
 
     /// Effective snapshot policy: log-count based, from the configured
-    /// threshold; zero falls back to the development default of 64.
+    /// threshold; zero falls back to the default of 4096.
     pub fn snapshot_policy(&self) -> u64 {
         if self.snapshot_policy_logs == 0 {
-            64
+            4096
         } else {
             self.snapshot_policy_logs
         }

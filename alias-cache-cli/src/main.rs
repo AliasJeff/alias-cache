@@ -78,7 +78,7 @@ struct Args {
     max_connections: u32,
 
     /// Create a raft snapshot after this many appended log entries.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 4096)]
     snapshot_policy: u64,
 }
 
@@ -225,12 +225,16 @@ mod tests {
     #[test]
     fn snapshot_policy_defaults_and_zero_falls_back() {
         let parsed = args(&["--node-id", "1"]).unwrap();
-        assert_eq!(parsed.snapshot_policy, 64);
+        assert_eq!(parsed.snapshot_policy, 4096);
         let config = build_config(&parsed).unwrap();
-        assert_eq!(config.snapshot_policy(), 64);
+        assert_eq!(config.snapshot_policy(), 4096);
         let zero =
             build_config(&args(&["--node-id", "1", "--snapshot-policy", "0"]).unwrap()).unwrap();
-        assert_eq!(zero.snapshot_policy(), 64, "zero falls back to the default");
+        assert_eq!(
+            zero.snapshot_policy(),
+            4096,
+            "zero falls back to the default"
+        );
         let custom =
             build_config(&args(&["--node-id", "1", "--snapshot-policy", "128"]).unwrap()).unwrap();
         assert_eq!(custom.snapshot_policy(), 128);
