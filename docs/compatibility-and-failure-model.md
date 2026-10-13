@@ -115,6 +115,18 @@ Bloom Filter 当前约束：
 - `BF.MADD`/`BF.MEXISTS`/`BF.SCANDUMP`/`BF.LOADCHUNK` 尚未纳入稳定
   兼容范围。
 
+Stream 当前约束（非阻塞骨干）：
+
+- `XADD key [NOMKSTREAM 裁剪] id field value...`：自动 ID（`*`）由复制
+  逻辑时钟毫秒 + 严格递增序号生成——**同日志重放产生相同 ID 序列**（
+  跨副本确定性的核心）；显式 ID 必须严格大于流顶部 ID；NOMKSTREAM 标记
+  当前不生效（首版裁剪）；
+- `XLEN`、`XRANGE - + [COUNT n]`（含端点、升序、每条目 `[id, [f, v...]]`
+  嵌套形状）、`XDEL`（缺失 ID 计 0）、`XTRIM key MAXLEN n`（从最旧端裁
+  剪）；阻塞读、消费者组（XREADGROUP/XACK）、XINFO 尚未纳入稳定兼容
+  范围；
+- 空流删除 key；XDEL 不回退 last_id；TYPE 返回 `stream`。
+
 遍历当前约束：
 
 - 游标是已返回成员数的十进制文本，语义为快照内偏移：同一批数据反复迭代

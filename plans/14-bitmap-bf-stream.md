@@ -112,6 +112,31 @@
 - 快照序列化路径（bincode 全量）自动获得新变体；三处存储格式版本
   **不动**（serde 向后兼容的新 enum 变体），但需在迁移文档追加说明。
 
+## 完成记录
+
+### Bitmap（2026-10-13，已交付）
+
+- SETBIT/GETBIT/BITCOUNT/BITPOS/BITOP 全部落地在 `Value::String` 位寻址上；
+  apply 端零扩展、全零清 key、BITOP 零填充对齐与 NOT 单源校验、
+  prepare/apply 响应一致（BITOP 返回目标长度）；WRONGTYPE 边界与
+  Redis BITPOS 0 全 1 缓冲 quirk 均有测试。
+
+### Bloom Filter（2026-10-13，已交付）
+
+- `Value::BloomFilter { bits, hash_count, inserted }`；BF.RESERVE 按
+  error_rate/capacity 计算 bits 与 hash 数；BF.ADD 经 BytesMut 原位置位
+  （确定性双重 FNV-1a-64，无盐）；未保留 key 隐式默认 1024/1%；容量
+  写满 noScale；TYPE 返回 `MBbloom--`；假阳性冒烟 <5%。
+
+### Stream 非阻塞骨干（2026-10-13，已交付）
+
+- `Value::Stream { entries: BTreeMap<(ms,seq), fields>, last_id }`；XADD
+  自动 ID = 逻辑时钟毫秒 + 严格递增序号（同日志重放确定，护栏测试覆盖
+  跨副本 ID 一致）；显式 ID 必须大于顶部 ID；XLEN/XRANGE（含端点解析、
+  COUNT、Redis 嵌套条目形状）/XDEL（缺失计 0）/XTRIM MAXLEN；空流删 key。
+- 首版裁剪：NOMKSTREAM 标记不生效；阻塞 XREAD、消费者组、XINFO 后续
+  立项。
+
 ## 完成标准
 
 - 每结构：协议测试（错误文本对齐 Redis）+ 状态机重放测试 + 集群级

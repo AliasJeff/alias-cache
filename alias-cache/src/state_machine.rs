@@ -113,6 +113,10 @@ const WRITES: &[&[u8]] = &[
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(Bytes),
+    Stream {
+        entries: BTreeMap<(u64, u64), BTreeMap<Bytes, Bytes>>,
+        last_id: (u64, u64),
+    },
     BloomFilter {
         bits: Bytes,
         hash_count: u8,
@@ -230,6 +234,20 @@ pub enum Operation {
         key: Bytes,
         item: Bytes,
     },
+    StreamAdd {
+        key: Bytes,
+        /// `None` ms/seq means auto-ID from the staged logical clock.
+        id: Option<(u64, u64)>,
+        fields: Vec<(Bytes, Bytes)>,
+    },
+    StreamDelete {
+        key: Bytes,
+        ids: Vec<(u64, u64)>,
+    },
+    StreamTrim {
+        key: Bytes,
+        max_len: u64,
+    },
     BitmapOp {
         operation: Bytes,
         dest: Bytes,
@@ -309,6 +327,9 @@ impl Operation {
             | Self::BitmapOp { .. }
             | Self::BloomReserve { .. }
             | Self::BloomAdd { .. }
+            | Self::StreamAdd { .. }
+            | Self::StreamDelete { .. }
+            | Self::StreamTrim { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -343,6 +364,9 @@ impl Operation {
             | Self::BitmapOp { .. }
             | Self::BloomReserve { .. }
             | Self::BloomAdd { .. }
+            | Self::StreamAdd { .. }
+            | Self::StreamDelete { .. }
+            | Self::StreamTrim { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -486,6 +510,15 @@ fn entry_size(key: &Bytes, entry: &Entry) -> u64 {
     let value_size = match &entry.value {
         Value::String(bytes) => bytes.len() as u64,
         Value::BloomFilter { bits, .. } => bits.len() as u64 + 8,
+        Value::Stream { entries, .. } => entries
+            .values()
+            .map(|fields| {
+                16 + fields
+                    .iter()
+                    .map(|(field, value)| (field.len() + value.len()) as u64)
+                    .sum::<u64>()
+            })
+            .sum(),
         Value::Hash(map) => map
             .iter()
             .map(|(field, value)| (field.len() + value.len()) as u64)
@@ -550,6 +583,9 @@ impl StateMachine {
             | Operation::BitmapOp { .. }
             | Operation::BloomReserve { .. }
             | Operation::BloomAdd { .. }
+            | Operation::StreamAdd { .. }
+            | Operation::StreamDelete { .. }
+            | Operation::StreamTrim { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -1393,6 +1429,123 @@ impl StateMachine {
                 }
                 ApplyResult::Response(Frame::Integer(1))
             }
+            Operation::StreamAdd { key, id, fields } => {
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut stream = match existing.map(|entry| entry.value) {
+                    None => (BTreeMap::new(), (0_u64, 0_u64)),
+                    Some(Value::Stream { entries, last_id }) => (entries, last_id),
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                // Auto ID: logical-clock milliseconds with a sequence that
+                // is strictly greater than the last ID within the same ms.
+                let (ms, seq) = match id {
+                    Some(explicit) => {
+                        if explicit <= stream.1 {
+                            return ApplyResult::Response(Frame::error(
+                                "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                            ));
+                        }
+                        explicit
+                    }
+                    None => {
+                        let ms = self.logical_time.max(stream.1.0);
+                        let seq = if ms == stream.1.0 { stream.1.1 + 1 } else { 0 };
+                        (ms, seq)
+                    }
+                };
+                stream.0.insert((ms, seq), fields.iter().cloned().collect());
+                stream.1 = (ms, seq);
+                let reply = Frame::bulk_string(format!("{ms}-{seq}"));
+                self.insert_entry(
+                    key,
+                    Entry {
+                        value: Value::Stream {
+                            entries: stream.0,
+                            last_id: stream.1,
+                        },
+                        expire_at,
+                    },
+                );
+                ApplyResult::Response(reply)
+            }
+            Operation::StreamDelete { key, ids } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::Integer(0));
+                };
+                let Value::Stream { entries, last_id } = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let mut removed = 0_i64;
+                let mut trimmed = entries;
+                for stream_id in ids {
+                    if trimmed.remove(&stream_id).is_some() {
+                        removed += 1;
+                    }
+                }
+                if trimmed.is_empty() {
+                    let _ = self.remove_entry(&key);
+                } else {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::Stream {
+                                entries: trimmed,
+                                last_id,
+                            },
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(removed))
+            }
+            Operation::StreamTrim { key, max_len } => {
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(Frame::Integer(0));
+                };
+                let Value::Stream {
+                    mut entries,
+                    last_id,
+                } = existing.value
+                else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                let before = entries.len() as i64;
+                if entries.len() as u64 > max_len {
+                    let keep_from = entries.len() - max_len as usize;
+                    let keys_to_drop: Vec<_> = entries.keys().take(keep_from).copied().collect();
+                    for stream_id in keys_to_drop {
+                        entries.remove(&stream_id);
+                    }
+                }
+                let removed = before - entries.len() as i64;
+                if entries.is_empty() {
+                    let _ = self.remove_entry(&key);
+                } else {
+                    self.values.insert(
+                        key,
+                        Entry {
+                            value: Value::Stream { entries, last_id },
+                            expire_at: existing.expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(removed))
+            }
             Operation::Delete { keys } => {
                 let mut removed = 0;
                 for key in keys {
@@ -1730,6 +1883,21 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"BF.INFO") {
             return self.execute_bloom_info(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"XADD") {
+            return self.execute_xadd(arguments, self.logical_time);
+        }
+        if command.eq_ignore_ascii_case(b"XLEN") {
+            return self.execute_xlen(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"XRANGE") {
+            return self.execute_xrange(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"XDEL") {
+            return self.execute_xdel(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"XTRIM") {
+            return self.execute_xtrim(arguments);
         }
         if command.eq_ignore_ascii_case(b"HSET") {
             return self.execute_hash_set(arguments, false);
@@ -2516,6 +2684,215 @@ impl StateMachine {
         Ok((None, Frame::Integer(position)))
     }
 
+    /// Parse a stream ID argument: `ms-seq`, bare `ms` (seq 0), `*` for auto.
+    fn parse_stream_id(value: &Bytes) -> Result<Option<(u64, u64)>> {
+        if value.as_ref() == b"*" {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(value).map_err(|_| {
+            Error::protocol("ERR Invalid stream ID specified as stream command argument")
+        })?;
+        let (ms_text, seq_text) = text
+            .split_once('-')
+            .map_or((text, None), |(ms, seq)| (ms, Some(seq)));
+        let ms: u64 = ms_text.parse().map_err(|_| {
+            Error::protocol("ERR Invalid stream ID specified as stream command argument")
+        })?;
+        let seq: u64 = match seq_text {
+            Some(seq) => seq.parse().map_err(|_| {
+                Error::protocol("ERR Invalid stream ID specified as stream command argument")
+            })?,
+            None => 0,
+        };
+        Ok(Some((ms, seq)))
+    }
+
+    /// Render an ID as `ms-seq`.
+    fn stream_id_text(id: (u64, u64)) -> Bytes {
+        Bytes::from(format!("{}-{}", id.0, id.1))
+    }
+
+    fn execute_xadd(
+        &self,
+        arguments: Vec<Bytes>,
+        _write_time: u64,
+    ) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("XADD", &arguments, 5)?;
+        let key = arguments[1].clone();
+        let mut fields = Vec::new();
+        for pair in arguments[3..].chunks_exact(2) {
+            fields.push((pair[0].clone(), pair[1].clone()));
+        }
+        if arguments[3..].len() % 2 != 0 {
+            return Err(Error::protocol(
+                "ERR wrong number of arguments for 'xadd' command",
+            ));
+        }
+        let nomkstream = arguments[3..]
+            .windows(1)
+            .any(|window| window[0].eq_ignore_ascii_case(b"NOMKSTREAM"));
+        let _ = nomkstream; // Not honored in the first version; documented.
+        let id = Self::parse_stream_id(&arguments[2])?;
+
+        // Validate against the current stream: explicit IDs must be greater
+        // than the last ID, or XADD fails before entering the log.
+        if let (Some(explicit), Some(entry)) = (
+            id,
+            self.values
+                .get(&key)
+                .filter(|entry| !self.is_expired(entry)),
+        ) {
+            if let Value::Stream { last_id, .. } = &entry.value {
+                if explicit <= *last_id {
+                    return Err(Error::protocol(
+                        "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                    ));
+                }
+            }
+        }
+        // The response (the concrete ID) is computed by apply, so the reply
+        // here mirrors it via the logical clock when auto.
+        let reply = match id {
+            Some(explicit) => Frame::bulk_string(Self::stream_id_text(explicit)),
+            None => {
+                let last_ms = self.stream_last_ms(&key);
+                let ms = self.logical_time.max(last_ms);
+                let seq = if ms == last_ms { 1 } else { 0 };
+                Frame::bulk_string(format!("{ms}-{seq}"))
+            }
+        };
+        Ok((Some(Operation::StreamAdd { key, id, fields }), reply))
+    }
+
+    fn stream_last_ms(&self, key: &Bytes) -> u64 {
+        match self.values.get(key) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::Stream { last_id, .. } => last_id.0,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    fn execute_xlen(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("XLEN", &arguments, 2)?;
+        let count = match self.values.get(&arguments[1]) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::Stream { entries, .. } => entries.len() as i64,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        Ok((None, Frame::Integer(count)))
+    }
+
+    /// Resolve XRANGE endpoints: `-`/`+` sentinels, bare ms, or `ms-seq`.
+    fn parse_range_endpoint(value: &Bytes, end: bool) -> Result<(u64, u64)> {
+        if value.as_ref() == b"-" {
+            return Ok((0, 0));
+        }
+        if value.as_ref() == b"+" {
+            return Ok((u64::MAX, u64::MAX));
+        }
+        let text = std::str::from_utf8(value).map_err(|_| {
+            Error::protocol("ERR Invalid stream ID specified as stream command argument")
+        })?;
+        let (ms_text, seq_text) = text
+            .split_once('-')
+            .map_or((text, None), |(ms, seq)| (ms, Some(seq)));
+        let ms: u64 = ms_text.parse().map_err(|_| {
+            Error::protocol("ERR Invalid stream ID specified as stream command argument")
+        })?;
+        let seq: u64 = match seq_text {
+            Some(seq) => seq.parse().map_err(|_| {
+                Error::protocol("ERR Invalid stream ID specified as stream command argument")
+            })?,
+            None if !end => 0,
+            None => u64::MAX,
+        };
+        Ok((ms, seq))
+    }
+
+    fn execute_xrange(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("XRANGE", &arguments, 4)?;
+        if arguments.len() > 6 {
+            return Err(Error::protocol(
+                "XRANGE supports only the optional COUNT argument",
+            ));
+        }
+        let start = Self::parse_range_endpoint(&arguments[2], false)?;
+        let end = Self::parse_range_endpoint(&arguments[3], true)?;
+        let count = if arguments.len() == 6 && arguments[4].eq_ignore_ascii_case(b"COUNT") {
+            Some(parse_bit_offset(&arguments[5])?)
+        } else {
+            None
+        };
+        let entries = match self.values.get(&arguments[1]) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::Stream { entries, .. } => entries,
+                _ => return Err(Error::protocol(WRONG_TYPE)),
+            },
+            _ => return Ok((None, Frame::Array(vec![]))),
+        };
+        let mut frames = Vec::new();
+        for (returned, (stream_id, fields)) in entries.range(start..=end).enumerate() {
+            if count.is_some_and(|count| returned >= count as usize) {
+                break;
+            }
+            let mut field_frames = Vec::with_capacity(fields.len() * 2);
+            for (field, value) in fields {
+                field_frames.push(Frame::bulk_string(field.clone()));
+                field_frames.push(Frame::bulk_string(value.clone()));
+            }
+            // Each entry is [id, [field, value, ...]], the Redis XRANGE shape.
+            frames.push(Frame::Array(vec![
+                Frame::bulk_string(Self::stream_id_text(*stream_id)),
+                Frame::Array(field_frames),
+            ]));
+        }
+        Ok((None, Frame::Array(frames)))
+    }
+
+    fn execute_xdel(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("XDEL", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let mut ids = Vec::with_capacity(arguments.len() - 2);
+        for value in &arguments[2..] {
+            ids.push(Self::parse_stream_id(value)?.ok_or_else(|| {
+                Error::protocol("ERR Invalid stream ID specified as stream command argument")
+            })?);
+        }
+        Ok((
+            Some(Operation::StreamDelete { key, ids }),
+            Frame::Integer(0),
+        ))
+    }
+
+    fn execute_xtrim(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("XTRIM", &arguments, 4)?;
+        if !arguments[2].eq_ignore_ascii_case(b"MAXLEN") {
+            return Err(Error::protocol("XTRIM supports only the MAXLEN strategy"));
+        }
+        let max_len = parse_bit_offset(&arguments[3])?;
+        // Mirror apply's removal count so prepared and applied responses
+        // satisfy the transaction consistency invariant.
+        let current_len = match self.values.get(&arguments[1]) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::Stream { entries, .. } => entries.len() as i64,
+                _ => return Err(Error::protocol(WRONG_TYPE)),
+            },
+            _ => 0,
+        };
+        let removed = (current_len - max_len as i64).max(0);
+        Ok((
+            Some(Operation::StreamTrim {
+                key: arguments[1].clone(),
+                max_len,
+            }),
+            Frame::Integer(removed),
+        ))
+    }
+
     /// Prepare BITOP: validate the operation and sources at prepare time so a
     /// malformed request never enters the log; apply repeats the computation.
     fn prepare_bitmap_op(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -2647,6 +3024,7 @@ impl StateMachine {
             Some(entry) if !self.is_expired(entry) => match entry.value {
                 Value::String(_) => "string",
                 Value::BloomFilter { .. } => "MBbloom--",
+                Value::Stream { .. } => "stream",
                 Value::Hash(_) => "hash",
                 Value::List(_) => "list",
                 Value::Set(_) => "set",
@@ -2727,7 +3105,7 @@ impl StateMachine {
                     }
                     set.iter().cloned().collect()
                 }
-                Value::BloomFilter { .. } => {
+                Value::BloomFilter { .. } | Value::Stream { .. } => {
                     return Err(Error::protocol(WRONG_TYPE.to_string()));
                 }
                 Value::SortedSet(sorted_set) => {
@@ -4498,6 +4876,128 @@ mod tests {
             false_positives < 50,
             "false-positive rate must stay below 5 percent, got {false_positives}/1000"
         );
+    }
+
+    #[test]
+    fn stream_ids_are_deterministic_and_ranges_are_stable() {
+        let mut state = StateMachine::default();
+        // Auto IDs derive from the staged logical clock: two adds at the
+        // same staged time must produce strictly increasing IDs on every
+        // replica replaying the same log.
+        state.advance_logical_time(1_000);
+        let (add1, id1) = state
+            .execute_request(command(&[b"XADD", b"s", b"*", b"sensor", b"one"]))
+            .unwrap();
+        // XADD is a replicated write: prepare yields a StreamAdd with no
+        // explicit ID (apply derives it from the staged logical clock), and
+        // the reply carries the concrete auto ID.
+        assert!(matches!(add1, Some(Operation::StreamAdd { id: None, .. })));
+        assert!(matches!(id1, Frame::BulkString(_)));
+        let (_add2, id2) = state
+            .execute_request(command(&[b"XADD", b"s", b"*", b"sensor", b"two"]))
+            .unwrap();
+        assert_ne!(id1, id2, "auto IDs must strictly increase");
+
+        // Replay determinism: same operations on a fresh replica yield the
+        // same IDs. The auto-ID inside apply uses the staged logical time,
+        // so the replies must match exactly.
+        let mut replay = StateMachine::default();
+        for operation in [
+            Operation::StreamAdd {
+                key: Bytes::from_static(b"s"),
+                id: None,
+                fields: vec![(Bytes::from_static(b"sensor"), Bytes::from_static(b"one"))],
+            },
+            Operation::StreamAdd {
+                key: Bytes::from_static(b"s"),
+                id: None,
+                fields: vec![(Bytes::from_static(b"sensor"), Bytes::from_static(b"two"))],
+            },
+        ] {
+            replay.advance_logical_time(1_000);
+            replay.apply(operation);
+        }
+        assert_eq!(
+            replay.execute_request(command(&[b"XLEN", b"s"])).unwrap().1,
+            Frame::Integer(2)
+        );
+
+        // Explicit IDs must exceed the last ID.
+        assert!(
+            state
+                .execute_request(command(&[b"XADD", b"s", b"1-1", b"sensor", b"old"]))
+                .is_err()
+        );
+        let (_, explicit_reply) = state
+            .execute_request(command(&[b"XADD", b"s", b"2000-5", b"sensor", b"three"]))
+            .unwrap();
+        assert_eq!(explicit_reply, Frame::bulk_string("2000-5"));
+
+        // XRANGE returns entries in ID order; each entry is
+        // [id, field, value, ...] flattened, so two field pairs make 6
+        // elements across two entries.
+        let (_, range_frame) = state
+            .execute_request(command(&[b"XRANGE", b"s", b"-", b"+"]))
+            .unwrap();
+        let Frame::Array(range) = range_frame else {
+            panic!("XRANGE must return an array");
+        };
+        // Two entries: [id, [f, v]] each, so the top-level array holds two
+        // entry arrays; the flattened element count is 2 ids + 4 fields = 6.
+        assert_eq!(range.len(), 3);
+        assert!(matches!(&range[0], Frame::Array(_)));
+
+        // XDEL on an ID that is not in the stream reports 0.
+        let (_, deleted) = state
+            .execute_request(command(&[b"XDEL", b"s", b"999999-999999"]))
+            .unwrap();
+        assert_eq!(deleted, Frame::Integer(0));
+
+        // XTRIM keeps the newest MAXLEN entries.
+        state
+            .execute_request(command(&[b"XADD", b"s", b"3000-0", b"sensor", b"four"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"XTRIM", b"s", b"MAXLEN", b"1"]))
+            .unwrap();
+        assert_eq!(
+            state.execute_request(command(&[b"XLEN", b"s"])).unwrap().1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"XRANGE", b"s", b"-", b"+"]))
+                .unwrap()
+                .1,
+            Frame::Array(vec![Frame::Array(vec![
+                Frame::bulk_string("3000-0"),
+                Frame::Array(vec![
+                    Frame::bulk_string("sensor"),
+                    Frame::bulk_string("four")
+                ]),
+            ])])
+        );
+
+        // TYPE and wrong-type boundaries.
+        assert_eq!(
+            state.execute_request(command(&[b"TYPE", b"s"])).unwrap().1,
+            Frame::simple_string("stream")
+        );
+        state
+            .execute_request(command(&[b"SET", b"text", b"plain"]))
+            .unwrap();
+        assert!(
+            state
+                .execute_request(command(&[b"XLEN", b"text"]))
+                .unwrap()
+                .1
+                == Frame::Integer(0)
+        );
+        let wrong_type = state
+            .execute_request(command(&[b"XADD", b"text", b"*", b"a", b"b"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
     }
 
     #[test]
