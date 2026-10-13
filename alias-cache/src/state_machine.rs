@@ -81,7 +81,7 @@ pub fn batchable_write_has_bounded_response(command: &[u8], request: &Request) -
 const WRITES: &[&[u8]] = &[
     b"SET", b"DEL", b"MSET", b"INCRBY", b"HSET", b"HMSET", b"HSETNX", b"HINCRBY", b"HDEL",
     b"LPUSH", b"RPUSH", b"LPOP", b"RPOP", b"LREM", b"LSET", b"LTRIM", b"SADD", b"SREM", b"ZADD",
-    b"ZINCRBY", b"ZREM", b"EXPIRE", b"PEXPIRE", b"PERSIST",
+    b"ZINCRBY", b"ZREM", b"EXPIRE", b"PEXPIRE", b"PERSIST", b"SETBIT", b"BITOP",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -185,6 +185,16 @@ pub enum Operation {
         key: Bytes,
         increment: i64,
     },
+    BitmapSet {
+        key: Bytes,
+        offset: u64,
+        bit: bool,
+    },
+    BitmapOp {
+        operation: Bytes,
+        dest: Bytes,
+        sources: Vec<Bytes>,
+    },
     Delete {
         keys: Vec<Bytes>,
     },
@@ -255,6 +265,8 @@ impl Operation {
             | Self::SortedSetAdd { .. }
             | Self::SortedSetRemove { .. }
             | Self::Increment { .. }
+            | Self::BitmapSet { .. }
+            | Self::BitmapOp { .. }
             | Self::Delete { .. }
             | Self::DeleteIfExpired { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
@@ -285,6 +297,8 @@ impl Operation {
             | Self::SortedSetAdd { .. }
             | Self::SortedSetRemove { .. }
             | Self::Increment { .. }
+            | Self::BitmapSet { .. }
+            | Self::BitmapOp { .. }
             | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
@@ -378,6 +392,14 @@ fn request_memory_bytes(request: &Request) -> u64 {
         .sum()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BitLogic {
+    And,
+    Or,
+    Xor,
+    Not,
+}
+
 /// Approximate payload size of one live entry, excluding tree overhead.
 fn entry_size(key: &Bytes, entry: &Entry) -> u64 {
     let value_size = match &entry.value {
@@ -442,6 +464,8 @@ impl StateMachine {
             | Operation::SortedSetAdd { .. }
             | Operation::SortedSetRemove { .. }
             | Operation::Increment { .. }
+            | Operation::BitmapSet { .. }
+            | Operation::BitmapOp { .. }
             | Operation::Delete { .. }
             | Operation::DeleteIfExpired { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
@@ -1063,6 +1087,148 @@ impl StateMachine {
                 );
                 ApplyResult::Response(Frame::Integer(total))
             }
+            Operation::BitmapSet { key, offset, bit } => {
+                let byte_index = (offset / 8) as usize;
+                let bit_mask = 0x80 >> (offset % 8);
+                let existing = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned();
+                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                let mut bytes = match existing.map(|entry| entry.value) {
+                    None => Vec::new(),
+                    Some(Value::String(bytes)) => bytes.to_vec(),
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                };
+                if byte_index >= bytes.len() {
+                    bytes.resize(byte_index + 1, 0);
+                }
+                let previous = bytes[byte_index] & bit_mask != 0;
+                if bit {
+                    bytes[byte_index] |= bit_mask;
+                } else {
+                    bytes[byte_index] &= !bit_mask;
+                }
+                let was_empty = bytes.iter().all(|byte| *byte == 0);
+                if was_empty {
+                    self.values.remove(&key);
+                    self.versions.remove(&key);
+                } else {
+                    self.insert_entry(
+                        key,
+                        Entry {
+                            value: Value::String(Bytes::from(bytes)),
+                            expire_at,
+                        },
+                    );
+                }
+                ApplyResult::Response(Frame::Integer(previous as i64))
+            }
+            Operation::BitmapOp {
+                operation,
+                dest,
+                sources,
+            } => {
+                let op = match operation.as_ref() {
+                    b"AND" | b"and" => BitLogic::And,
+                    b"OR" | b"or" => BitLogic::Or,
+                    b"XOR" | b"xor" => BitLogic::Xor,
+                    b"NOT" | b"not" if sources.len() == 1 => BitLogic::Not,
+                    _ => {
+                        return ApplyResult::Response(Frame::error(
+                            "ERR BITOP requires AND, OR, XOR or NOT with one source key",
+                        ));
+                    }
+                };
+                // Sources shorter than the longest are zero-padded, matching
+                // Redis; a NOT source is used verbatim.
+                let load = |state: &Self, key: &Bytes| -> Option<Vec<u8>> {
+                    state
+                        .values
+                        .get(key)
+                        .filter(|entry| !state.is_expired(entry))
+                        .map(|entry| match &entry.value {
+                            Value::String(bytes) => bytes.to_vec(),
+                            _ => Vec::new(),
+                        })
+                };
+                if op == BitLogic::Not {
+                    let Some(source) = sources.first() else {
+                        return ApplyResult::Response(Frame::error(
+                            "ERR BITOP NOT accepts exactly one source key",
+                        ));
+                    };
+                    let Some(bytes) = load(self, source) else {
+                        let _ = self.remove_entry(&dest);
+                        return ApplyResult::Response(Frame::Integer(0));
+                    };
+                    let inverted: Vec<u8> = bytes.iter().map(|byte| !byte).collect();
+                    let was_empty = inverted.iter().all(|byte| *byte == 0);
+                    if was_empty {
+                        let _ = self.remove_entry(&dest.clone());
+                    } else {
+                        let entry = Entry {
+                            value: Value::String(Bytes::from(inverted)),
+                            expire_at: None,
+                        };
+                        self.insert_entry(dest.clone(), entry);
+                    }
+                    return ApplyResult::Response(Frame::Integer(
+                        self.values
+                            .get(&dest)
+                            .map(|entry| match &entry.value {
+                                Value::String(bytes) => bytes.len() as i64,
+                                _ => 0,
+                            })
+                            .unwrap_or(0),
+                    ));
+                }
+                let mut loaded: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
+                for source in &sources {
+                    match load(self, source) {
+                        Some(bytes) => loaded.push(bytes),
+                        // A missing source contributes zeros; a wrong-type
+                        // source must fail the whole operation.
+                        None => {
+                            if self.values.contains_key(source) {
+                                return ApplyResult::Response(wrong_type_frame());
+                            }
+                            loaded.push(Vec::new());
+                        }
+                    }
+                }
+                let width = loaded.iter().map(|bytes| bytes.len()).max().unwrap_or(0);
+                let mut result = vec![0_u8; width];
+                for (byte_index, slot) in result.iter_mut().enumerate() {
+                    let mut byte = match op {
+                        BitLogic::And => 0xff,
+                        _ => 0,
+                    };
+                    for bytes in &loaded {
+                        let value = bytes.get(byte_index).copied().unwrap_or(0);
+                        byte = match op {
+                            BitLogic::And => byte & value,
+                            BitLogic::Or => byte | value,
+                            BitLogic::Xor => byte ^ value,
+                            BitLogic::Not => unreachable!(),
+                        };
+                    }
+                    *slot = byte;
+                }
+                let dest_len = result.len() as i64;
+                let was_empty = result.iter().all(|byte| *byte == 0);
+                if was_empty {
+                    let _ = self.remove_entry(&dest);
+                } else {
+                    let entry = Entry {
+                        value: Value::String(Bytes::from(result)),
+                        expire_at: None,
+                    };
+                    self.insert_entry(dest, entry);
+                }
+                ApplyResult::Response(Frame::Integer(dest_len))
+            }
             Operation::Delete { keys } => {
                 let mut removed = 0;
                 for key in keys {
@@ -1374,6 +1540,21 @@ impl StateMachine {
         if command.eq_ignore_ascii_case(b"INCRBY") {
             return self.execute_increment(arguments);
         }
+        if command.eq_ignore_ascii_case(b"SETBIT") {
+            return self.execute_set_bit(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"GETBIT") {
+            return self.execute_get_bit(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BITCOUNT") {
+            return self.execute_bit_count(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BITPOS") {
+            return self.execute_bit_pos(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"BITOP") {
+            return self.prepare_bitmap_op(arguments);
+        }
         if command.eq_ignore_ascii_case(b"HSET") {
             return self.execute_hash_set(arguments, false);
         }
@@ -1596,9 +1777,9 @@ impl StateMachine {
         if let Some(operation) = operation.clone() {
             let applied = self.apply(operation);
             if applied != ApplyResult::Response(response.clone()) {
-                return Err(Error::server(
-                    "prepared response differs from applied response",
-                ));
+                return Err(Error::server(format!(
+                    "prepared response differs from applied response: prepared={response:?} applied={applied:?}"
+                )));
             }
         }
         Ok((operation, response))
@@ -1943,6 +2124,172 @@ impl StateMachine {
         Ok((
             Some(Operation::Increment { key, increment }),
             Frame::Integer(total),
+        ))
+    }
+
+    fn bitmap_bytes(&self, key: &Bytes) -> Result<Option<Vec<u8>>> {
+        match self.values.get(key) {
+            Some(entry) if !self.is_expired(entry) => match &entry.value {
+                Value::String(bytes) => Ok(Some(bytes.to_vec())),
+                _ => Err(Error::protocol(WRONG_TYPE)),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn execute_set_bit(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("SETBIT", &arguments, 4)?;
+        let key = arguments[1].clone();
+        let offset = parse_bit_offset(&arguments[2])?;
+        let bit = match arguments[3].as_ref() {
+            b"0" => false,
+            b"1" => true,
+            _ => return Err(Error::protocol("ERR bit is not an integer or out of range")),
+        };
+        let previous = self
+            .bitmap_bytes(&key)?
+            .and_then(|bytes| bytes.get((offset / 8) as usize).copied())
+            .map(|byte| byte & (0x80 >> (offset % 8)) != 0)
+            .unwrap_or(false);
+        Ok((
+            Some(Operation::BitmapSet { key, offset, bit }),
+            Frame::Integer(previous as i64),
+        ))
+    }
+
+    fn execute_get_bit(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("GETBIT", &arguments, 3)?;
+        let key = arguments[1].clone();
+        let offset = parse_bit_offset(&arguments[2])?;
+        let bit = self
+            .bitmap_bytes(&key)?
+            .and_then(|bytes| bytes.get((offset / 8) as usize).copied())
+            .map(|byte| byte & (0x80 >> (offset % 8)) != 0)
+            .unwrap_or(false);
+        Ok((None, Frame::Integer(bit as i64)))
+    }
+
+    fn execute_bit_count(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("BITCOUNT", &arguments, 2)?;
+        if arguments.len() > 5 {
+            return Err(Error::protocol(
+                "BITCOUNT supports only the optional start and end indexes",
+            ));
+        }
+        let bytes = self.bitmap_bytes(&arguments[1])?.unwrap_or_default();
+        let count = if arguments.len() >= 4 {
+            let start = parse_signed_i64(&arguments[2], "BITCOUNT")?;
+            let end = parse_signed_i64(&arguments[3], "BITCOUNT")?;
+            let (start, end) = resolve_byte_range(start, end, bytes.len())?;
+            bytes[start..=end]
+                .iter()
+                .map(|byte| byte.count_ones() as i64)
+                .sum()
+        } else {
+            bytes.iter().map(|byte| byte.count_ones() as i64).sum()
+        };
+        Ok((None, Frame::Integer(count)))
+    }
+
+    fn execute_bit_pos(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("BITPOS", &arguments, 3)?;
+        if arguments.len() > 5 {
+            return Err(Error::protocol(
+                "BITPOS supports only the optional start and end indexes",
+            ));
+        }
+        let bit = match arguments[2].as_ref() {
+            b"0" => false,
+            b"1" => true,
+            _ => return Err(Error::protocol("ERR bit is not an integer or out of range")),
+        };
+        let bytes = self.bitmap_bytes(&arguments[1])?.unwrap_or_default();
+        let range = if arguments.len() >= 5 {
+            let start = parse_signed_i64(&arguments[3], "BITPOS")?;
+            let end = parse_signed_i64(&arguments[4], "BITPOS")?;
+            let (start, end) = resolve_byte_range(start, end, bytes.len())?;
+            Some((start, end))
+        } else {
+            None
+        };
+        let mut position: i64 = -1;
+        'outer: for (byte_index, byte) in bytes.iter().enumerate() {
+            if let Some((start, end)) = &range
+                && (byte_index < *start || byte_index > *end)
+            {
+                continue;
+            }
+            for bit_index in 0..8_u32 {
+                if ((byte & (0x80 >> bit_index)) != 0) == bit {
+                    position = (byte_index as i64) * 8 + bit_index as i64;
+                    break 'outer;
+                }
+            }
+            // Redis BITPOS 0 quirk: searching for 0 in an all-ones buffer
+            // returns the first out-of-range bit position.
+            if !bit && byte_index + 1 == bytes.len() {
+                position = (bytes.len() * 8) as i64;
+            }
+        }
+        Ok((None, Frame::Integer(position)))
+    }
+
+    /// Prepare BITOP: validate the operation and sources at prepare time so a
+    /// malformed request never enters the log; apply repeats the computation.
+    fn prepare_bitmap_op(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        expect_min_arity("BITOP", &arguments, 4)?;
+        let operation = arguments[1].clone();
+        match operation.as_ref() {
+            b"AND" | b"OR" | b"XOR" => {
+                if arguments.len() < 5 {
+                    return Err(Error::protocol(
+                        "ERR BITOP AND, OR or XOR requires at least two source keys",
+                    ));
+                }
+            }
+            b"NOT" => {
+                if arguments.len() != 4 {
+                    return Err(Error::protocol(
+                        "ERR BITOP NOT accepts exactly one source key",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::protocol("ERR BITOP requires AND, OR, XOR or NOT"));
+            }
+        }
+        let dest = arguments[2].clone();
+        for source in &arguments[3..] {
+            if *source == dest {
+                return Err(Error::protocol(
+                    "ERR BITOP source and destination must differ",
+                ));
+            }
+            self.bitmap_bytes(source)?;
+        }
+        let sources = arguments[3..].to_vec();
+        // The apply-side width is the longest source for AND/OR/XOR and the
+        // single source for NOT; a missing source contributes zero bytes.
+        // Mirroring it keeps prepared and applied responses identical.
+        let dest_len: i64 = match operation.as_ref() {
+            b"NOT" => self
+                .bitmap_bytes(&arguments[3])?
+                .map(|bytes| bytes.len() as i64)
+                .unwrap_or(0),
+            _ => arguments[3..]
+                .iter()
+                .filter_map(|source| self.bitmap_bytes(source).ok())
+                .filter_map(|bytes| bytes.map(|bytes| bytes.len() as i64))
+                .max()
+                .unwrap_or(0),
+        };
+        Ok((
+            Some(Operation::BitmapOp {
+                operation,
+                dest,
+                sources,
+            }),
+            Frame::Integer(dest_len),
         ))
     }
 
@@ -2912,6 +3259,32 @@ fn set_frame(set: BTreeSet<Bytes>) -> Frame {
     Frame::Set(set.into_iter().map(Frame::BulkString).collect())
 }
 
+fn parse_bit_offset(value: &Bytes) -> Result<u64> {
+    let text = std::str::from_utf8(value)
+        .map_err(|_| Error::protocol("ERR bit offset is not an integer or out of range"))?;
+    text.parse::<u64>()
+        .map_err(|_| Error::protocol("ERR bit offset is not an integer or out of range"))
+}
+
+/// Resolve Redis byte-range semantics: negative indexes count from the end,
+/// and the inclusive end may not precede start.
+fn resolve_byte_range(start: i64, end: i64, len: usize) -> Result<(usize, usize)> {
+    let length = len as i64;
+    let resolve = |index: i64| {
+        if index < 0 {
+            (length + index).max(0)
+        } else {
+            index.min(length.saturating_sub(1))
+        }
+    };
+    let start = resolve(start);
+    let end = resolve(end);
+    if start > end || start >= length {
+        return Err(Error::protocol("ERR invalid range"));
+    }
+    Ok((start as usize, end as usize))
+}
+
 fn parse_score(value: &Bytes) -> Result<i64> {
     let text = std::str::from_utf8(value)
         .map_err(|_| Error::protocol("value is not a valid floating point number"))?;
@@ -3707,6 +4080,306 @@ mod tests {
     /// Compatibility matrix for every SET option combination and the
     /// EXPIRE/PEXPIRE protocol boundary, driven by an explicit table so the
     /// supported surface is readable in one place.
+
+    #[test]
+    fn bitmap_commands_are_deterministic_across_replay_and_ranges() {
+        let mut state = StateMachine::default();
+        // SETBIT returns the previous bit; offsets extend the string with
+        // zero bytes, MSB-first within each byte.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SETBIT", b"bm", b"0", b"1"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SETBIT", b"bm", b"15", b"1"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"bm"])).unwrap().1,
+            Frame::bulk_string(Bytes::from_static(b"\x80\x01")),
+            "bit 0 is the MSB of byte 0, bit 15 the LSB of byte 1"
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SETBIT", b"bm", b"0", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1),
+            "clearing a set bit reports 1"
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"GETBIT", b"bm", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"GETBIT", b"bm", b"15"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"GETBIT", b"bm", b"999"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0),
+            "out-of-range reads return 0"
+        );
+
+        // BITCOUNT with and without a byte range (negative indexes count
+        // from the end). Only bit 15 is set at this point.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BITCOUNT", b"bm"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BITCOUNT", b"bm", b"0", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BITCOUNT", b"bm", b"-1", b"-1"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+
+        // BITPOS finds the first set bit; searching 0 in an all-ones byte
+        // reports the first out-of-range position like Redis.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BITPOS", b"bm", b"1"]))
+                .unwrap()
+                .1,
+            Frame::Integer(15)
+        );
+        state
+            .execute_request(command(&[b"SETBIT", b"allones", b"0", b"1"]))
+            .unwrap();
+        for bit in 1..8_u64 {
+            state
+                .execute_request(command(&[
+                    b"SETBIT",
+                    b"allones",
+                    bit.to_string().as_bytes(),
+                    b"1",
+                ]))
+                .unwrap();
+        }
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BITPOS", b"allones", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(8),
+            "first clear bit after a full first byte"
+        );
+
+        // Replay: prepared operations produce identical state on a fresh
+        // replica.
+        let (operation, _) = state
+            .prepare_request(command(&[b"SETBIT", b"bm", b"3", b"1"]))
+            .unwrap();
+        let mut replay = StateMachine::default();
+        replay
+            .execute_request(command(&[b"SETBIT", b"bm", b"0", b"1"]))
+            .unwrap();
+        replay
+            .execute_request(command(&[b"SETBIT", b"bm", b"15", b"1"]))
+            .unwrap();
+        replay.apply(operation.expect("SETBIT must replicate"));
+        assert_eq!(
+            replay
+                .execute_request(command(&[b"GETBIT", b"bm", b"3"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1),
+            "replayed SETBIT sets the same bit as the leader's prepare"
+        );
+
+        // Boundaries: non-integer offset and non-0/1 bit are protocol
+        // errors; a wrong-type key is WRONGTYPE.
+        assert!(
+            state
+                .execute_request(command(&[b"SETBIT", b"bm", b"abc", b"1"]))
+                .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"SETBIT", b"bm", b"0", b"2"]))
+                .is_err()
+        );
+        state
+            .execute_request(command(&[b"SET", b"text", b"plain"]))
+            .unwrap();
+        // Strings are bit-addressable in Redis: 'p' = 0x70, whose bit 0 is 0.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"GETBIT", b"text", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        // List/Hash/Set/Sorted Set keys are WRONGTYPE for every bitmap
+        // command.
+        state
+            .execute_request(command(&[b"HSET", b"hashed", b"field", b"value"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"GETBIT", b"hashed", b"0"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn bitop_computes_cross_key_results_and_cleans_empty_dest() {
+        let mut state = StateMachine::default();
+        // a = 0b1100_0000, b = 0b1010_0000 over one byte each.
+        state
+            .execute_request(command(&[b"SETBIT", b"a", b"0", b"1"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"SETBIT", b"a", b"1", b"1"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"SETBIT", b"b", b"0", b"1"]))
+            .unwrap();
+        state
+            .execute_request(command(&[b"SETBIT", b"b", b"2", b"1"]))
+            .unwrap();
+
+        // a has bits {0, 1}, b has bits {0, 2}: AND={0}, OR={0,1,2},
+        // XOR={1,2}.
+        for (op, expected_bits) in [
+            (&b"AND"[..], vec![0_u64]),
+            (&b"OR"[..], vec![0, 1, 2]),
+            (&b"XOR"[..], vec![1, 2]),
+        ] {
+            let prepared = state
+                .execute_request(command(&[b"BITOP", op, b"dest", b"a", b"b"]))
+                .unwrap()
+                .1;
+            assert_eq!(
+                prepared,
+                Frame::Integer(1),
+                "{} dest must be one byte, got {:?}",
+                String::from_utf8_lossy(op),
+                prepared
+            );
+            for bit in 0..8_u32 {
+                let expected = expected_bits.contains(&(bit as u64));
+                let actual = state
+                    .execute_request(command(&[b"GETBIT", b"dest", bit.to_string().as_bytes()]))
+                    .unwrap()
+                    .1;
+                assert_eq!(
+                    actual,
+                    Frame::Integer(expected as i64),
+                    "{} bit {}",
+                    String::from_utf8_lossy(op),
+                    bit
+                );
+            }
+        }
+
+        // NOT on a missing source yields an empty dest and 0.
+        assert_eq!(
+            state
+                .execute_request(command(&[b"BITOP", b"NOT", b"notdest", b"missing"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"GET", b"notdest"]))
+                .unwrap()
+                .1
+                == Frame::Null
+        );
+
+        // NOT over an existing key inverts it and BITOP AND clears an
+        // all-zero dest.
+        state
+            .execute_request(command(&[b"BITOP", b"NOT", b"notdest", b"a"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"GETBIT", b"notdest", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0),
+            "bit 0 of a (set) must be clear in NOT a"
+        );
+
+        // Errors: unknown op, NOT with two sources, same src and dest.
+        assert!(
+            state
+                .execute_request(command(&[b"BITOP", b"NAND", b"d", b"a"]))
+                .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"BITOP", b"NOT", b"d", b"a", b"b"]))
+                .is_err()
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"BITOP", b"OR", b"a", b"a"]))
+                .is_err()
+        );
+
+        // Replay determinism for the AND result.
+        let (operation, _) = state
+            .prepare_request(command(&[b"BITOP", b"AND", b"replay", b"a", b"b"]))
+            .unwrap();
+        let mut replay = StateMachine::default();
+        replay
+            .execute_request(command(&[b"SETBIT", b"a", b"0", b"1"]))
+            .unwrap();
+        replay
+            .execute_request(command(&[b"SETBIT", b"a", b"1", b"1"]))
+            .unwrap();
+        replay
+            .execute_request(command(&[b"SETBIT", b"b", b"0", b"1"]))
+            .unwrap();
+        replay
+            .execute_request(command(&[b"SETBIT", b"b", b"2", b"1"]))
+            .unwrap();
+        replay.apply(operation.expect("BITOP must replicate"));
+        // AND of a={0,1} and b={0,2} keeps only bit 0.
+        assert_eq!(
+            replay
+                .execute_request(command(&[b"GETBIT", b"replay", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            replay
+                .execute_request(command(&[b"GETBIT", b"replay", b"1"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+    }
 
     #[test]
     fn set_option_matrix_and_expire_boundaries() {

@@ -91,6 +91,17 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
 - 两项缺省 0（不限）；限制在重启后由配置恢复，不进复制状态机；
 - `--snapshot-policy`：追加多少条日志后生成 raft 快照，缺省 64，0 回落默认。
 
+Bitmap 当前约束：
+
+- `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP` 操作 `Value::String`（位
+  数组即字节串），MSB-first；SETBIT 越界以 0 字节扩展，offset 上限 2^32；
+- BITOP 支持 AND/OR/XOR（≥2 源）与 NOT（恰 1 源），源短于最长者按 0
+  填充，源与目标必须不同；BITOP 写入不继承 TTL（Redis 同）；
+- 全零结果删除 key；GETBIT 越界返回 0；BITPOS 0 在全 1 缓冲返回首个
+  越界位（Redis quirk）；String 类型的 key 可直接位寻址；
+- `BITFIELD`、`BITCOUNT` 的 BIT 位模式、`BITOP` 的耗时保护尚未纳入
+  稳定兼容范围。
+
 遍历当前约束：
 
 - 游标是已返回成员数的十进制文本，语义为快照内偏移：同一批数据反复迭代
