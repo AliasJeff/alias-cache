@@ -374,6 +374,35 @@ redis-benchmark 口径差 13%；缺口在长跑快照 IO（全量快照与吞吐
   40% 方差带内；clone 成本随状态规模线性增长，规模越大收益越大——
   3.15ms/批在 10 万 key 下约占批周期 12%，并在状态继续增长时放大）。
 
+
+### cache-cat 本体同机对等实测（2026-10-13）
+
+构建 cache-cat 本体（release），用**它自带的 benchmark**（pwrite 模式，
+内部 bincode 协议 + PipelineMultiClient，600 连接）同机实测：
+
+| 配置 | 写入吞吐 |
+| --- | ---: |
+| cache-cat 单节点，pwrite 内部协议，600c | **~154,000 writes/s** |
+| alias-cache 单节点，RESP pwrite 16c×128 | 27,693 writes/s |
+| alias-cache 三节点，RESP pwrite 16c×128 | 14,200 writes/s |
+| Redis 6.2 单节点，redis-benchmark P16 | ~1.5M（SET） |
+
+诚实结论：
+
+1. **未达到 cache-cat 的实测水平（154k）**，单节点差距 5.5×；与 README
+   宣传的 500k 差距更大——154k 是本机实测，500k 宣传在本机未能复现
+   （其基准使用内部 bincode 协议 + 600 连接流式管线，绕开 RESP 全栈）。
+2. 差距的主导项（按判断排序）：(a) 协议层——RESP 解析/分发/Frame 编码
+   vs bincode 直发；(b) apply 路径——每条写的版本 bump/内存计费/响应
+   Frame 构造，且批内逐条；(c) 连接规模——cache-cat 基准用 600 连接
+   流式灌入，我们的 pwrite 客户端 16-64 连接；(d) 分配器——cache-cat
+   用 mimalloc，我们用系统分配器。
+3. 三节点多数派 fsync 的强一致代价叠加后，14.2k 是当前架构的稳定值。
+4. 后续工程路径（数量级从大到小）：内部二进制批量通道（绕开 RESP 的
+   raft 直连档已立项 plans/16 步骤 3）、apply 批量化（一次 ClientBatch
+   内逐条 apply 已做，响应 Frame 构造批量化未做）、mimalloc 接入、
+   增量快照。
+
 ### 8 轮中位数终测（2026-10-13，clone 消除后）
 
 16 连接 × pipeline 128、10s 每轮、同机三节点、零错误：
