@@ -188,7 +188,12 @@ INFO，确定性双重 FNV-1a hash——无盐跨副本一致）、Stream 非阻
 （XADD/XLEN/XRANGE/XDEL/XTRIM，自动 ID 派生自复制逻辑时钟——同日志
 重放同 ID 序列）、Lua 脚本（EVAL，leader 执行/结果复制模型：redis.call
 收集为确定性操作进单事务，mlua 沙箱 64MiB 内存上限 + 指令中断钩子 +
-5s 预算 + io/os 移除，副本永不执行脚本）。剩余方向：增量快照（解耦
+5s 预算 + io/os 移除，副本永不执行脚本）。
+
+性能对等实测（plans/16，同机、对齐 cache-cat 的内部协议测量口径）：
+单节点 raft-direct 32c×512 = **142,316 writes/s**，同机 cache-cat
+pwrite 实测 154,000（差距 8%）；三节点 raft-direct ~30,000 ops/s
+（多数派 fsync + 2× 复制的强一致代价）。剩余方向：增量快照（解耦
 快照 IO 与写吞吐）、脚本缓存（EVALSHA 完整实现）、消费者组。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
