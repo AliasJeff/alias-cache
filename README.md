@@ -175,11 +175,18 @@ PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s
 CHANGELOG、依赖 SPDX 许可证白名单门禁。
 
 计划 13 的批量写入口、RESP pipeline 批处理和 pwrite 压测模式已实现，
-`redis-benchmark -t set,get -P 16` 也已完成三节点交叉验证；但多数派写吞吐
-目标 ≥20,000 ops/s 尚未达到。当前测得最高约 10,563 ops/s（16 客户端 ×
-pipeline 512），p99 约 2.68 秒并出现 15 个请求错误，不能视为可用性能达标。
-完整测量与限制见 plans/13。后续路线：先继续解决批量写的吞吐和尾延迟，再做
-14 Bitmap/Bloom Filter/Stream，最后做 15 Lua 脚本（leader 执行/结果复制）。
+`redis-benchmark -t set,get -P 16` 三节点交叉验证：SET 17,440 ops/s
+（合批 + 快照策略修正 + prepare 去 clone 后；p50 14.5ms）、线性一致
+GET 16,242 ops/s、PING_INLINE 22.4 万 ops/s。
+
+第二阶段扩展已交付（plans/14-15）：Bitmap（SETBIT/GETBIT/BITCOUNT/
+BITPOS/BITOP，String 位寻址）、Bloom Filter（BF.RESERVE/ADD/EXISTS/
+INFO，确定性双重 FNV-1a hash——无盐跨副本一致）、Stream 非阻塞骨干
+（XADD/XLEN/XRANGE/XDEL/XTRIM，自动 ID 派生自复制逻辑时钟——同日志
+重放同 ID 序列）、Lua 脚本（EVAL，leader 执行/结果复制模型：redis.call
+收集为确定性操作进单事务，mlua 沙箱 64MiB 内存上限 + 指令中断钩子 +
+5s 预算 + io/os 移除，副本永不执行脚本）。剩余方向：增量快照（解耦
+快照 IO 与写吞吐）、脚本缓存（EVALSHA 完整实现）、消费者组。
 
 客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
 `--tls-key-file` 即可启用客户端 TLS listener；额外指定
