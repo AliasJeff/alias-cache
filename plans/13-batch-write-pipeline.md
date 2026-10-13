@@ -455,6 +455,41 @@ ops/s**（p128），32c×256 达 14,013。剩余瓶颈：openraft apply 逐条
 条数不增加并发轮数。突破 14k 平台需要允许 committer 多轮并发（openraft
 内部是否串行化待验证），或接受 14k 为当前架构下的稳定吞吐。
 
+
+### raft 直连传输档实测（2026-10-13，plans/16 步骤 3 完成）
+
+benchmark 新增 `--mode raft-direct`：直连 leader 的 raft RPC listener，
+发送 `NetworkRequest::ClientBatch` bincode 帧（与内部复制同一协议、同一
+committer 路径），绕开 RESP 协议层——与 cache-cat 的 pwrite 内部协议
+测量口径对齐。
+
+同机对等实测（本机，release，零错误）：
+
+| 配置 | 写入吞吐 |
+| --- | ---: |
+| cache-cat 单节点，pwrite 内部协议，600c | 154,000 writes/s |
+| **alias-cache 单节点，raft-direct 16c×128** | **55,180 writes/s** |
+| **alias-cache 单节点，raft-direct 32c×512** | **142,316 writes/s** |
+| alias-cache 三节点，raft-direct 16c×128 | ~30,000 writes/s |
+
+结论：
+
+1. **相同测量口径下单节点差距收敛到 8% 以内**（142k vs 154k）——
+   RESP 协议层 + 连接规模正是此前 RESP 口径差距（27.7k vs 154k）的
+   主导项，与归因一致。
+2. 协议层成本占比量化：单节点 RESP 口径 27.7k vs raft-direct 55.2k
+   （16c×128），协议层成本约 50%；深管线 + 直连后协议层影响消退。
+3. 剩余差距来源：apply 逐条开销（版本 bump/内存计费/响应 Frame 构造）
+   与分配器——cache-cat 用 mimalloc（alias-cache CLI 已接入，基线
+   重测包含在内）。
+4. 三节点 raft-direct 30k vs cache-cat 单节点 154k：多数派 fsync +
+   2× 复制的强一致代价，与 Redis AOF-always 的层级差异论证一致。
+
+### mimalloc 接入（2026-10-13）
+
+CLI 全局分配器接入 mimalloc（对齐 cache-cat 的分配器选择）。所有
+上述数字均在 mimalloc 下测得。
+
 ## 完成标准
 
 - **门禁修订（2026-10-13，按 8 轮实测数据正式修订）**：原门禁"pwrite

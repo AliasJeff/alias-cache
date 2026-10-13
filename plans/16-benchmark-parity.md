@@ -126,6 +126,18 @@
   回退为"policy 放宽 + 增量快照立项"。
 - 笔记本测量噪声：所有主张以 ≥5 轮中位数为口径，单轮仅作参考。
 
+## 完成记录
+
+- 步骤 3 已交付（2026-10-13）：`alias-cache-benchmark --mode raft-direct`
+  直连 leader 的 raft RPC listener 发送 `ClientBatch` bincode 帧（会话
+  循环连接 + 4 字节 BE 长度前缀），与内部复制同协议。同时服务器
+  `handle_raft_rpc` 改为会话循环（一连接多请求），follower 复制不再
+  每 RPC 重连。
+- 对等实测：alias-cache 单节点 raft-direct 32c×512 = **142,316
+  writes/s**，同机 cache-cat pwrite = 154,000——差距 8%，数量级对齐。
+  协议层成本量化：RESP 口径 27.7k vs raft-direct 55.2k（16c×128）。
+- 服务端附带改进：raft RPC 会话循环（ follower 复制不再每 RPC 重连）。
+
 ## 完成标准
 
 - cache-cat 本体与 alias-cache 在同机、同负载下的对等实测数字写入

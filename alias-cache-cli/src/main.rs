@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use alias_cache::config::{Config, PeerSpec};
 use alias_cache::server::Server;
 use alias_cache::{Error, Result};

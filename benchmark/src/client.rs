@@ -4,6 +4,7 @@
 //! encoded inline (no decoding on the write path) and responses are matched by
 //! completion order, which is RESP pipeline order.
 
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -31,6 +32,9 @@ pub enum Command {
 pub enum Mode {
     Batch,
     Pwrite,
+    /// Stream `ClientBatch` bincode frames straight into the leader's raft
+    /// RPC listener (diagnostic gauge: bypasses the RESP protocol layer).
+    RaftDirect,
 }
 
 impl Command {
@@ -163,6 +167,7 @@ pub async fn run_worker(config: &WorkerConfig, worker_id: usize) -> std::io::Res
     match config.mode {
         Mode::Batch => run_batch_worker(config, worker_id).await,
         Mode::Pwrite => run_pwrite_worker(config, worker_id).await,
+        Mode::RaftDirect => run_raft_direct_worker(config, worker_id).await,
     }
 }
 
@@ -417,6 +422,126 @@ async fn stream_reader(
             ));
         }
     }
+}
+
+/// Stream `ClientBatch` bincode frames straight into the leader's raft
+/// RPC listener (diagnostic gauge: bypasses the RESP protocol layer). One
+/// persistent connection per worker; the raft RPC handler is a session
+/// loop that answers frames in order.
+async fn run_raft_direct_worker(
+    config: &WorkerConfig,
+    worker_id: usize,
+) -> std::io::Result<WorkerStats> {
+    use alias_cache::protocol::Request;
+    use alias_cache::raft::{NetworkRequest, NetworkResponse};
+
+    let mut stats = WorkerStats::default();
+    let stream = TcpStream::connect(&config.address).await?;
+    stream.set_nodelay(true)?;
+    let (mut reader, mut writer) = stream.into_split();
+
+    let value = vec![b'x'; config.value_size];
+    let mut sequence: u64 = (worker_id as u64 + 1) * 1_000_003;
+    let mut next_request_id: u128 = (worker_id as u128 + 1) * 10_000_000_000;
+    let mut read_buffer = vec![0_u8; READ_BUFFER];
+    let mut acc: Vec<u8> = Vec::new();
+    let mut sample_counter: u64 = 0;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.run_seconds);
+    while tokio::time::Instant::now() < deadline {
+        // Build one ClientBatch of up to pipeline_depth SET commands with
+        // globally unique request IDs.
+        let mut items = Vec::with_capacity(config.pipeline_depth);
+        for _ in 0..config.pipeline_depth {
+            sequence = sequence
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let key = format!("benchmark-key-{}", sequence % config.key_space);
+            next_request_id += 1;
+            items.push((
+                next_request_id,
+                Request::Command(vec![
+                    Bytes::from_static(b"SET"),
+                    Bytes::copy_from_slice(key.as_bytes()),
+                    Bytes::copy_from_slice(&value),
+                ]),
+            ));
+        }
+        let frame =
+            alias_cache::raft::encode_raft_rpc_frame(&NetworkRequest::ClientBatch { items })
+                .map_err(std::io::Error::other)?;
+        let batch_items = config.pipeline_depth;
+        writer.write_all(&frame).await?;
+        let started = tokio::time::Instant::now();
+
+        // Read length-prefixed bincode response frames until the
+        // ClientBatch outcome for this batch arrives; leftovers carry into
+        // the next batch.
+        let outcome = loop {
+            if acc.len() >= 4 {
+                let length = u32::from_be_bytes(acc[..4].try_into().unwrap()) as usize;
+                if length > alias_cache::raft::NETWORK_MAX_FRAME {
+                    eprintln!(
+                        "RAFT_DIRECT_DEBUG: length={length} acc_head={:?} acc_len={}",
+                        &acc[..acc.len().min(24)],
+                        acc.len()
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "raft rpc response exceeds maximum frame size",
+                    ));
+                }
+                if acc.len() >= 4 + length {
+                    let payload = acc[4..4 + length].to_vec();
+                    acc.drain(..4 + length);
+                    let response: NetworkResponse =
+                        alias_cache::raft::decode_raft_rpc_frame(&payload).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                        })?;
+                    match response {
+                        NetworkResponse::ClientBatch(outcome) => break outcome,
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "unexpected raft rpc response",
+                            ));
+                        }
+                    }
+                }
+            }
+            let read = tokio::time::timeout(config.timeout, reader.read(&mut read_buffer))
+                .await
+                .map_err(std::io::Error::other)??;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "raft listener closed mid-batch",
+                ));
+            }
+            acc.extend_from_slice(&read_buffer[..read]);
+        };
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Ok(alias_cache::raft::ClientBatchOutcome::Applied(frames)) => {
+                stats.completed += frames.len() as u64
+            }
+            Ok(alias_cache::raft::ClientBatchOutcome::Redirect(_)) => {
+                stats.errors += batch_items as u64
+            }
+            Err(message) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("raft batch failed: {message}"),
+                ));
+            }
+        }
+        sample_counter += 1;
+        if config.sample_rate == 1 || sample_counter.is_multiple_of(config.sample_rate as u64) {
+            stats.latencies.push(elapsed.as_micros() as u32);
+        }
+    }
+    Ok(stats)
 }
 
 /// Aggregate latencies across workers into percentile micros.

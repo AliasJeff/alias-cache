@@ -93,7 +93,7 @@ pub type Vote = openraft::alias::VoteOf<TypeConfig>;
 pub type StoredMembership = openraft::alias::StoredMembershipOf<TypeConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum NetworkRequest {
+pub enum NetworkRequest {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<TypeConfig>),
     PreVote(VoteRequest<TypeConfig>),
@@ -123,7 +123,7 @@ enum NetworkRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum NetworkResponse {
+pub enum NetworkResponse {
     Append(Result<AppendEntriesResponse<TypeConfig>, String>),
     Vote(Result<VoteResponse<TypeConfig>, String>),
     Snapshot(Result<SnapshotResponse<TypeConfig>, String>),
@@ -132,7 +132,7 @@ enum NetworkResponse {
     ClientBatch(Result<ClientBatchOutcome, String>),
 }
 
-const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
+pub const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const CLIENT_BATCH_MAX_ITEMS: usize = 1_024;
 pub const CLIENT_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_CHUNK_SIZE: usize = 256 * 1024;
@@ -2576,11 +2576,9 @@ async fn handle_raft_rpc(
             result = read_network_message(&mut stream) => match result {
                 Ok(Some(request)) => request,
                 Ok(None) => {
-                    eprintln!("RAFT_RPC_DEBUG: client EOF, closing session");
                     return Ok(());
                 }
                 Err(error) => {
-                    eprintln!("RAFT_RPC_DEBUG: read error {error}");
                     return Err(error);
                 }
             },
@@ -2691,8 +2689,30 @@ async fn handle_raft_rpc(
             }
         };
         write_network_message(&mut stream, &response).await?;
-        eprintln!("RAFT_RPC_DEBUG: response written");
     }
+}
+
+/// Encode one length-prefixed bincode raft RPC frame (request or response).
+///
+/// Public for load tools that speak the raft RPC protocol directly; the
+/// frame layout is part of the wire contract and only changes with a
+/// documented protocol bump.
+pub fn encode_raft_rpc_frame<T: Serialize>(message: &T) -> CacheResult<Vec<u8>> {
+    let payload = bincode::serialize(message)
+        .map_err(|error| Error::server(format!("serialize raft rpc frame: {error}")))?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| Error::protocol("raft rpc frame length overflows u32"))?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Decode one length-prefixed bincode raft RPC frame body (payload only,
+/// the 4-byte length prefix is consumed by the caller).
+pub fn decode_raft_rpc_frame<T: for<'de> Deserialize<'de>>(payload: &[u8]) -> CacheResult<T> {
+    bincode::deserialize(payload)
+        .map_err(|error| Error::server(format!("decode raft rpc frame: {error}")))
 }
 
 async fn read_network_message<T: for<'de> Deserialize<'de>>(
