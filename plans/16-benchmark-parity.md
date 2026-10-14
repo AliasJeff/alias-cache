@@ -154,12 +154,54 @@
   raft-direct 8c×128 = 17,441（协议层成本 ~26%，同形状）；静默环境
   重测前不替换任何门禁数字。
 
-### 步骤 6（新增，2026-10-14）：读路径扩展性与协议层并行化
+### 步骤 7（2026-10-15）：复刻 cache-cat 图表口径的三方对测（混合负载成绩单）
+
+按 cache-cat B 站图表场景跑完整对测：三种读写比（50/50、95/5、5/95）×
+三系统（Redis 哨兵式主从、cache-cat 3 节点、alias-cache 3 节点），
+512 连接、keyspace 40 万、value 16B、跑分期间无快照（见偏差说明）。
+cache-cat benchmark 打本地补丁新增 `mix` 档（--read-percent/--key-space，
+写走其 PipelineMultiClient、读走其 GetReq 原通路）。原始记录：
+notes/three-way-mixed-benchmark-2026-10-15.md（git-excluded）。
+
+本机实测（Apple Silicon/APFS，load 4-7，单轮，全部零错误）：
+
+| 负载 | Redis 哨兵式 | cache-cat | alias-cache |
+| --- | ---: | ---: | ---: |
+| 50/50 | 388,818 | 153,068 | 55 |
+| 95/5 | 638,931 | 197,387 | 30 |
+| 5/95 | 469,150 | 152,440 | 500 |
+| 纯写参考 | - | - | 16,814 |
+
+结论与发现（按重要性）：
+
+1. **读路径悬崖是混合负载的决定性短板**：每个线性一致 GET 独立走一次
+   ReadIndex（blank 追加 + 多数派 fsync ≈ 30ms）且**串行**——读天花板
+   ~30 reads/s 与并发无关；5% 读即把全场拖到几百 ops/s。步骤 6 的三项
+   候选（读簇并行化、跨连接 barrier 合批、租约读）升级为混合负载
+   可用的**前置必需**。cache-cat 同负载 197k reads/s 证明其读实现
+   （lease/批量 ReadIndex 类）不逐读走共识轮。
+2. **"无快照"口径对 alias-cache 不可生存**（图表口径的诚实偏差）：
+   无快照下 raft 日志无清理，写入随日志增长衰减至 1/3；压测残留可将
+   集群拖入单操作 ~250ms 的慢态（sample 归因 FileLogStore::sync_all on
+   224MB 日志）。快照开启后仍受全量序列化压制（状态 30 万 key 时
+   预载 13.5k → 8.9k）。增量快照从优化项升级为持续吞吐的必需项。
+3. alias-cache 列实测口径：混合档 512c×p1（p16 档 4096 并发读会触发
+   30s 超时无法完成）；纯写参考 512c×p16 = 16,814（合批器修复在 512
+   连接下零错误，稳固）。
+4. Redis 列为异步复制 + AOF everysec（数据保证弱于两 Raft 系统，
+   与图表同口径并列，不作"同保证"解读）；平台差异（9950X3D/EXT4 vs
+   Apple Silicon/APFS）使绝对值不可与图表直接对比，三方相对关系有效。
+5. 顺带发现：DBSIZE 读数陈旧（批量写后不更新，键实际存在）——小 bug
+   待查。cache-cat follower 不自动转发（ERR forward），benchmark 指向
+   leader，与 alias-cache 同口径。
+
+### 步骤 6（2026-10-14 立项）：读路径扩展性与协议层并行化
 
 - 现状实测：GET 逐条走 `ensure_linearizable(ReadIndex)`，pipeline 段内
   读串行；50% 混合负载 16c×128 在 5s 超时下吞吐塌缩（2c×32 仅
   123 ops/s，p50 1.23s），机制为每读一次心跳轮（50ms heartbeat）+
-  多数派确认，写路径可合批摊销而读路径不能。
+  多数派确认，写路径可合批摊销而读路径不能。（步骤 7 实测进一步确认：
+  读天花板 ~30 reads/s 与并发无关，为串行 barrier。）
 - 候选优化（按侵入度排序）：
   1. 段内连续读簇并行化：同一 pipeline 段内相邻 GET 共享一次
      ReadIndex barrier（读写边界仍严格排序），N 连续读从 N 次 barrier
