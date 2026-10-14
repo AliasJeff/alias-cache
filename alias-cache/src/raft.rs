@@ -1453,10 +1453,10 @@ impl BatchCommitterHandle {
                 // concurrently: spawning each chunk lets openraft merge
                 // concurrent appends into large batches, and responses reach
                 // submitters via their oneshots when the chunk finishes.
-                type CommitChunk = (Vec<(ClientRequestId, Request)>, Vec<QueuedBatch>);
+                type CommitChunk = (Vec<(ClientRequestId, Request)>, Vec<(usize, QueuedBatch)>);
                 let mut chunks: Vec<CommitChunk> = Vec::new();
                 let mut current_items: Vec<(ClientRequestId, Request)> = Vec::new();
-                let mut current_group: Vec<QueuedBatch> = Vec::new();
+                let mut current_group: Vec<(usize, QueuedBatch)> = Vec::new();
                 for queued in group {
                     let item_count = queued.items.len();
                     if current_items.len() + item_count > CLIENT_BATCH_MAX_ITEMS
@@ -1467,8 +1467,11 @@ impl BatchCommitterHandle {
                             std::mem::take(&mut current_group),
                         ));
                     }
+                    // Record where this submitter's requests land inside the
+                    // merged chunk so its reply slice can be split back out.
+                    let offset = current_items.len();
                     current_items.extend(queued.items.iter().cloned());
-                    current_group.push(queued);
+                    current_group.push((offset, queued));
                 }
                 if !current_items.is_empty() {
                     chunks.push((current_items, current_group));
@@ -1478,8 +1481,24 @@ impl BatchCommitterHandle {
                     let raft = raft.clone();
                     tokio::spawn(async move {
                         let outcome = commit_batch_items(&raft, chunk_items).await;
-                        for queued in chunk_group {
-                            let _ = queued.response.send(outcome.clone());
+                        for (offset, queued) in chunk_group {
+                            // A merged chunk's replies must be partitioned
+                            // back per submitter; only a whole-chunk failure
+                            // or redirect is shared verbatim.
+                            let sliced = match &outcome {
+                                Ok(ClientBatchOutcome::Applied(responses)) => {
+                                    let end = offset + queued.items.len();
+                                    if end <= responses.len() {
+                                        Ok(ClientBatchOutcome::Applied(
+                                            responses[offset..end].to_vec(),
+                                        ))
+                                    } else {
+                                        outcome.clone()
+                                    }
+                                }
+                                _ => outcome.clone(),
+                            };
+                            let _ = queued.response.send(sliced);
                         }
                     });
                 }
@@ -5078,6 +5097,72 @@ mod tests {
                 .1,
             crate::protocol::Frame::Integer(1_000)
         );
+    }
+
+    #[tokio::test]
+    async fn coalescer_partitions_merged_chunk_replies_per_submitter() {
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let raft = new_mem_raft(1, Arc::clone(&peers))
+            .await
+            .expect("raft node should start");
+        raft.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "mem://1".into(),
+            },
+        )]))
+        .await
+        .expect("single node should initialize");
+        timeout(
+            Duration::from_secs(3),
+            raft.wait(None).current_leader(1, "single node should lead"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        // Two concurrent connection batches that fit one coalescing window
+        // merge into a single chunk; each submitter must see only its own
+        // replies, identified here by distinct INCRBY steps.
+        let committer = BatchCommitterHandle::spawn(raft.clone());
+        let build_batch = |key: &'static [u8], step: u128, base: u128| {
+            (0..74)
+                .map(|index| {
+                    (
+                        base + index,
+                        Request::Command(vec![
+                            Bytes::from_static(b"INCRBY"),
+                            Bytes::from_static(key),
+                            Bytes::from(step.to_string()),
+                        ]),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let (outcome_a, outcome_b) = tokio::join!(
+            committer.execute(&raft, build_batch(b"coalesce-key-a", 1, 1_000)),
+            committer.execute(&raft, build_batch(b"coalesce-key-b", 100, 2_000)),
+        );
+
+        let assert_increments = |outcome: Result<ClientBatchOutcome, String>, step: u128| {
+            match outcome.expect("batch should commit") {
+                ClientBatchOutcome::Applied(frames) => {
+                    assert_eq!(frames.len(), 74);
+                    for (index, frame) in frames.iter().enumerate() {
+                        assert_eq!(
+                            frame,
+                            &Frame::Integer(((index as u128 + 1) * step) as i64)
+                        );
+                    }
+                }
+                other => panic!("batch should apply locally, got {other:?}"),
+            }
+        };
+        assert_increments(outcome_a, 1);
+        assert_increments(outcome_b, 100);
+
+        drop(committer);
+        raft.shutdown().await.expect("raft should stop");
     }
 
     #[tokio::test]
