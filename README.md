@@ -174,13 +174,14 @@ PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s
 格式的版本拒绝门禁与迁移策略文档（docs/storage-format-migration.md）、
 CHANGELOG、依赖 SPDX 许可证白名单门禁。
 
-计划 13 的批量写入口、RESP pipeline 批处理和 pwrite 压测模式已实现，
-`redis-benchmark -t set,get -P 16` 三节点交叉验证：SET 17,440 ops/s
-（合批 + 快照策略修正 + prepare 去 clone 后；p50 14.5ms）、线性一致
-GET 16,242 ops/s、PING_INLINE 22.4 万 ops/s。自研压测 8 轮中位数
-16,086 ops/s（峰值 20,707；对比优化前基线 2,355 = 6.8×）。稳定吞吐与
-峰值的差距来自全量快照 IO 周期，20k 稳定中位数门禁转移至增量快照
-计划完成后复测（plans/13 完成标准修订留档）。
+计划 13 的批量写入口、RESP pipeline 批处理和 pwrite 压测模式已实现。
+2026-10-14 定位并修复了合批器响应划分 bug（多连接合并 chunk 的响应未按
+提交者切分——此前多连接 RESP 压测数字含错误帧，已作废并有回归测试）。
+修复后负载噪声环境净测：三节点 SET 8c×128 = 12,897 ops/s（零错误），
+高于 bug 前如实记录的 7,549 基线；单节点 8c×128 = 22,275 ops/s。静默
+环境多轮中位数复测进行中，完成后更新此处（plans/13/16 留档全过程）。
+另一实测结论：线性一致 GET 逐条 quorum barrier，读密集 pipeline 需要读
+簇并行化/租约读优化（plans/16 步骤 6 立项）。
 
 第二阶段扩展已交付（plans/14-15）：Bitmap（SETBIT/GETBIT/BITCOUNT/
 BITPOS/BITOP，String 位寻址）、Bloom Filter（BF.RESERVE/ADD/EXISTS/

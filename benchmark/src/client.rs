@@ -61,12 +61,13 @@ fn encode(parts: &[&[u8]], output: &mut Vec<u8>) {
 /// Count completed replies in a byte slice by walking RESP2 frames.
 ///
 /// Returns the number of whole replies, how many of them are error replies,
-/// and how many bytes they consumed, so the caller can keep the partial tail
-/// for the next read.
-fn count_replies(buffer: &[u8]) -> (usize, usize, usize) {
+/// the first error reply verbatim, and how many bytes the replies consumed,
+/// so the caller can keep the partial tail for the next read.
+fn count_replies(buffer: &[u8]) -> (usize, usize, Option<Vec<u8>>, usize) {
     let mut rest = buffer;
     let mut replies = 0;
     let mut errors = 0;
+    let mut first_error: Option<Vec<u8>> = None;
     let mut consumed = 0;
     // A missing length means the current frame is incomplete, not malformed:
     // stop and let the caller read more bytes.
@@ -77,11 +78,19 @@ fn count_replies(buffer: &[u8]) -> (usize, usize, usize) {
         replies += 1;
         if rest[0] == b'-' {
             errors += 1;
+            if first_error.is_none() {
+                let end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
+                let mut line = &rest[..end];
+                if line.last() == Some(&b'\r') {
+                    line = &line[..line.len() - 1];
+                }
+                first_error = Some(line.to_vec());
+            }
         }
         consumed += frame_len;
         rest = &rest[frame_len..];
     }
-    (replies, errors, consumed)
+    (replies, errors, first_error, consumed)
 }
 
 /// Total wire length of the first RESP2 frame, or `None` if incomplete.
@@ -126,6 +135,8 @@ fn frame_length(buffer: &[u8]) -> Option<usize> {
 pub struct WorkerStats {
     pub completed: u64,
     pub errors: u64,
+    /// First error reply seen verbatim, for diagnosable failure runs.
+    pub first_error: Option<String>,
     /// Per-request latency in microseconds, only recorded when sampling.
     pub latencies: Vec<u32>,
 }
@@ -154,6 +165,9 @@ fn record_latency(stats: &mut WorkerStats, request: SentRequest, completed: toki
 pub struct WorkerConfig {
     pub address: String,
     pub command: Command,
+    /// Percentage of requests that are writes (SET); the rest are reads
+    /// (GET). `None` honors the single-command mode.
+    pub write_percent: Option<u64>,
     pub mode: Mode,
     pub value_size: usize,
     pub pipeline_depth: usize,
@@ -175,6 +189,7 @@ async fn run_batch_worker(config: &WorkerConfig, worker_id: usize) -> std::io::R
     let WorkerConfig {
         address,
         command,
+        write_percent,
         mode: _,
         value_size,
         pipeline_depth,
@@ -204,10 +219,14 @@ async fn run_batch_worker(config: &WorkerConfig, worker_id: usize) -> std::io::R
             let key = format!("benchmark-key-{}", sequence % key_space);
             request_index = request_index.wrapping_add(1);
             let started = tokio::time::Instant::now();
-            match command {
-                Command::Set => encode(&[b"SET", key.as_bytes(), &value], &mut write_buffer),
-                Command::Get => encode(&[b"GET", key.as_bytes()], &mut write_buffer),
-                Command::Ping => encode(&[b"PING"], &mut write_buffer),
+            let is_write = write_percent.map_or(matches!(command, Command::Set), |percent| {
+                (request_index.wrapping_mul(2654435761) % 100) < percent
+            });
+            match (command, is_write) {
+                (Command::Set, _) | (Command::Get, true) | (Command::Ping, true) => {
+                    encode(&[b"SET", key.as_bytes(), &value], &mut write_buffer)
+                }
+                _ => encode(&[b"GET", key.as_bytes()], &mut write_buffer),
             }
             pending.push_back(SentRequest {
                 started,
@@ -229,9 +248,14 @@ async fn run_batch_worker(config: &WorkerConfig, worker_id: usize) -> std::io::R
                 ));
             }
             let filled = tail_start + read;
-            let (replies, errors, consumed) = count_replies(&read_buffer[..filled]);
+            let (replies, errors, first_error, consumed) = count_replies(&read_buffer[..filled]);
             completed += replies;
             stats.errors += errors as u64;
+            if let Some(sample) = &first_error
+                && stats.first_error.is_none()
+            {
+                stats.first_error = Some(String::from_utf8_lossy(sample).into_owned());
+            }
             for _ in 0..replies {
                 let sent = pending.pop_front().ok_or_else(|| {
                     std::io::Error::new(
@@ -295,9 +319,13 @@ async fn run_pwrite_worker(
                 .wrapping_add(1);
             request_index = request_index.wrapping_add(1);
             let key = format!("benchmark-key-{}", sequence % config.key_space);
+            let is_write = config
+                .write_percent
+                .is_none_or(|percent| (sequence % 100) < percent);
             let mut payload = Vec::with_capacity(WRITE_BUFFER);
             match config.command {
-                Command::Set => encode(&[b"SET", key.as_bytes(), &value], &mut payload),
+                Command::Set if is_write => encode(&[b"SET", key.as_bytes(), &value], &mut payload),
+                Command::Set => encode(&[b"GET", key.as_bytes()], &mut payload),
                 Command::Get => encode(&[b"GET", key.as_bytes()], &mut payload),
                 Command::Ping => encode(&[b"PING"], &mut payload),
             }
@@ -399,9 +427,14 @@ async fn stream_reader(
             return Ok(stats);
         }
         let filled = tail_start + read;
-        let (replies, errors, consumed) = count_replies(&read_buffer[..filled]);
+        let (replies, errors, first_error, consumed) = count_replies(&read_buffer[..filled]);
         stats.errors += errors as u64;
         stats.completed += replies as u64;
+        if let Some(sample) = &first_error
+            && stats.first_error.is_none()
+        {
+            stats.first_error = Some(String::from_utf8_lossy(sample).into_owned());
+        }
         for _ in 0..replies {
             let request = tokio::time::timeout(timeout, sent.recv())
                 .await?
@@ -481,11 +514,6 @@ async fn run_raft_direct_worker(
             if acc.len() >= 4 {
                 let length = u32::from_be_bytes(acc[..4].try_into().unwrap()) as usize;
                 if length > alias_cache::raft::NETWORK_MAX_FRAME {
-                    eprintln!(
-                        "RAFT_DIRECT_DEBUG: length={length} acc_head={:?} acc_len={}",
-                        &acc[..acc.len().min(24)],
-                        acc.len()
-                    );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "raft rpc response exceeds maximum frame size",
@@ -565,14 +593,16 @@ mod tests {
     #[test]
     fn counts_flat_replies_and_keeps_partial_tail() {
         let payload = b"+OK\r\n$3\r\nbar\r\n:7\r\n-ERR nope\r\n";
-        let (replies, errors, consumed) = count_replies(payload);
+        let (replies, errors, first_error, consumed) = count_replies(payload);
         assert_eq!(replies, 4);
         assert_eq!(errors, 1);
+        assert_eq!(first_error.as_deref(), Some(&b"-ERR nope"[..]));
         assert_eq!(consumed, payload.len());
         // Incomplete bulk tail is not counted.
-        let (replies, errors, consumed) = count_replies(&payload[..payload.len() - 2]);
+        let (replies, errors, first_error, consumed) = count_replies(&payload[..payload.len() - 2]);
         assert_eq!(replies, 3);
         assert_eq!(errors, 0, "the truncated error reply is not counted");
+        assert_eq!(first_error, None);
         assert_eq!(consumed, 18, "only the three complete frames count");
     }
 

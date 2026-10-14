@@ -54,6 +54,11 @@ struct Args {
     /// Per-request timeout in milliseconds.
     #[arg(long, default_value_t = 5_000)]
     timeout_ms: u64,
+
+    /// Percentage of requests that are writes (SET); the rest are GETs.
+    /// 0-100; omitted = single-command mode from --command.
+    #[arg(long)]
+    write_percent: Option<u64>,
 }
 
 #[tokio::main]
@@ -91,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = std::sync::Arc::new(client::WorkerConfig {
         address: args.address.clone(),
         command,
+        write_percent: args.write_percent,
         mode: args.mode,
         value_size: args.value_size,
         pipeline_depth: args.pipeline,
@@ -111,6 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stats = handle.await??;
         totals.completed += stats.completed;
         totals.errors += stats.errors;
+        if totals.first_error.is_none() {
+            totals.first_error = stats.first_error;
+        }
         totals.latencies.extend(stats.latencies);
     }
 
@@ -132,5 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             0.0
         }
     );
+    if totals.errors > 0
+        && let Some(sample) = &totals.first_error
+    {
+        println!("first error reply: {sample:?}");
+    }
     Ok(())
 }
