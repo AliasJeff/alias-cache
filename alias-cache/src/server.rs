@@ -55,6 +55,7 @@ impl Server {
                 &self.config.data_dir,
                 self.config.raft_addr.to_string(),
                 max_memory,
+                self.config.snapshot_policy(),
             )
             .await?;
             return Ok((Arc::new(raft), metrics));
@@ -1516,6 +1517,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -1679,6 +1681,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -1809,6 +1812,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -1913,6 +1917,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -2026,6 +2031,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -2106,6 +2112,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -2205,6 +2212,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),
@@ -2273,6 +2281,7 @@ mod tests {
                 &config.data_dir,
                 config.raft_addr.to_string(),
                 None,
+                10_000,
             )
             .await
             .unwrap(),

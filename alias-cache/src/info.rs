@@ -295,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn single_node_info_reports_leader_and_membership() {
         let data_dir = temp_dir("single");
-        let raft = open_single_node(7, &data_dir, "127.0.0.1:1", None)
+        let raft = open_single_node(7, &data_dir, "127.0.0.1:1", None, 10_000)
             .await
             .unwrap();
         let stats = StatsContext::new(&data_dir, 0, None);
@@ -332,6 +332,7 @@ mod tests {
             &data_dir,
             "127.0.0.1:1",
             Some(1_048_576),
+            10_000,
         )
         .await
         .unwrap();
@@ -419,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn info_accepts_section_filters_and_unknown_sections_render_empty() {
         let data_dir = temp_dir("sections");
-        let raft = open_single_node(8, &data_dir, "127.0.0.1:1", None)
+        let raft = open_single_node(8, &data_dir, "127.0.0.1:1", None, 10_000)
             .await
             .unwrap();
         let stats = StatsContext::new(&data_dir, 0, None);

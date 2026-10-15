@@ -359,6 +359,7 @@ mod tests {
             std::env::temp_dir().join(format!("alias-lua-{}", std::process::id())),
             "127.0.0.1:1",
             None,
+            10_000,
         )
         .await
         .unwrap();

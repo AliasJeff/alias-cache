@@ -3098,7 +3098,8 @@ pub async fn new_file_raft(
     peers: PeerMap,
     max_memory: Option<u64>,
 ) -> Result<RaftHandle, openraft::error::Fatal<TypeConfig>> {
-    new_file_raft_with_metrics(node_id, data_dir, peers, max_memory)
+    // Tests exercise the openraft default snapshot cadence.
+    new_file_raft_with_metrics(node_id, data_dir, peers, max_memory, 10_000)
         .await
         .map(|(raft, _)| raft)
 }
@@ -3108,12 +3109,14 @@ pub async fn new_file_raft_with_metrics(
     data_dir: impl AsRef<Path>,
     peers: PeerMap,
     max_memory: Option<u64>,
+    snapshot_policy: u64,
 ) -> Result<(RaftHandle, Arc<LogStoreMetrics>), openraft::error::Fatal<TypeConfig>> {
     let config = openraft::Config {
         cluster_name: "alias-cache".to_string(),
         heartbeat_interval: 50,
         election_timeout_min: 150,
         election_timeout_max: 300,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_policy.max(1)),
         enable_tick: true,
         ..Default::default()
     }
@@ -3747,8 +3750,9 @@ pub async fn open_single_node(
     data_dir: impl AsRef<Path>,
     raft_addr: impl Into<String>,
     max_memory: Option<u64>,
+    snapshot_policy: u64,
 ) -> CacheResult<RaftHandle> {
-    open_single_node_with_metrics(node_id, data_dir, raft_addr, max_memory)
+    open_single_node_with_metrics(node_id, data_dir, raft_addr, max_memory, snapshot_policy)
         .await
         .map(|(raft, _)| raft)
 }
@@ -3758,12 +3762,18 @@ pub async fn open_single_node_with_metrics(
     data_dir: impl AsRef<Path>,
     raft_addr: impl Into<String>,
     max_memory: Option<u64>,
+    snapshot_policy: u64,
 ) -> CacheResult<(RaftHandle, Arc<LogStoreMetrics>)> {
     let peers = Arc::new(Mutex::new(BTreeMap::new()));
-    let (raft, metrics) =
-        new_file_raft_with_metrics(node_id, data_dir, Arc::clone(&peers), max_memory)
-            .await
-            .map_err(|error| Error::server(format!("open raft node: {error}")))?;
+    let (raft, metrics) = new_file_raft_with_metrics(
+        node_id,
+        data_dir,
+        Arc::clone(&peers),
+        max_memory,
+        snapshot_policy,
+    )
+    .await
+    .map_err(|error| Error::server(format!("open raft node: {error}")))?;
     if !raft
         .is_initialized()
         .await
