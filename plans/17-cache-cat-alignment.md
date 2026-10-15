@@ -78,7 +78,44 @@ cache-cat 的 GET 走 `lease_read()` = openraft `get_read_linearizer(LeaseRead)`
 50/50 与 5/95 的剩余差距全部归因写侧（第 2 层）。95/5 混合档读侧不再是
 瓶颈（写 5% 的提交轮主导波动）。
 
-### 第 2 层：写管线（归因完成，2026-10-15；增量快照立项）
+### 第 2 层：增量快照（已交付，2026-10-15）
+
+**格式**（向后兼容，旧快照文件照常加载）：
+
+- base 文件（ARSS v1）不变；新增 delta 段文件 `snapshot.deltas`（ARSD v1
+  帧：last_log_id + membership + operations，追加写 + fsync）。
+- build 路由：有 base 且未达紧缩阈值 → **增量构建**（取 pending_deltas
+  追加一条 delta 记录 + fsync 后才推进覆盖点）；首次/紧缩到期 → 全量
+  重建（原路径，同时清理 delta 文件）。紧缩阈值：64MiB 或 512 条。
+- 快照 blob = **ARSE 信封**：验证过的 base 载荷字节 + 原始 delta 帧的
+  纯拼接 + 整体校验和——增量构建零状态编解码（初版误用 StoredSnapshot
+  包装字节导致 install 失败无限重发，已修复并规范化 install 落盘为干净
+  全量载荷）。`decode_snapshot_blob` 同时接受信封与旧格式。
+- apply 持续把操作累积进 pending_deltas（全量构建期间走 snapshot_queue
+  原机制）；恢复 = openraft 启动 install（信封解码合并）+ 短日志回放；
+  follower 追赶/learner 加入走同一信封传输路径。
+- 状态机锁为 RwLock：build 增量段与读直备互不阻塞。
+
+实测（单节点 40 万 key 热态，policy 4096）：
+
+| 方案 | 稳态写吞吐 | 恢复时间（~2.3M 条日志） |
+| --- | ---: | ---: |
+| 全量快照（改造前） | 14,456 | 秒级（快照小） |
+| 无快照（对照） | 24,455-48,235 | **>16 分钟，不可用** |
+| **增量快照** | **34,370-45,223** | **1.7s**（base+delta 合并 + 短回放） |
+
+三节点（512c×p16，40 万 key）：50/50 = **44,345**（全量快照时代
+12,373-19,654）；纯写 = **33,368**（13,032-18,578）。零错误。
+
+新增测试：`file_raft_incremental_snapshots_survive_restart`（base+delta
+重启恢复，早期 key 仅可经快照恢复）、
+`incremental_snapshots_compact_and_keep_state`（515 次构建触发紧缩、
+覆盖计数重置、状态不丢）、`delta_records_scan_stops_at_torn_tail`
+（撕裂尾帧安全截停）。全部 171 项测试通过，clippy 零告警。
+
+第 2 层剩余（记录，非本轮）：恢复回放逐条 apply ~250µs/条的批量优化；
+committer 固定窗口与 openraft 逐条 apply 的进一步压榨；读侧
+GetLinearizer 单核 oneshot 的最后 ~15% 差距归因。
 
 **步骤 0 归因实验（此前未做，本轮补齐）**——单节点、40 万 key 热态、
 纯写 32c×512，`sample` 采样 leader：
@@ -113,11 +150,18 @@ plans/06 遗留项正式升级为第 2 层前置。恢复回放速度（apply �
 **过渡期调参依据（增量快照交付前）**：快照成本随状态大小线性增长，
 policy 应随工作集规模上调（4096 默认是为 10 万级 key 设计的）；具体
 默认值待增量快照方案落地时一并修订，避免两头不讨好的临时值。
+（增量快照已交付，见上文；默认 policy 4096 现在代价可控，维持不变。）
 
-### 第 3 层：协议层（未开始）
+### 第 2 层（续）：归因实验留档（2026-10-15）
 
-- `write_frame` 每响应帧新建 BytesMut；pipeline 应答应批量编码一次写出。
-- 读响应路径的 Frame 分配可评估 Bytes 复用。
+**步骤 0 归因实验（此前未做，本轮补齐）**——单节点、40 万 key 热态、
+纯写 32c×512，`sample` 采样 leader：
+
+| 配置 | 稳态吞吐 | CPU 归因 |
+| --- | ---: | --- |
+| policy 4096（改造前全量快照） | 14,456 | ~95% 快照流水线 |
+| policy 1e9（真·无快照） | 24,455-48,235 | apply + WAL fsync |
+| policy 4096（增量快照，交付后） | 34,370-45,223 | 快照税消除 |
 
 ## 完成标准
 

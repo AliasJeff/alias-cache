@@ -186,6 +186,17 @@ fn persist_raft_snapshot(path: &Path, snapshot: &StoredSnapshot) -> io::Result<(
 }
 
 fn load_persisted_raft_snapshot(path: &Path) -> io::Result<Option<StoredSnapshot>> {
+    let Some(payload) = read_persisted_snapshot_payload(path)? else {
+        return Ok(None);
+    };
+    let snapshot = bincode::deserialize(&payload).map_err(io::Error::other)?;
+    Ok(Some(snapshot))
+}
+
+/// Read and validate one persisted snapshot file, returning its raw bincode
+/// payload without the framing header/checksum. Envelope builders reuse these
+/// bytes directly so an incremental build never re-serializes the base.
+fn read_persisted_snapshot_payload(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -243,9 +254,9 @@ fn load_persisted_raft_snapshot(path: &Path) -> io::Result<Option<StoredSnapshot
             "raft snapshot file checksum mismatch",
         ));
     }
-    let snapshot = bincode::deserialize(&record[RAFT_SNAPSHOT_FILE_HEADER_LEN..checksum_offset])
-        .map_err(io::Error::other)?;
-    Ok(Some(snapshot))
+    Ok(Some(
+        record[RAFT_SNAPSHOT_FILE_HEADER_LEN..checksum_offset].to_vec(),
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -279,6 +290,269 @@ fn decode_raft_snapshot(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
         ));
     }
     Ok((payload.state, payload.pending_operations))
+}
+
+fn delta_file_path(snapshot_path: &Path) -> PathBuf {
+    snapshot_path.with_extension("deltas")
+}
+
+fn remove_delta_file(snapshot_path: &Path) {
+    let path = delta_file_path(snapshot_path);
+    let _ = fs::remove_file(path);
+}
+
+fn encode_delta_record(segment: &DeltaSegment) -> io::Result<Vec<u8>> {
+    let payload = bincode::serialize(segment).map_err(io::Error::other)?;
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "delta length overflows u64"))?;
+    let mut record = Vec::with_capacity(
+        RAFT_DELTA_HEADER_LEN + payload.len() + RAFT_DELTA_CHECKSUM_LEN,
+    );
+    record.extend_from_slice(&RAFT_DELTA_FILE_MAGIC);
+    record.extend_from_slice(&RAFT_DELTA_FILE_VERSION.to_le_bytes());
+    record.extend_from_slice(&payload_len.to_le_bytes());
+    record.extend_from_slice(&payload);
+    record.extend_from_slice(&snapshot_checksum(&record).to_le_bytes());
+    Ok(record)
+}
+
+/// Append one delta record and fsync it. The snapshot coverage point may only
+/// advance after this returns, so a crash can never lose claimed coverage.
+fn append_delta_record(path: &Path, segment: &DeltaSegment) -> io::Result<u64> {
+    let record = encode_delta_record(segment)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&record)?;
+    file.sync_all()?;
+    Ok(record.len() as u64)
+}
+
+/// Scan delta records from the start of the file, stopping at the first
+/// invalid magic, unsupported version, checksum mismatch, or truncated tail —
+/// a torn append can only damage the tail, and everything before the last
+/// valid record is durable. Records after a damaged one are unreachable by
+/// construction (append-only), so stopping is lossless for covered state.
+fn load_delta_records(path: &Path) -> io::Result<Vec<(DeltaSegment, u64)>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut segments = Vec::new();
+    let mut offset = 0usize;
+    while bytes.len() - offset >= RAFT_DELTA_HEADER_LEN + RAFT_DELTA_CHECKSUM_LEN {
+        if bytes[offset..offset + 4] != RAFT_DELTA_FILE_MAGIC {
+            break;
+        }
+        if u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) != RAFT_DELTA_FILE_VERSION {
+            break;
+        }
+        let payload_len = u64::from_le_bytes(
+            bytes[offset + 6..offset + RAFT_DELTA_HEADER_LEN]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delta length"))?,
+        );
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "delta length overflows usize")
+        })?;
+        let expected_len = RAFT_DELTA_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|length| length.checked_add(RAFT_DELTA_CHECKSUM_LEN))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "delta length overflows"))?;
+        if bytes.len() - offset < expected_len {
+            break;
+        }
+        let checksum_offset = offset + RAFT_DELTA_HEADER_LEN + payload_len;
+        let stored_checksum = u64::from_le_bytes(
+            bytes[checksum_offset..checksum_offset + RAFT_DELTA_CHECKSUM_LEN]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delta checksum"))?,
+        );
+        if snapshot_checksum(&bytes[offset..checksum_offset]) != stored_checksum {
+            break;
+        }
+        let segment: DeltaSegment = bincode::deserialize(
+            &bytes[offset + RAFT_DELTA_HEADER_LEN..checksum_offset],
+        )
+        .map_err(io::Error::other)?;
+        if segment.version != RAFT_DELTA_FILE_VERSION {
+            break;
+        }
+        offset += expected_len;
+        segments.push((segment, expected_len as u64));
+    }
+    Ok(segments)
+}
+
+const RAFT_SNAPSHOT_ENVELOPE_MAGIC: [u8; 4] = *b"ARSE";
+const RAFT_SNAPSHOT_ENVELOPE_VERSION: u16 = 1;
+const RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN: usize = 4 + 2 + 8;
+const RAFT_SNAPSHOT_ENVELOPE_CHECKSUM_LEN: usize = 8;
+
+/// Assemble the incremental snapshot blob without touching the state machine:
+/// the validated base payload bytes followed by the raw delta records, wrapped
+/// in a checksummed envelope. This runs only when a snapshot blob is actually
+/// needed (openraft build bookkeeping, follower catch-up, startup install), so
+/// the steady-state snapshot cost stays at one small append plus a copy.
+fn build_snapshot_envelope(snapshot_path: &Path) -> io::Result<Vec<u8>> {
+    // The base file stores a StoredSnapshot wrapper; the envelope embeds the
+    // inner RaftSnapshotPayload bytes so a decode never sees the wrapper.
+    let base_payload = load_persisted_raft_snapshot(snapshot_path)?
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "raft snapshot base is missing")
+        })?
+        .data;
+    let base_len = u64::try_from(base_payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "base length overflows u64"))?;
+    let delta_bytes = read_raw_delta_records(&delta_file_path(snapshot_path))?;
+    let mut blob = Vec::with_capacity(
+        RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN
+            + base_payload.len()
+            + delta_bytes.len()
+            + RAFT_SNAPSHOT_ENVELOPE_CHECKSUM_LEN,
+    );
+    blob.extend_from_slice(&RAFT_SNAPSHOT_ENVELOPE_MAGIC);
+    blob.extend_from_slice(&RAFT_SNAPSHOT_ENVELOPE_VERSION.to_le_bytes());
+    blob.extend_from_slice(&base_len.to_le_bytes());
+    blob.extend_from_slice(&base_payload);
+    blob.extend_from_slice(&delta_bytes);
+    let checksum = snapshot_checksum(&blob);
+    blob.extend_from_slice(&checksum.to_le_bytes());
+    Ok(blob)
+}
+
+/// Raw delta record bytes (already framed and individually checksummed).
+fn read_raw_delta_records(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Decode a snapshot blob into state. Accepts the incremental envelope and
+/// the legacy single full payload so old snapshot files keep loading.
+fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>)> {
+    if data.len() < RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN + RAFT_SNAPSHOT_ENVELOPE_CHECKSUM_LEN
+        || data[..4] != RAFT_SNAPSHOT_ENVELOPE_MAGIC
+    {
+        return decode_raft_snapshot(data);
+    }
+    if u16::from_le_bytes([data[4], data[5]]) != RAFT_SNAPSHOT_ENVELOPE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported raft snapshot envelope version",
+        ));
+    }
+    let checksum_offset = data.len() - RAFT_SNAPSHOT_ENVELOPE_CHECKSUM_LEN;
+    let expected_checksum = u64::from_le_bytes(
+        data[checksum_offset..]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid envelope checksum"))?,
+    );
+    if snapshot_checksum(&data[..checksum_offset]) != expected_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot envelope checksum mismatch",
+        ));
+    }
+    let base_len = u64::from_le_bytes(
+        data[6..RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid envelope base length"))?,
+    );
+    let base_len = usize::try_from(base_len).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "envelope base length overflows usize")
+    })?;
+    let base_end = RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN
+        .checked_add(base_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "envelope base length overflows"))?;
+    if base_end > checksum_offset {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft snapshot envelope base exceeds blob",
+        ));
+    }
+    let (mut state, pending_operations) = decode_raft_snapshot(&data[RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN..base_end])?;
+    for operation in &pending_operations {
+        state.advance_logical_time(operation.write_time());
+        let _ = state.apply(operation.clone());
+    }
+    let mut offset = base_end;
+    while offset < checksum_offset {
+        if checksum_offset - offset < RAFT_DELTA_HEADER_LEN + RAFT_DELTA_CHECKSUM_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft snapshot envelope delta is truncated",
+            ));
+        }
+        if data[offset..offset + 4] != RAFT_DELTA_FILE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft snapshot envelope delta magic is invalid",
+            ));
+        }
+        if u16::from_le_bytes([data[offset + 4], data[offset + 5]]) != RAFT_DELTA_FILE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported raft snapshot delta version",
+            ));
+        }
+        let payload_len = u64::from_le_bytes(
+            data[offset + 6..offset + RAFT_DELTA_HEADER_LEN]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delta length"))?,
+        );
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "delta length overflows usize")
+        })?;
+        let expected_len = RAFT_DELTA_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|length| length.checked_add(RAFT_DELTA_CHECKSUM_LEN))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "delta length overflows"))?;
+        if checksum_offset - offset < expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft snapshot envelope delta is truncated",
+            ));
+        }
+        let record_checksum_offset = offset + RAFT_DELTA_HEADER_LEN + payload_len;
+        let stored_checksum = u64::from_le_bytes(
+            data[record_checksum_offset..record_checksum_offset + RAFT_DELTA_CHECKSUM_LEN]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delta checksum"))?,
+        );
+        if snapshot_checksum(&data[offset..record_checksum_offset]) != stored_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft snapshot envelope delta checksum mismatch",
+            ));
+        }
+        let segment: DeltaSegment = bincode::deserialize(
+            &data[offset + RAFT_DELTA_HEADER_LEN..record_checksum_offset],
+        )
+        .map_err(io::Error::other)?;
+        if segment.version != RAFT_DELTA_FILE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported raft snapshot delta version",
+            ));
+        }
+        for operation in &segment.operations {
+            state.advance_logical_time(operation.write_time());
+            let _ = state.apply(operation.clone());
+        }
+        offset += expected_len;
+    }
+    state.recompute_memory();
+    Ok((state, Vec::new()))
 }
 
 const RAFT_LOG_MAGIC: [u8; 4] = *b"ARLG";
@@ -1152,9 +1426,28 @@ struct MemState {
     state: StateMachine,
     last_applied: Option<LogId>,
     membership: StoredMembership,
-    snapshot: Option<StoredSnapshot>,
+    /// Durable snapshot coverage: the base file plus the delta records
+    /// applied on top. Data lives on disk; metadata lives here.
+    snapshot: Option<SnapshotCoverage>,
+    /// Snapshot payload for pathless (in-memory) instances only; durable
+    /// instances materialize their payload from disk on demand.
+    snapshot_data: Option<Vec<u8>>,
     snapshot_state: SnapshotState,
+    /// Operations applied while a full base build is in flight; they are
+    /// encoded into the new base payload.
     snapshot_queue: Vec<Operation>,
+    /// Operations applied since the last durable delta record (or since the
+    /// base, if no delta has been flushed yet).
+    pending_deltas: Vec<Operation>,
+}
+
+/// Coverage metadata of the durable incremental snapshot.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct SnapshotCoverage {
+    last_log_id: Option<LogId>,
+    membership: StoredMembership,
+    delta_bytes: u64,
+    delta_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1164,13 +1457,50 @@ struct StoredSnapshot {
     membership: StoredMembership,
 }
 
+/// One durable delta record: operations applied on top of the previous
+/// coverage point, plus the membership and log position they reached.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeltaSegment {
+    version: u16,
+    last_log_id: Option<LogId>,
+    membership: StoredMembership,
+    operations: Vec<Operation>,
+}
+
+const RAFT_DELTA_FILE_MAGIC: [u8; 4] = *b"ARSD";
+const RAFT_DELTA_FILE_VERSION: u16 = 1;
+const RAFT_DELTA_HEADER_LEN: usize = 4 + 2 + 8;
+const RAFT_DELTA_CHECKSUM_LEN: usize = 8;
+/// Rebuild the base once accumulated deltas reach either bound; both keep the
+/// delta replay (and the follower-catch-up materialization) small.
+const RAFT_DELTA_COMPACTION_BYTES: u64 = 64 * 1024 * 1024;
+const RAFT_DELTA_COMPACTION_COUNT: u64 = 512;
+
 impl MemStateMachine {
     fn persistent(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let snapshot = load_persisted_raft_snapshot(&path)?;
+        let base = load_persisted_raft_snapshot(&path)?;
+        let segments = load_delta_records(&delta_file_path(&path))?;
+        // The state machine itself starts empty here: openraft's startup
+        // reads this coverage through applied_state/get_current_snapshot and
+        // installs the snapshot into us, then replays the log after it.
+        let mut coverage = SnapshotCoverage::default();
+        let mut covered = false;
+        if let Some(stored) = &base {
+            coverage.last_log_id = stored.last_log_id;
+            coverage.membership = stored.membership.clone();
+            covered = true;
+        }
+        for (segment, record_bytes) in &segments {
+            coverage.last_log_id = segment.last_log_id;
+            coverage.membership = segment.membership.clone();
+            coverage.delta_bytes += record_bytes;
+            covered = true;
+        }
+        coverage.delta_count = segments.len() as u64;
         Ok(Self {
             inner: Arc::new(RwLock::new(MemState {
-                snapshot,
+                snapshot: covered.then_some(coverage),
                 ..MemState::default()
             })),
             snapshot_path: Some(path),
@@ -1843,10 +2173,16 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
                     RaftResponse::Noop
                 }
             };
-            if inner.snapshot_state == SnapshotState::Start
-                && let Some(operation) = snapshot_operation
-            {
-                inner.snapshot_queue.push(operation);
+            if inner.snapshot_state == SnapshotState::Start {
+                // A full base build is in flight: operations applied after its
+                // working clone are encoded into the new base payload.
+                if let Some(operation) = snapshot_operation {
+                    inner.snapshot_queue.push(operation);
+                }
+            } else if let Some(operation) = snapshot_operation {
+                // Everything applied on top of the durable coverage point is
+                // the next delta record.
+                inner.pending_deltas.push(operation);
             }
             drop(inner);
             if let Some(responder) = responder {
@@ -1872,7 +2208,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
     ) -> Result<(), io::Error> {
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut snapshot, &mut data)?;
-        let (mut state, pending_operations) = decode_raft_snapshot(&data)?;
+        let (mut state, pending_operations) = decode_snapshot_blob(&data)?;
         for operation in pending_operations {
             state.advance_logical_time(operation.write_time());
             let _ = state.apply(operation);
@@ -1880,13 +2216,18 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         // The memory counter is skipped by serde and must be rebuilt from
         // the restored data before the node serves anything.
         state.recompute_memory();
-        let stored_snapshot = StoredSnapshot {
-            data,
-            last_log_id: meta.last_log_id,
-            membership: meta.last_membership.clone(),
-        };
+        // Normalize whatever arrived (envelope or legacy payload) into a
+        // clean full base so later envelope builds embed plain payload bytes.
+        data = encode_raft_snapshot(&state, Vec::new())?;
         if let Some(path) = &self.snapshot_path {
-            persist_raft_snapshot(path, &stored_snapshot)?;
+            persist_raft_snapshot(
+                path,
+                &StoredSnapshot {
+                    data: data.clone(),
+                    last_log_id: meta.last_log_id,
+                    membership: meta.last_membership.clone(),
+                },
+            )?;
         }
         let mut inner = self.inner.write().await;
         inner.state = state;
@@ -1894,7 +2235,20 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         inner.membership = meta.last_membership.clone();
         inner.snapshot_state = SnapshotState::End;
         inner.snapshot_queue.clear();
-        inner.snapshot = Some(stored_snapshot);
+        inner.pending_deltas.clear();
+        // The installed snapshot covers everything; delta records are stale.
+        if let Some(path) = &self.snapshot_path {
+            remove_delta_file(path);
+            inner.snapshot_data = None;
+        } else {
+            inner.snapshot_data = Some(data);
+        }
+        inner.snapshot = Some(SnapshotCoverage {
+            last_log_id: meta.last_log_id,
+            membership: meta.last_membership.clone(),
+            delta_bytes: 0,
+            delta_count: 0,
+        });
         Ok(())
     }
 
@@ -1911,13 +2265,31 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         >,
         io::Error,
     > {
-        let inner = self.inner.read().await;
-        Ok(inner.snapshot.clone().map(|snapshot| openraft::Snapshot {
+        // Coverage metadata comes from memory; durable instances materialize
+        // the blob from disk (base + deltas merged) only when someone asks.
+        // Pathless instances keep their payload in memory.
+        let inner_guard = self.inner.read().await;
+        let (snapshot_path, coverage, data) = match &inner_guard.snapshot {
+            Some(coverage) => (
+                self.snapshot_path.clone(),
+                coverage.clone(),
+                inner_guard.snapshot_data.clone(),
+            ),
+            None => return Ok(None),
+        };
+        drop(inner_guard);
+        let data = match snapshot_path {
+            Some(snapshot_path) => build_snapshot_envelope(&snapshot_path)?,
+            None => data.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "raft snapshot payload is missing")
+            })?,
+        };
+        Ok(Some(openraft::Snapshot {
             meta: openraft::SnapshotMeta {
-                last_log_id: snapshot.last_log_id,
-                last_membership: snapshot.membership,
+                last_log_id: coverage.last_log_id,
+                last_membership: coverage.membership,
             },
-            snapshot: std::io::Cursor::new(snapshot.data),
+            snapshot: std::io::Cursor::new(data),
         }))
     }
 }
@@ -1936,6 +2308,39 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         >,
         io::Error,
     > {
+        // With a durable base and a snapshot directory, a build is one small
+        // delta append; a full rebuild (base serialize) only happens for the
+        // first snapshot, at compaction, or for pathless in-memory instances,
+        // so the steady-state write path never serializes state.
+        let (coverage, has_path) = {
+            let inner = self.inner.read().await;
+            (inner.snapshot.clone(), self.snapshot_path.is_some())
+        };
+        let compaction_due = coverage.as_ref().is_some_and(|coverage| {
+            coverage.delta_bytes >= RAFT_DELTA_COMPACTION_BYTES
+                || coverage.delta_count >= RAFT_DELTA_COMPACTION_COUNT
+        });
+        match coverage {
+            Some(_) if has_path && !compaction_due => self.build_incremental_snapshot().await,
+            _ => self.build_full_snapshot().await,
+        }
+    }
+}
+
+impl MemStateMachine {
+    /// Full rebuild: clone the live state, encode it (plus operations applied
+    /// during the build) as the new base, and retire every delta record.
+    async fn build_full_snapshot(
+        &mut self,
+    ) -> Result<
+        openraft::Snapshot<
+            <TypeConfig as RaftTypeConfig>::LeaderId,
+            NodeId,
+            Node,
+            std::io::Cursor<Vec<u8>>,
+        >,
+        io::Error,
+    > {
         let base_state = {
             let mut inner = self.inner.write().await;
             if inner.snapshot_state != SnapshotState::End {
@@ -1945,6 +2350,9 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
                 ));
             }
             inner.snapshot_state = SnapshotState::Start;
+            // The clone already contains everything applied so far, including
+            // the pending delta operations.
+            inner.pending_deltas.clear();
             inner.state.clone()
         };
 
@@ -1954,9 +2362,60 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         }
         result
     }
-}
 
-impl MemStateMachine {
+    /// Incremental build: append one delta record with everything applied
+    /// since the durable coverage point, fsync it, and only then advance the
+    /// coverage openraft sees. No state clone, no full serialize.
+    async fn build_incremental_snapshot(
+        &self,
+    ) -> Result<
+        openraft::Snapshot<
+            <TypeConfig as RaftTypeConfig>::LeaderId,
+            NodeId,
+            Node,
+            std::io::Cursor<Vec<u8>>,
+        >,
+        io::Error,
+    > {
+        let snapshot_path = self
+            .snapshot_path
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "raft snapshot path unset"))?;
+        let (operations, last_log_id, membership, prior_coverage) = {
+            let mut inner = self.inner.write().await;
+            let operations = std::mem::take(&mut inner.pending_deltas);
+            (
+                operations,
+                inner.last_applied,
+                inner.membership.clone(),
+                inner.snapshot.clone(),
+            )
+        };
+        let segment = DeltaSegment {
+            version: RAFT_DELTA_FILE_VERSION,
+            last_log_id,
+            membership: membership.clone(),
+            operations,
+        };
+        let record_bytes = append_delta_record(&delta_file_path(&snapshot_path), &segment)?;
+        let mut coverage = prior_coverage.unwrap_or_default();
+        coverage.last_log_id = last_log_id;
+        coverage.membership = membership;
+        coverage.delta_bytes += record_bytes;
+        coverage.delta_count += 1;
+        let data = build_snapshot_envelope(&snapshot_path)?;
+        {
+            let mut inner = self.inner.write().await;
+            inner.snapshot = Some(coverage.clone());
+        }
+        Ok(openraft::Snapshot {
+            meta: openraft::SnapshotMeta {
+                last_log_id: coverage.last_log_id,
+                last_membership: coverage.membership,
+            },
+            snapshot: std::io::Cursor::new(data),
+        })
+    }
     async fn build_snapshot_from_base(
         &self,
         base_state: StateMachine,
@@ -1979,17 +2438,29 @@ impl MemStateMachine {
             )
         };
         let data = encode_raft_snapshot(&base_state, pending_operations)?;
-        let stored_snapshot = StoredSnapshot {
-            data: data.clone(),
+        let mut inner = self.inner.write().await;
+        inner.snapshot = Some(SnapshotCoverage {
             last_log_id,
             membership: membership.clone(),
-        };
-        if let Some(path) = &self.snapshot_path {
-            persist_raft_snapshot(path, &stored_snapshot)?;
-        }
-        let mut inner = self.inner.write().await;
-        inner.snapshot = Some(stored_snapshot);
+            delta_bytes: 0,
+            delta_count: 0,
+        });
         inner.snapshot_state = SnapshotState::End;
+        if let Some(path) = &self.snapshot_path {
+            persist_raft_snapshot(
+                path,
+                &StoredSnapshot {
+                    data: data.clone(),
+                    last_log_id,
+                    membership: membership.clone(),
+                },
+            )?;
+            // The new base covers every delta record.
+            remove_delta_file(path);
+            inner.snapshot_data = None;
+        } else {
+            inner.snapshot_data = Some(data.clone());
+        }
         Ok(openraft::Snapshot {
             meta: openraft::SnapshotMeta {
                 last_log_id,
@@ -8241,6 +8712,198 @@ mod tests {
             .await
             .expect("restart shutdown should finish")
             .expect("restart shutdown should succeed");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn file_raft_incremental_snapshots_survive_restart() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-file-raft-incremental-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let deltas_path = data_dir.join("raft").join("snapshot.deltas");
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let (node, _) = new_file_raft_with_metrics(1, &data_dir, Arc::clone(&peers), None, 100)
+            .await
+            .expect("initial node should start");
+        node.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "file://1".into(),
+            },
+        )]))
+        .await
+        .expect("single node should initialize");
+        timeout(
+            Duration::from_secs(5),
+            node.wait(None)
+                .current_leader(1, "node should become leader"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        // Policy 100: these writes produce one base plus several delta
+        // records, and openraft purges covered log entries along the way.
+        for index in 0..350 {
+            node.client_write(RaftRequest::Apply(Operation::Set {
+                key: Bytes::from(format!("incremental-key-{index}")),
+                value: Bytes::from(format!("incremental-value-{index}")),
+            }))
+            .await
+            .expect("write should succeed");
+        }
+        assert!(
+            deltas_path.exists(),
+            "delta records must be durable while the base stays in place"
+        );
+        node.shutdown().await.expect("node should shut down");
+
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let (restarted, _) =
+            new_file_raft_with_metrics(1, &data_dir, Arc::clone(&peers), None, 100)
+                .await
+                .expect("restarted node should start");
+        timeout(
+            Duration::from_secs(5),
+            restarted
+                .wait(None)
+                .applied_index_at_least(Some(351), "all entries should recover"),
+        )
+        .await
+        .expect("recovery should finish")
+        .expect("recovery should succeed");
+        let state = restarted
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("state machine should be readable");
+        // Early keys are only recoverable through the base + delta records
+        // (their log entries are purged); late keys ride the log replay.
+        for index in [0, 99, 100, 250, 349] {
+            assert_eq!(
+                state
+                    .snapshot()
+                    .get(&Bytes::from(format!("incremental-key-{index}"))),
+                Some(&crate::state_machine::Value::String(Bytes::from(format!(
+                    "incremental-value-{index}"
+                )))),
+                "key {index} must survive the restart"
+            );
+        }
+        restarted.shutdown().await.expect("node should shut down");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn incremental_snapshots_compact_and_keep_state() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-file-raft-compact-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        // Policy 10 with 5,150 writes: 515 delta builds trigger the
+        // count-based compaction well before the run ends.
+        let (node, _) = new_file_raft_with_metrics(1, &data_dir, Arc::clone(&peers), None, 10)
+            .await
+            .expect("initial node should start");
+        node.initialize(BTreeMap::from([(
+            1,
+            Node {
+                addr: "file://1".into(),
+            },
+        )]))
+        .await
+        .expect("single node should initialize");
+        timeout(
+            Duration::from_secs(5),
+            node.wait(None)
+                .current_leader(1, "node should become leader"),
+        )
+        .await
+        .expect("leader election should finish")
+        .expect("leader election should succeed");
+
+        for index in 0..5_150 {
+            node.client_write(RaftRequest::Apply(Operation::Set {
+                key: Bytes::from(format!("compact-key-{index}")),
+                value: Bytes::from(format!("compact-value-{index}")),
+            }))
+            .await
+            .expect("write should succeed");
+        }
+        // The compaction rebuild retired the delta records; the few builds
+        // after it started a fresh delta generation (count far below the
+        // 514 builds a run without compaction would have accumulated).
+        let coverage = node
+            .with_state_machine(|state_machine| {
+                Box::pin(async move {
+                    state_machine.inner.read().await.snapshot.clone()
+                })
+            })
+            .await
+            .expect("coverage should be readable")
+            .expect("coverage should exist after snapshots");
+        assert!(
+            coverage.delta_count < 100,
+            "delta count must have been reset by compaction, got {}",
+            coverage.delta_count
+        );
+        let state = node
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.state().await })
+            })
+            .await
+            .expect("state machine should be readable");
+        assert_eq!(
+            state
+                .snapshot()
+                .get(&Bytes::from_static(b"compact-key-5149")),
+            Some(&crate::state_machine::Value::String(Bytes::from_static(
+                b"compact-value-5149"
+            )))
+        );
+        node.shutdown().await.expect("node should shut down");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn delta_records_scan_stops_at_torn_tail() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "alias-cache-delta-torn-tail-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("test dir should create");
+        let deltas_path = data_dir.join("snapshot.deltas");
+        let segment = |last_index: u64| DeltaSegment {
+            version: RAFT_DELTA_FILE_VERSION,
+            last_log_id: Some(openraft::LogId::new(
+                <TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1),
+                last_index,
+            )),
+            membership: StoredMembership::default(),
+            operations: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        for last_index in [10_u64, 20, 30] {
+            bytes.extend_from_slice(&encode_delta_record(&segment(last_index))
+                .expect("delta record should encode"));
+        }
+        // A torn append: the last record is cut short mid-payload.
+        bytes.truncate(bytes.len() - 8);
+        std::fs::write(&deltas_path, &bytes).expect("delta file should write");
+
+        let segments = load_delta_records(&deltas_path).expect("scan should not fail");
+        assert_eq!(segments.len(), 2, "torn tail must not yield records");
+        assert_eq!(
+            segments[1].0.last_log_id.map(|log_id| log_id.index),
+            Some(20),
+            "recovery must stop at the last durable record"
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
