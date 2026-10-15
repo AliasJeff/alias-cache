@@ -88,17 +88,38 @@ RESP request
 
 ## 3. 读取路径
 
-第一版使用 ReadIndex 或等价的多数派读屏障实现线性一致读：
+读取路径使用 leader 租约读（lease read，`ReadPolicy::LeaseRead`）：leader
+在租约有效期内直接应答读请求，不追加日志、不发起多数派往返；租约失效则
+fail-closed（拒绝应答并重定向），绝不返回陈旧值。读请求在建立租约屏障
+**之后**才执行状态机读取。
+
+租约模型的前提与行为（实现依据，改动前必须复验）：
+
+- **时钟前提**：租约有效性由 leader 本地时钟与
+  `election_timeout_max`（默认 300ms）判定，假设节点间时钟漂移可忽略。
+  跨节点时钟无界漂移会放大陈旧读窗口——部署前提必须记录时钟同步方式。
+- **租约续期**：follower 对心跳/复制的确认推进
+  `quorum_acked_time`；`heartbeat_interval`（默认 50ms）内持续续期。
+- **分区行为**：leader 失去多数派后，租约最迟
+  `election_timeout_max` 过期，期间只允许应答分区前已提交的状态，
+  过期后读请求必须失败（护栏测试
+  `tcp_minority_partition_separates_read_write_and_redirect_errors`）。
+- **Leader 变更**：新 leader 就任后租约重新计时；旧 leader 租约到期前
+  与新 term 冲突由 openraft 的 vote/lease 机制拒绝。
+
+单条读的执行路径（与 cache-cat 同口径的 lease read + 直备）：
 
 ```text
 RESP request
-  -> confirm current Leader
-  -> establish read barrier
-  -> read committed state
+  -> leader lease valid? no  -> redirect / fail closed
+  -> yes -> prepare against LIVE state (no clone)
   -> encode response
 ```
 
-租约读只能作为后续优化，必须记录时钟漂移、租约失效、网络分区和 Leader 变更行为。
+历史记录：第一版曾对每条读执行 ReadIndex（blank 日志追加 + 多数派确认，
+串行约 30ms/读），实测读上限 ~30 reads/s 且与并发无关；租约读 + 单条
+直备后，40 万 key 深并发线性一致读单节点 ~34 万 ops/s（p50 785µs），
+三节点 GET p1 p50 66µs。
 
 ## 4. 快照路径
 

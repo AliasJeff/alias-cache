@@ -1648,15 +1648,6 @@ impl StateMachine {
         }
     }
 
-    pub fn prepare_request_at(
-        &self,
-        request: Request,
-        write_time: u64,
-    ) -> Result<(Option<Operation>, Frame)> {
-        let mut state = self.clone();
-        state.prepare_request_at_with_id_mut(request, write_time, None)
-    }
-
     /// Prepare on an owned working copy that the caller obtained from
     /// `MemStateMachine::state()`; advancing the logical clock mutates that
     /// copy in place, so no second full-state clone is needed. A failed

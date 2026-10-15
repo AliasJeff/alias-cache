@@ -1199,44 +1199,57 @@ impl MemStateMachine {
         )
     }
 
+    /// Validate one client request against the live state machine without
+    /// cloning it — the same prepare-on-live-state contract as the batch
+    /// path: prepare is pure validation and operation generation (responses
+    /// for reads execute read-only; writes only wrap an Operation), so it can
+    /// run under the state lock directly. The only mutation before success is
+    /// the monotonic logical-time advance, which never enters the log.
+    pub async fn prepare_request_live(
+        &self,
+        request: Request,
+        write_time: u64,
+        request_id: Option<ClientRequestId>,
+    ) -> Result<(Option<Operation>, Frame), String> {
+        let mut guard = self.inner.lock().await;
+        guard.state.advance_logical_time(write_time);
+        guard
+            .state
+            .prepare_request_with_id(request, request_id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Prepare one transaction against the live state machine; the
+    /// transaction's own trial execution runs on its internal working copy.
+    pub async fn prepare_transaction_live(
+        &self,
+        requests: &[Request],
+        write_time: u64,
+        request_id: ClientRequestId,
+        watch_expectations: Vec<(Bytes, Option<u64>)>,
+    ) -> Result<Operation, String> {
+        let guard = self.inner.lock().await;
+        guard
+            .state
+            .prepare_transaction_with_id(
+                requests,
+                write_time,
+                Some(request_id),
+                watch_expectations,
+            )
+            .map(|(operation, _)| operation)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Wrap a logical-time advance against the live state machine.
+    pub async fn prepare_time_advance_live(&self, write_time: u64) -> Operation {
+        let guard = self.inner.lock().await;
+        guard.state.prepare_time_advance(write_time)
+    }
+
     pub async fn state_with_applied_index(&self) -> (StateMachine, Option<LogId>) {
         let inner = self.inner.lock().await;
         (inner.state.clone(), inner.last_applied)
-    }
-}
-
-pub async fn execute_raft_request(raft: &RaftHandle, request: Request) -> CacheResult<Frame> {
-    raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex)
-        .await
-        .map_err(|error| Error::server(format!("raft read barrier failed: {error}")))?;
-    let (operation, response) = raft
-        .with_state_machine(move |state_machine| {
-            Box::pin(async move { state_machine.state().await.prepare_request(request) })
-        })
-        .await
-        .map_err(|error| Error::server(format!("read raft state machine: {error}")))??;
-    let Some(operation) = operation else {
-        return Ok(response);
-    };
-
-    let result = raft
-        .client_write(RaftRequest::Apply(operation))
-        .await
-        .map_err(|error| {
-            if let Some(forward) = error.forward_to_leader() {
-                if let Some(node) = &forward.leader_node {
-                    return Error::server(format!(
-                        "not leader; retry at raft leader {}",
-                        node.addr
-                    ));
-                }
-                return Error::server("not leader; raft leader is not known");
-            }
-            Error::server(format!("raft write failed: {error}"))
-        })?;
-    match result.data {
-        RaftResponse::Applied(response) => Ok(response),
-        RaftResponse::Noop => Err(Error::server("raft write produced no response")),
     }
 }
 
@@ -1264,32 +1277,37 @@ pub async fn execute_client_request_with_id(
     request_id: ClientRequestId,
     request: Request,
 ) -> Result<ClientRequestOutcome, String> {
+    // Reads establish the leader-lease barrier BEFORE touching the state
+    // machine: a valid lease proves this node still leads without a log
+    // append or a quorum round (the same lease-read model cache-cat uses);
+    // an expired lease fails closed into the redirect path. The lease spans
+    // election_timeout_max and is renewed by follower heartbeat
+    // acknowledgements, so a partitioned leader stops answering reads within
+    // that window.
+    if !is_replicated_write(request.command_name())
+        && let Err(error) = raft.ensure_linearizable(openraft::ReadPolicy::LeaseRead).await
+    {
+        if let Some(forward) = error.forward_to_leader() {
+            if let Some(node) = &forward.leader_node {
+                return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
+            }
+            return Err("raft leader is not known".to_string());
+        }
+        return Err(format!("raft read barrier failed: {error}"));
+    }
     let write_time = current_time_millis();
     let (operation, response) = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
-                let mut state = state_machine.state().await;
-                state.prepare_request_at_with_id_mut(request, write_time, Some(request_id))
+                state_machine
+                    .prepare_request_live(request, write_time, Some(request_id))
+                    .await
             })
         })
         .await
-        .map_err(|error| format!("read raft state machine: {error}"))?
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("raft state machine: {error}"))??;
     let Some(operation) = operation else {
-        // A follower cannot establish a linearizable read barrier; redirect so
-        // the caller forwards the read to the leader, exactly like writes.
-        if let Err(error) = raft
-            .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
-            .await
-        {
-            if let Some(forward) = error.forward_to_leader() {
-                if let Some(node) = &forward.leader_node {
-                    return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
-                }
-                return Err("raft leader is not known".to_string());
-            }
-            return Err(format!("raft read barrier failed: {error}"));
-        }
+        // A read; the lease barrier above already linearized it.
         return Ok(ClientRequestOutcome::Applied(response));
     };
     let result = raft.client_write(RaftRequest::Apply(operation)).await;
@@ -1652,20 +1670,18 @@ pub async fn execute_transaction_request_with_id(
     let operation = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
-                let state = state_machine.state().await;
-                state
-                    .prepare_transaction_with_id(
+                state_machine
+                    .prepare_transaction_live(
                         &requests,
                         write_time,
-                        Some(request_id),
+                        request_id,
                         watch_expectations,
                     )
-                    .map(|(operation, _)| operation)
+                    .await
             })
         })
         .await
-        .map_err(|error| format!("read raft state machine: {error}"))?
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("raft state machine: {error}"))??;
     match raft.client_write(RaftRequest::Apply(operation)).await {
         Ok(result) => match result.data {
             RaftResponse::Applied(response) => Ok(ClientRequestOutcome::Applied(response)),
@@ -1687,13 +1703,10 @@ pub async fn advance_raft_time(raft: &RaftHandle) -> Result<(), String> {
     let write_time = current_time_millis();
     let operation = raft
         .with_state_machine(move |state_machine| {
-            Box::pin(async move {
-                let state = state_machine.state().await;
-                state.prepare_time_advance(write_time)
-            })
+            Box::pin(async move { state_machine.prepare_time_advance_live(write_time).await })
         })
         .await
-        .map_err(|error| format!("read raft state machine: {error}"))?;
+        .map_err(|error| format!("raft state machine: {error}"))?;
     raft.client_write(RaftRequest::Apply(operation))
         .await
         .map_err(|error| format!("advance raft logical time: {error}"))?;
@@ -7170,21 +7183,48 @@ mod tests {
             ClientRequestOutcome::Redirect(nodes[&majority_leader].addr.clone())
         );
 
-        let minority_read_error = timeout(
-            Duration::from_secs(5),
-            execute_client_request(
-                &rafts[0],
-                Request::Command(vec![
-                    Bytes::from_static(b"GET"),
-                    Bytes::from_static(b"partition-key"),
-                ]),
-            ),
-        )
-        .await
-        .expect("minority read should finish")
-        .expect_err("minority read must not return a linearizable value");
-        assert!(minority_read_error.contains("read barrier failed"));
-        assert!(minority_read_error.to_ascii_lowercase().contains("quorum"));
+        // Lease reads let the partitioned leader answer only while its lease
+        // (election_timeout_max, renewed by follower heartbeat
+        // acknowledgements) is still valid, and only from pre-partition
+        // state. The lease must then expire into a fail-closed error —
+        // never a stale value and never a redirect to an unreachable quorum.
+        let lease_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let minority_read = timeout(
+                Duration::from_secs(1),
+                execute_client_request(
+                    &rafts[0],
+                    Request::Command(vec![
+                        Bytes::from_static(b"GET"),
+                        Bytes::from_static(b"partition-key"),
+                    ]),
+                ),
+            )
+            .await
+            .expect("minority read should finish");
+            match minority_read {
+                Err(error) => {
+                    assert_eq!(
+                        error, "raft leader is not known",
+                        "expired lease must fail closed"
+                    );
+                    break;
+                }
+                Ok(ClientRequestOutcome::Applied(value)) => {
+                    assert_eq!(
+                        value,
+                        Frame::bulk_string("initial-value"),
+                        "a lease-window read may only serve the pre-partition value"
+                    );
+                }
+                Ok(other) => panic!("minority leader must not redirect reads: {other:?}"),
+            }
+            assert!(
+                tokio::time::Instant::now() < lease_deadline,
+                "partitioned leader lease must expire and fail reads closed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         let minority_write_error = timeout(
             Duration::from_secs(5),

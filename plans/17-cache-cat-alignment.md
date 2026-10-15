@@ -1,0 +1,74 @@
+# 17 性能对齐 cache-cat：三层改造（读路径 / 写管线 / 协议层）
+
+## 目标
+
+按 plans/16 步骤 7 的三方对测归因，向 cache-cat 的实现对齐三层瓶颈，
+目标是在同机对测中达到其性能量级。全程保持核心最小、不留 legacy：
+被替代的路径直接删除，不保留兼容开关。
+
+## 层次与状态
+
+### 第 1 层：读路径（已交付，2026-10-15）
+
+cache-cat 的 GET 走 `lease_read()` = openraft `get_read_linearizer(LeaseRead)`
+（租约有效即本地应答，零日志、零多数派往返）。我们原实现每条读走
+`ensure_linearizable(ReadIndex)`（blank 追加 + 多数派确认，串行 ~30ms/读，
+实测读上限 ~30 reads/s 与并发无关——混合负载的决定性短板）。
+
+交付内容（两项叠加，缺一不可）：
+
+1. **LeaseRead 策略 + 屏障前置**：读请求先建立租约屏障再读状态机；
+   follower 经 ForwardToLeader 重定向（不变）；PING/ECHO/INFO 仍在
+   服务器层本地应答（不进 raft）。租约语义与护栏：
+   - 租约窗口 = `election_timeout_max`（300ms），follower 心跳确认续期；
+   - 分区时租约窗口内只允许应答分区前已提交状态，到期必须 fail-closed
+     （护栏测试 `tcp_minority_partition_separates_read_write_and_redirect_errors`
+     已改为断言该契约：窗口内只允许 pre-partition 值，到期后必须报错）；
+   - 时钟前提（漂移可忽略）写入 docs/architecture.md 读取路径一节。
+2. **单条路径直备（去全状态 clone）**：`execute_client_request_with_id`
+   原来每次调用 `state().await` 深拷贝整个状态机（40 万 key 实测单次
+   ~90-130ms，且在互斥锁内串行）——预载数据后读吞吐塌到两位数即此所致。
+   新增 `prepare_request_live` / `prepare_transaction_live` /
+   `prepare_time_advance_live`（直备契约与合批路径一致：prepare 纯校验
+   + Operation 生成，唯一前置变更是单调逻辑时钟 max）。事务路径同样
+   去掉外层 clone（事务内部工作副本语义保留）。删除无调用方的
+   `execute_raft_request` 与 `prepare_request_at`。
+   附带发现并修复：leader 时间 worker 原每 5ms 全状态 clone 一次
+   （plans/13 中"未知 ~13ms/轮"的来源）。
+
+实测（3 节点，512c×p16，40 万 key，value 16B，全部零错误完整完成）：
+
+| 负载 | 改造前（同日口径） | 改造后 | cache-cat 参照（同表） |
+| --- | ---: | ---: | ---: |
+| 50/50 | 崩溃（30s 超时）/ 55 | **19,654** | 153,068 |
+| 95/5 | 30 | **82,551** | 197,387 |
+| 5/95 | 500 | **13,373** | 152,440 |
+| 纯写参考 | 16,814 | **18,578** | - |
+
+读路径单点：三节点 GET p1 = 32,178 ops/s（p50 66µs）；单节点 40 万 key
+深并发读 = 340,859 ops/s（p50 785µs）。改造前同点分别为 3-35 ops/s 与
+18 ops/s。
+
+### 第 2 层：写管线（未开始）
+
+剩余归因（plans/16 步骤 7）：纯写 18.6k vs cache-cat ~150k 的差距在
+- 提交轮率：committer 每轮固定 2×350µs 窗口 + openraft 逐条 apply
+  （版本 bump/内存计费/Frame 构造）；
+- 全量快照周期性压制（policy 4096 下状态 30 万 key 时每 4096 条全量
+  序列化）；"无快照"口径又因日志不清理而不可生存——增量快照
+  （快照与日志清理解耦）是根治项（plans/06 遗留，升级为必需）。
+- 客户端在途深度：cache-cat 的 PipelineMultiClient 无界在途；
+  我们的 benchmark 驱动有界（服务端 coalescer 窗口可再评估）。
+
+### 第 3 层：协议层（未开始）
+
+- `write_frame` 每响应帧新建 BytesMut；pipeline 应答应批量编码一次写出。
+- 读响应路径的 Frame 分配可评估 Bytes 复用。
+
+## 完成标准
+
+- 同机三方对测（plans/16 步骤 7 口径）混合负载进入 cache-cat 同量级
+  （≥50%）且全部零错误完整完成；
+- 180+ 项功能测试全绿；线性一致/分区/护栏测试不回退；
+- 架构文档记录租约读全部前提（时钟、续期、分区、Leader 变更）；
+- 每步独立提交，实测数字回写本文件。
