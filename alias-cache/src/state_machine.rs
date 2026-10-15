@@ -390,7 +390,10 @@ pub struct StateMachine {
     ///
     /// Every committed change to a key increments its counter; removing the
     /// key removes the counter, so an absent key reads as version zero.
-    versions: BTreeMap<Bytes, u64>,
+    /// A hash map (not a BTreeMap): apply touches this on every write, and
+    /// WATCH only ever looks versions up by key — no ordered iteration
+    /// exists, so O(1) access beats deterministic layout.
+    versions: std::collections::HashMap<Bytes, u64>,
     /// Best-effort live payload size in bytes, maintained incrementally.
     /// Skipped by serde and recomputed after recovery; it excludes BTreeMap
     /// and queue structural overhead.

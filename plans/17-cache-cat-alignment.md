@@ -186,6 +186,23 @@ raft RPC 监听两处 accept 后 set_nodelay(true)。
 | 5/95 | 13.5k | **13,563** | 152,440 | apply 逐条 ~40-100µs：1024 条/轮 × 每轮 40-100ms = 吞吐上限；BTreeMap×2（values+versions）+ 内存计费 + Frame 构造 |
 | SET p1 延迟 | 96.8ms | 30.4ms | - | 每跳 ~10ms（fsync 2.2ms + core 开销） |
 
+**迭代 2**：apply 逐条瘦身第一步——WATCH 版本表 `versions` 从
+BTreeMap 换 HashMap（apply 每条写少一次 40 万节点 BTreeMap 行走；WATCH
+只按 key 点查，无序遍历需求，快照相等性为语义比较不受布局影响）。
+
+迭代 2 结果（三节点 512c×p16，40 万 key，零错误）：
+
+| 档位 | 迭代 1 后 | 迭代 2 后 | cache-cat | 达成率 |
+| --- | ---: | ---: | ---: | ---: |
+| 95/5 | 96,886 | **191,488** | 197,387 | **97%，实质持平** |
+| 50/50 | 25,673 | **39,189** | 102,323 | 38% |
+| 5/95 | 13,563 | **29,599** | 152,440 | 19% |
+
+**迭代 3 方向**：写侧剩余归因（values BTreeMap 每次 SET 两次行走 →
+entry API 合一；client_results BTreeMap 插入+淘汰；Frame 分配）；
+50/50 与 5/95 的轮延迟在并发下仍是 ~40-100ms/轮量级，需对 openraft
+core 单任务串行与 coalescer 窗口做进一步归因。
+
 **迭代 2 方向（按预期收益）**：
 1. apply 逐条瘦身：client_results 去重表是否有界/换 HashMap；versions
    BTreeMap → HashMap（WATCH 才需要）；内存计费按批聚合。目标是把
