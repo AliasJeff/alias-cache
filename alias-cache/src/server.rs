@@ -150,6 +150,11 @@ impl Server {
                 result = listener.accept() => {
                     let (stream, peer) = result
                         .map_err(|source| Error::io("accept client connection", source))?;
+                    // Small RESP replies must not wait on Nagle + delayed-ACK
+                    // (worth tens of ms per exchange on interactive workloads).
+                    stream.set_nodelay(true).map_err(|source| {
+                        Error::io("enable TCP_NODELAY on client connection", source)
+                    })?;
                     let child_shutdown = shutdown.clone();
                     let limits = self.config.protocol_limits();
                     let child_raft = raft.clone();

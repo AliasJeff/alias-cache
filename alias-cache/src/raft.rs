@@ -620,6 +620,10 @@ pub struct FileLogStore {
     committed_path: PathBuf,
     inner: Arc<Mutex<FileLog>>,
     metrics: Arc<LogStoreMetrics>,
+    /// Debounce clock for the committed sidecar rewrite: the sidecar is a
+    /// recovery hint (the log itself is authoritative), so it must not sit on
+    /// the quorum-acknowledgment path.
+    last_sidecar_flush: Option<std::time::Instant>,
     #[cfg(test)]
     fail_next_sync_data: bool,
     #[cfg(test)]
@@ -679,6 +683,7 @@ impl FileLogStore {
             committed_path,
             inner: Arc::new(Mutex::new(inner)),
             metrics: Arc::new(LogStoreMetrics::default()),
+            last_sidecar_flush: None,
             #[cfg(test)]
             fail_next_sync_data: false,
             #[cfg(test)]
@@ -1208,12 +1213,20 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), io::Error> {
         // The commit pointer is recovery acceleration, not a correctness
         // record: openraft tolerates a stale value because a restarting node
-        // re-confirms a cluster commit before serving reads again. So the
-        // sidecar is published atomically without an fsync, keeping fsyncs
-        // out of the quorum-acknowledgment path.
-        save_committed_sidecar(&self.committed_path, &committed)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        // re-confirms a cluster commit before serving reads again, and the
+        // log replay covers whatever the stale sidecar missed. The rewrite is
+        // therefore debounced (at most one every 200ms) so the per-commit
+        // tmp-write+rename never sits on the quorum-acknowledgment path.
         self.inner.lock().await.committed = committed;
+        let due = self
+            .last_sidecar_flush
+            .map_or(true, |flushed| flushed.elapsed() >= Duration::from_millis(200));
+        if due {
+            let committed = self.inner.lock().await.committed;
+            save_committed_sidecar(&self.committed_path, &committed)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.last_sidecar_flush = Some(std::time::Instant::now());
+        }
         Ok(())
     }
 
@@ -3041,6 +3054,12 @@ pub async fn serve_raft_rpc_with_tls(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result.map_err(|error| Error::io("accept raft rpc connection", error))?;
+                // Raft RPC traffic is many small messages (votes, appends,
+                // heartbeats): Nagle + delayed-ACK would add tens of ms to
+                // every replication round.
+                stream.set_nodelay(true).map_err(|error| {
+                    Error::io("enable TCP_NODELAY on raft rpc connection", error)
+                })?;
                 let raft = raft.clone();
                 let shutdown = shutdown.clone();
                 let tls_acceptor = tls_acceptor.clone();

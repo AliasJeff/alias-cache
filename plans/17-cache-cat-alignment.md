@@ -163,6 +163,37 @@ policy 应随工作集规模上调（4096 默认是为 10 万级 key 设计的�
 | policy 1e9（真·无快照） | 24,455-48,235 | apply + WAL fsync |
 | policy 4096（增量快照，交付后） | 34,370-45,223 | 快照税消除 |
 
+### 迭代循环（2026-10-16 起）：每轮 = 双集群同机对测 → 归因 → 修复 → 复测
+
+**迭代 1**：对测发现 50/50 仅 4.8-12.2k（cache-cat 102,323）。归因链：
+单轮提交延迟 p1 = 96.8ms（三节点）/24.7ms（单节点），而裸 nc 单次 SET
+只花 10-70ms（含进程启动）→ 服务端往返本就正常，等待在 TCP 栈。
+**根因：服务端 accept 的连接从未设 TCP_NODELAY**——每个小 RESP 响应都
+被 Nagle + 延迟 ACK 拖 40-90ms，自项目伊始就在暗税所有小操作与全部
+benchmark 数字（redis-benchmark 口径同样受害）。修复：客户端监听与
+raft RPC 监听两处 accept 后 set_nodelay(true)。
+附带：WAL fsync 实测 2.2ms/次（max 15.8ms，INFO raft_log_sync_data_*
+指标，此前 0.05ms 探针是新鲜小文件的假象）；committed sidecar 每次
+提交 rewrite+rename ~1.3ms → 去抖为 200ms 一次（sidecar 是恢复提示
+而非正确性记录，日志回放兜底）。
+
+迭代 1 结果（三节点 512c×p16，40 万 key，零错误）：
+
+| 档位 | 迭代前 | 迭代 1 后 | cache-cat | 剩余差距归因 |
+| --- | ---: | ---: | ---: | --- |
+| 95/5 | 79-82k | **96,886** | 197,387 | 读 prepare 单核串行 + apply |
+| 50/50 | 12-25k | **25,673** | 102,323 | 写侧（同 5/95） |
+| 5/95 | 13.5k | **13,563** | 152,440 | apply 逐条 ~40-100µs：1024 条/轮 × 每轮 40-100ms = 吞吐上限；BTreeMap×2（values+versions）+ 内存计费 + Frame 构造 |
+| SET p1 延迟 | 96.8ms | 30.4ms | - | 每跳 ~10ms（fsync 2.2ms + core 开销） |
+
+**迭代 2 方向（按预期收益）**：
+1. apply 逐条瘦身：client_results 去重表是否有界/换 HashMap；versions
+   BTreeMap → HashMap（WATCH 才需要）；内存计费按批聚合。目标是把
+   1024 条/轮的 apply 从 40-100ms 压到 ~10ms（对齐 cache-cat 的
+   HashMap 直写模型）。
+2. 5/95 与 50/50 打平后，95/5 的读 prepare 串行（单核 oneshot）。
+3. SET p1 剩余 30ms：每跳 ~10ms 的 core/fsync 开销归因。
+
 ## 完成标准
 
 - 同机三方对测（plans/16 步骤 7 口径）混合负载进入 cache-cat 同量级
