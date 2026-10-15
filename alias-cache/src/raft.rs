@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::interval;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -1132,7 +1132,10 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 
 #[derive(Debug, Clone, Default)]
 pub struct MemStateMachine {
-    inner: Arc<Mutex<MemState>>,
+    // Reads dominate cache workloads: the state lock is a RwLock so lease
+    // reads prepare concurrently (same model as cache-cat's read lock) and
+    // only apply/snapshot transitions take the write guard.
+    inner: Arc<RwLock<MemState>>,
     snapshot_path: Option<PathBuf>,
 }
 
@@ -1166,7 +1169,7 @@ impl MemStateMachine {
         let path = path.into();
         let snapshot = load_persisted_raft_snapshot(&path)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(MemState {
+            inner: Arc::new(RwLock::new(MemState {
                 snapshot,
                 ..MemState::default()
             })),
@@ -1175,7 +1178,7 @@ impl MemStateMachine {
     }
 
     pub async fn state(&self) -> StateMachine {
-        self.inner.lock().await.state.clone()
+        self.inner.read().await.state.clone()
     }
 
     /// Validate and wrap a client batch against the live state machine
@@ -1188,7 +1191,7 @@ impl MemStateMachine {
         write_time: u64,
         max_batch_memory: u64,
     ) -> CacheResult<Vec<Operation>> {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         let max_memory = guard.state.max_memory_limit();
         guard.state.prepare_client_batch_with_limits(
             &request_ids,
@@ -1203,20 +1206,29 @@ impl MemStateMachine {
     /// cloning it — the same prepare-on-live-state contract as the batch
     /// path: prepare is pure validation and operation generation (responses
     /// for reads execute read-only; writes only wrap an Operation), so it can
-    /// run under the state lock directly. The only mutation before success is
-    /// the monotonic logical-time advance, which never enters the log.
+    /// run under the state lock directly. Writes advance the monotonic
+    /// logical clock under the write guard; reads take only the read guard
+    /// and scale concurrently.
     pub async fn prepare_request_live(
         &self,
         request: Request,
         write_time: u64,
         request_id: Option<ClientRequestId>,
     ) -> Result<(Option<Operation>, Frame), String> {
-        let mut guard = self.inner.lock().await;
-        guard.state.advance_logical_time(write_time);
-        guard
-            .state
-            .prepare_request_with_id(request, request_id)
-            .map_err(|error| error.to_string())
+        if is_replicated_write(request.command_name()) {
+            let mut guard = self.inner.write().await;
+            guard.state.advance_logical_time(write_time);
+            guard
+                .state
+                .prepare_request_with_id(request, request_id)
+                .map_err(|error| error.to_string())
+        } else {
+            let guard = self.inner.read().await;
+            guard
+                .state
+                .prepare_request_with_id(request, request_id)
+                .map_err(|error| error.to_string())
+        }
     }
 
     /// Prepare one transaction against the live state machine; the
@@ -1228,7 +1240,7 @@ impl MemStateMachine {
         request_id: ClientRequestId,
         watch_expectations: Vec<(Bytes, Option<u64>)>,
     ) -> Result<Operation, String> {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         guard
             .state
             .prepare_transaction_with_id(
@@ -1243,12 +1255,12 @@ impl MemStateMachine {
 
     /// Wrap a logical-time advance against the live state machine.
     pub async fn prepare_time_advance_live(&self, write_time: u64) -> Operation {
-        let guard = self.inner.lock().await;
+        let guard = self.inner.read().await;
         guard.state.prepare_time_advance(write_time)
     }
 
     pub async fn state_with_applied_index(&self) -> (StateMachine, Option<LogId>) {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.read().await;
         (inner.state.clone(), inner.last_applied)
     }
 }
@@ -1796,7 +1808,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
     type SnapshotBuilder = Self;
 
     async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), io::Error> {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.read().await;
         Ok((inner.last_applied, inner.membership.clone()))
     }
 
@@ -1808,7 +1820,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
     {
         while let Some((entry, responder)) = tokio_stream::StreamExt::try_next(&mut entries).await?
         {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.inner.write().await;
             let snapshot_operation = match &entry.payload {
                 EntryPayload::Normal(RaftRequest::Apply(operation)) => Some(operation.clone()),
                 EntryPayload::Blank | EntryPayload::Membership(_) => None,
@@ -1849,7 +1861,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
     }
 
     async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self::SnapshotBuilder> {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.read().await;
         (force || inner.snapshot_state == SnapshotState::End).then(|| self.clone())
     }
 
@@ -1876,7 +1888,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         if let Some(path) = &self.snapshot_path {
             persist_raft_snapshot(path, &stored_snapshot)?;
         }
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.write().await;
         inner.state = state;
         inner.last_applied = meta.last_log_id;
         inner.membership = meta.last_membership.clone();
@@ -1899,7 +1911,7 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
         >,
         io::Error,
     > {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.read().await;
         Ok(inner.snapshot.clone().map(|snapshot| openraft::Snapshot {
             meta: openraft::SnapshotMeta {
                 last_log_id: snapshot.last_log_id,
@@ -1925,7 +1937,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         io::Error,
     > {
         let base_state = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.inner.write().await;
             if inner.snapshot_state != SnapshotState::End {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -1938,7 +1950,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
 
         let result = self.build_snapshot_from_base(base_state).await;
         if result.is_err() {
-            self.inner.lock().await.snapshot_state = SnapshotState::End;
+            self.inner.write().await.snapshot_state = SnapshotState::End;
         }
         result
     }
@@ -1958,7 +1970,7 @@ impl MemStateMachine {
         io::Error,
     > {
         let (pending_operations, last_log_id, membership) = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.inner.write().await;
             inner.snapshot_state = SnapshotState::Tail;
             (
                 std::mem::take(&mut inner.snapshot_queue),
@@ -1975,7 +1987,7 @@ impl MemStateMachine {
         if let Some(path) = &self.snapshot_path {
             persist_raft_snapshot(path, &stored_snapshot)?;
         }
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.write().await;
         inner.snapshot = Some(stored_snapshot);
         inner.snapshot_state = SnapshotState::End;
         Ok(openraft::Snapshot {
@@ -3116,7 +3128,7 @@ pub async fn new_file_raft_with_metrics(
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     state_machine
         .inner
-        .lock()
+        .write()
         .await
         .state
         .set_max_memory(max_memory);
@@ -3261,7 +3273,7 @@ async fn new_tcp_raft_inner_with_metrics(
         .map_err(|_| openraft::error::Fatal::Panicked)?;
     state_machine
         .inner
-        .lock()
+        .write()
         .await
         .state
         .set_max_memory(max_memory);
@@ -4505,7 +4517,7 @@ mod tests {
         let snapshot_log_id =
             openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 1);
         {
-            let mut inner = state_machine.inner.lock().await;
+            let mut inner = state_machine.inner.write().await;
             inner.state.apply(operation);
             inner.last_applied = Some(snapshot_log_id);
         }
@@ -4519,7 +4531,7 @@ mod tests {
         let later_log_id =
             openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 2);
         {
-            let mut inner = state_machine.inner.lock().await;
+            let mut inner = state_machine.inner.write().await;
             inner.state.apply(Operation::Set {
                 key: Bytes::from_static(b"later-key"),
                 value: Bytes::from_static(b"later-value"),
@@ -4610,7 +4622,7 @@ mod tests {
         let snapshot_log_id =
             openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 7);
         {
-            let mut inner = state_machine.inner.lock().await;
+            let mut inner = state_machine.inner.write().await;
             inner.state.apply(Operation::Set {
                 key: Bytes::from_static(b"persisted"),
                 value: Bytes::from_static(b"value"),
@@ -4663,7 +4675,7 @@ mod tests {
         let mut state_machine =
             MemStateMachine::persistent(&path).expect("persistent state machine should open");
         {
-            let mut inner = state_machine.inner.lock().await;
+            let mut inner = state_machine.inner.write().await;
             inner.state.apply(Operation::Set {
                 key: Bytes::from_static(b"key"),
                 value: Bytes::from_static(b"value"),
@@ -4697,7 +4709,7 @@ mod tests {
         let snapshot_log_id =
             openraft::LogId::new(<TypeConfig as RaftTypeConfig>::LeaderId::new(1, 1), 3);
         {
-            let mut inner = state_machine.inner.lock().await;
+            let mut inner = state_machine.inner.write().await;
             inner.state.apply(Operation::Set {
                 key: Bytes::from_static(b"stable"),
                 value: Bytes::from_static(b"value"),
@@ -5055,7 +5067,7 @@ mod tests {
     async fn raft_snapshot_replays_operations_collected_during_start() {
         let state_machine = MemStateMachine::default();
         let base_state = {
-            let mut inner = state_machine.inner.lock().await;
+            let mut inner = state_machine.inner.write().await;
             inner.state.advance_logical_time(1_000);
             inner.state.apply(Operation::Set {
                 key: Bytes::from_static(b"base"),

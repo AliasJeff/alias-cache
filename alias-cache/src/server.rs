@@ -349,6 +349,10 @@ async fn handle_raft_connection(
                     && parsed.iter().all(|result| {
                         matches!(result, Ok(request) if is_pipeline_safe(request))
                 });
+                // Replies encode into one per-segment buffer and flush with a
+                // single write; each frame encodes with the RESP version
+                // current at its production point.
+                let mut output = BytesMut::new();
                 if parallel {
                     // Consecutive writes share one OpenRaft client_write_many
                     // call. Reads and response-heavy writes remain barriers so
@@ -374,20 +378,22 @@ async fn handle_raft_connection(
                             )
                             .await
                             {
-                                write_frame(&mut stream, response, resp_version).await?;
+                                buffer_response(&mut stream, &mut output, &response, resp_version)
+                                    .await?;
                             }
                         }
                         if is_replicated_write(command) {
                             let response =
                                 execute_client_command_with_tls(&raft, request, tls_connector.clone())
                                     .await;
-                            write_frame(&mut stream, response, resp_version).await?;
+                            buffer_response(&mut stream, &mut output, &response, resp_version)
+                                .await?;
                             continue;
                         }
                         let response =
                             execute_client_command_with_tls(&raft, request, tls_connector.clone())
                                 .await;
-                        write_frame(&mut stream, response, resp_version).await?;
+                        buffer_response(&mut stream, &mut output, &response, resp_version).await?;
                     }
                     if !write_batch.is_empty() {
                         for response in execute_client_batch_with_tls(
@@ -398,9 +404,11 @@ async fn handle_raft_connection(
                         )
                         .await
                         {
-                            write_frame(&mut stream, response, resp_version).await?;
+                            buffer_response(&mut stream, &mut output, &response, resp_version)
+                                .await?;
                         }
                     }
+                    flush_buffered(&mut stream, &mut output).await?;
                     continue;
                 }
                 for parsed in parsed {
@@ -422,8 +430,9 @@ async fn handle_raft_connection(
                         }
                         Err(error) => Frame::error(format!("ERR {error}")),
                     };
-                    write_frame(&mut stream, response, resp_version).await?;
+                    buffer_response(&mut stream, &mut output, &response, resp_version).await?;
                 }
+                flush_buffered(&mut stream, &mut output).await?;
             }
             result = wait_for_shutdown(shutdown.clone()) => {
                 result?;
@@ -901,6 +910,45 @@ async fn execute_client_batch_chunk_with_tls(
 
 fn batch_error_frames(count: usize, message: String) -> Vec<Frame> {
     (0..count).map(|_| Frame::error(message.clone())).collect()
+}
+
+/// Per-segment soft cap on buffered reply bytes: a segment of huge replies
+/// flushes in chunks instead of buffering without bound.
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Encode one reply into the segment buffer, flushing to the stream once the
+/// buffer crosses [`MAX_BUFFERED_RESPONSE_BYTES`].
+async fn buffer_response(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    output: &mut BytesMut,
+    frame: &Frame,
+    resp_version: RespVersion,
+) -> Result<()> {
+    frame.encode_for(resp_version, output)?;
+    if output.len() >= MAX_BUFFERED_RESPONSE_BYTES {
+        stream
+            .write_all(output)
+            .await
+            .map_err(|source| Error::io("write client response", source))?;
+        output.clear();
+    }
+    Ok(())
+}
+
+/// Write out whatever the segment buffer still holds.
+async fn flush_buffered(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    output: &mut BytesMut,
+) -> Result<()> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    stream
+        .write_all(output)
+        .await
+        .map_err(|source| Error::io("write client response", source))?;
+    output.clear();
+    Ok(())
 }
 
 async fn write_frame(
