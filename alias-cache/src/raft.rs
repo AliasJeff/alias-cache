@@ -1465,6 +1465,11 @@ struct MemState {
     state: StateMachine,
     last_applied: Option<LogId>,
     membership: StoredMembership,
+    /// Wall clock of the last full (compacting) rebuild. Full rebuilds hold
+    /// the state lock for a full clone plus serialize, so at high write rates
+    /// they are rate-limited: deltas temporarily overshoot the compaction
+    /// threshold instead of stalling apply every couple of seconds.
+    last_full_build: Option<std::time::Instant>,
     /// Durable snapshot coverage: the base file plus the delta records
     /// applied on top. Data lives on disk; metadata lives here.
     snapshot: Option<SnapshotCoverage>,
@@ -1513,6 +1518,10 @@ const RAFT_DELTA_CHECKSUM_LEN: usize = 8;
 /// Rebuild the base once accumulated deltas reach either bound; both keep the
 /// delta replay (and the follower-catch-up materialization) small.
 const RAFT_DELTA_COMPACTION_BYTES: u64 = 16 * 1024 * 1024;
+/// Minimum spacing between full rebuilds: their clone-plus-serialize stalls
+/// the apply path, so under sustained writes deltas overshoot the byte
+/// threshold for a while rather than compacting every couple of seconds.
+const RAFT_COMPACTION_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const RAFT_DELTA_COMPACTION_COUNT: u64 = 512;
 
 impl MemStateMachine {
@@ -2346,9 +2355,16 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         // delta append; a full rebuild (base serialize) only happens for the
         // first snapshot, at compaction, or for pathless in-memory instances,
         // so the steady-state write path never serializes state.
-        let (coverage, has_path) = {
+        let (coverage, has_path, compaction_allowed) = {
             let inner = self.inner.read().await;
-            (inner.snapshot.clone(), self.snapshot_path.is_some())
+            let allowed = inner
+                .last_full_build
+                .is_none_or(|built| built.elapsed() >= RAFT_COMPACTION_MIN_INTERVAL);
+            (
+                inner.snapshot.clone(),
+                self.snapshot_path.is_some(),
+                allowed,
+            )
         };
         let compaction_due = coverage.as_ref().is_some_and(|coverage| {
             coverage.delta_bytes >= RAFT_DELTA_COMPACTION_BYTES
@@ -2356,6 +2372,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStateMachine {
         });
         match coverage {
             Some(_) if has_path && !compaction_due => self.build_incremental_snapshot().await,
+            _ if !compaction_allowed && has_path => self.build_incremental_snapshot().await,
             _ => self.build_full_snapshot().await,
         }
     }
@@ -2479,6 +2496,7 @@ impl MemStateMachine {
             delta_bytes: 0,
             delta_count: 0,
         });
+        inner.last_full_build = Some(std::time::Instant::now());
         inner.snapshot_state = SnapshotState::End;
         if let Some(path) = &self.snapshot_path {
             persist_raft_snapshot(
@@ -8873,6 +8891,25 @@ mod tests {
         .expect("leader election should succeed");
 
         for index in 0..5_150 {
+            node.client_write(RaftRequest::Apply(Operation::Set {
+                key: Bytes::from(format!("compact-key-{index}")),
+                value: Bytes::from(format!("compact-value-{index}")),
+            }))
+            .await
+            .expect("write should succeed");
+        }
+        // The compaction rate limiter defers full rebuilds for 30s after the
+        // previous one; age the marker past the window, let a few more builds
+        // run, and the next compaction must retire the delta records.
+        node.with_state_machine(|state_machine| {
+            Box::pin(async move {
+                state_machine.inner.write().await.last_full_build =
+                    Some(std::time::Instant::now() - Duration::from_secs(31));
+            })
+        })
+        .await
+        .expect("rate-limit marker should be writable");
+        for index in 5_150..5_200 {
             node.client_write(RaftRequest::Apply(Operation::Set {
                 key: Bytes::from(format!("compact-key-{index}")),
                 value: Bytes::from(format!("compact-value-{index}")),
