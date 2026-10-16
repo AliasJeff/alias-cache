@@ -240,6 +240,17 @@ openraft 默认 `max_payload_entries: 300` 把每个在途 AppendEntries 限到
 3. 偶发测试超时（负载下 tcp 集群测试 2 例，重跑即绿）——测试隔离性
    待改善。
 
+**迭代 5**（2026-10-16）：follower 侧采样（5/95，~49k）显示 follower
+总负载约为 leader 2 倍：apply 738 + 快照构建 474 + WAL IO 为三大项
+（follower 也要逐条 apply 并按 policy 重建快照 blob）。对照实验：
+policy 65536 → 262144 三档全部略低（噪声带内但方向一致）→ **回退
+65536**，负结果留档；policy 在该区间不敏感，follower 的 apply + WAL
+fsync + 快照机器的**叠加串行**才是当前写侧边界（apply 本身 4.9µs/条
+有余量）。**迭代 6 方向（结构性）**：values BTreeMap → HashMap——
+SCAN/KEYS 在 Redis 语义下本就无序保证（可按需排序），点操作
+O(log n)→O(1) 对齐 cache-cat 的 Mocha HashMap 模型；SM 级重构（所有
+命令、快照 serde、TTL 扫描、内存计费均触及），需独立窗口实施。
+
 **迭代 2 方向（按预期收益）**：
 1. apply 逐条瘦身：client_results 去重表是否有界/换 HashMap；versions
    BTreeMap → HashMap（WATCH 才需要）；内存计费按批聚合。目标是把
