@@ -115,8 +115,10 @@ impl Default for Config {
             max_memory_bytes: 0,
             max_connections: 0,
             // With incremental snapshots a build is one small delta append,
-            // but it still assembles the snapshot blob for openraft; the
-            // default cadence therefore favors fewer, larger deltas.
+            // but each build still assembles the whole snapshot blob for
+            // openraft (base + deltas), so the default cadence favors fewer,
+            // larger deltas — followers otherwise rebuild megabytes several
+            // times a second under load.
             snapshot_policy_logs: 65_536,
         }
     }
