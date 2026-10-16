@@ -385,7 +385,11 @@ pub enum ApplyResult {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StateMachine {
-    values: BTreeMap<Bytes, Entry>,
+    /// A hash map (not a BTreeMap): apply, reads, and writes are all
+    /// point operations, and the only whole-keyset iteration (SCAN) is
+    /// officially unordered in Redis — its positional cursor makes no
+    /// ordering promise. O(1) point access matches cache-cat's model.
+    values: std::collections::HashMap<Bytes, Entry>,
     /// Per-key modification counters backing WATCH optimistic locking.
     ///
     /// Every committed change to a key increments its counter; removing the
@@ -2151,7 +2155,7 @@ impl StateMachine {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> BTreeMap<Bytes, Value> {
+    pub fn snapshot(&self) -> std::collections::HashMap<Bytes, Value> {
         self.values
             .iter()
             .filter(|(_, entry)| !self.is_expired(entry))
@@ -5587,38 +5591,51 @@ mod tests {
 
     #[test]
     fn scan_family_iterates_deterministically_with_cursors() {
+        // Redis SCAN promises no key ordering (the cursor is opaque); the
+        // contract under test is the cursor mechanics: COUNT bounds the
+        // batch, iteration ends at cursor zero, every live key is returned
+        // exactly once, and expired keys never appear.
         let mut state = StateMachine::default();
         for name in ["alpha", "beta", "gamma", "delta"] {
             state
                 .execute_request(command(&[b"SET", name.as_bytes(), b"v"]))
                 .unwrap();
         }
-        // Byte order: alpha, beta, delta, gamma.
-        let reply = state
-            .execute_request(command(&[b"SCAN", b"0", b"COUNT", b"2"]))
-            .unwrap()
-            .1;
-        let (first_cursor, first_batch) = scan_parts(reply);
-        assert_eq!(first_cursor, 2);
+        let mut returned: Vec<Vec<u8>> = Vec::new();
+        let mut cursor: usize = 0;
+        loop {
+            let reply = state
+                .execute_request(command(&[
+                    b"SCAN",
+                    cursor.to_string().as_bytes(),
+                    b"COUNT",
+                    b"2",
+                ]))
+                .unwrap()
+                .1;
+            let (next_cursor, batch) = scan_parts(reply);
+            assert!(batch.len() <= 2, "COUNT bounds the batch size");
+            for frame in batch {
+                let Frame::BulkString(key) = frame else {
+                    panic!("scan batch must contain bulk strings");
+                };
+                returned.push(key.to_vec());
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        returned.sort();
         assert_eq!(
-            first_batch,
-            vec![Frame::bulk_string("alpha"), Frame::bulk_string("beta")]
-        );
-
-        let reply = state
-            .execute_request(command(&[
-                b"SCAN",
-                first_cursor.to_string().as_bytes(),
-                b"COUNT",
-                b"10",
-            ]))
-            .unwrap()
-            .1;
-        let (second_cursor, second_batch) = scan_parts(reply);
-        assert_eq!(second_cursor, 0, "iteration ends with cursor zero");
-        assert_eq!(
-            second_batch,
-            vec![Frame::bulk_string("delta"), Frame::bulk_string("gamma")]
+            returned,
+            vec![
+                b"alpha".to_vec(),
+                b"beta".to_vec(),
+                b"delta".to_vec(),
+                b"gamma".to_vec()
+            ],
+            "every live key is returned exactly once"
         );
 
         // Expired keys never appear.

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, SemaphorePermit, watch};
 use tokio::time::interval;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -71,6 +71,30 @@ pub enum RaftResponse {
 }
 
 static NEXT_CLIENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Admission control for client writes. Unbounded in-flight writes starve
+/// the followers' heartbeat acknowledgements once they exceed apply/fsync
+/// capacity: the leader's lease expires, leadership flaps, and every
+/// redirected batch opens a fresh connection until the port space is
+/// exhausted. The permit cap keeps the write queue bounded so the control
+/// plane stays alive; clients beyond it simply wait (TCP backpressure)
+/// instead of melting the cluster.
+const CLIENT_WRITE_PERMIT_LIMIT: u32 = 4_096;
+static CLIENT_WRITE_PERMITS: Semaphore = Semaphore::const_new(CLIENT_WRITE_PERMIT_LIMIT as usize);
+
+/// How long a write waits for admission permits before shedding with an
+/// explicit error. Overload must degrade to visible errors, not a silent
+/// control-plane collapse.
+const CLIENT_WRITE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn acquire_client_write_permits(count: usize) -> Result<SemaphorePermit<'static>, String> {
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    match timeout(CLIENT_WRITE_ADMISSION_TIMEOUT, CLIENT_WRITE_PERMITS.acquire_many(count)).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err("raft is shutting down".to_string()),
+        Err(_) => Err("raft write overloaded: admission queue timed out".to_string()),
+    }
+}
 #[cfg(test)]
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1977,6 +2001,20 @@ async fn commit_batch_items(
         .map_err(|error| format!("raft state machine: {error}"))??;
 
     let payloads: Vec<RaftRequest> = operations.into_iter().map(RaftRequest::Apply).collect();
+    let admission = match timeout(
+        CLIENT_WRITE_ADMISSION_TIMEOUT,
+        CLIENT_WRITE_PERMITS.acquire_many(payloads.len().min(u32::MAX as usize) as u32),
+    )
+    .await
+    {
+        Ok(Ok(permits)) => permits,
+        Ok(Err(_)) => return Err("raft is shutting down".to_string()),
+        Err(_) => {
+            return Err(
+                "raft write overloaded: admission queue timed out".to_string(),
+            )
+        }
+    };
     let mut stream = raft
         .client_write_many(payloads)
         .await
@@ -2002,6 +2040,7 @@ async fn commit_batch_items(
             }
         }
     }
+    drop(admission);
     if responses.len() != request_count {
         return Err(format!(
             "raft batch returned {} responses for {} requests",

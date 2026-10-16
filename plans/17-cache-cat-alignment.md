@@ -240,6 +240,18 @@ openraft 默认 `max_payload_entries: 300` 把每个在途 AppendEntries 限到
 3. 偶发测试超时（负载下 tcp 集群测试 2 例，重跑即绿）——测试隔离性
    待改善。
 
+**稳定性悬崖（2026-10-16 迭代 6 期间确认，最高优先级遗留）**：
+准入控制（CLIENT_WRITE_PERMITS=4096，日志追加前排队）已实现但未消除
+leadership 抖动。实测边界：**≤1024 并发在途写稳定（43.8k ops/s 零错误，
+term 不变）；2048+ 在途即触发错误风暴（os error 49 = 重定向新建连接
+端口耗尽），且 term 持续攀升（全天 202→411）——过载引发的 leadership
+抖动在老化数据集上跨重启持续，需低负载期才能重新稳定**。机制链：
+过载 → follower apply/fsync 饱和 → 心跳确认延迟 → leader 租约到期
+下台 → 选举风暴 → 每次重定向新建连接 → 端口耗尽。**迭代 7（最高
+优先级）**：openraft leadership 在 follower 饱和下的稳定性深查
+（心跳优先级、step-down 条件、准入阈值与 follower 容量的匹配），
+并结合存储格式文档补"过载行为"章节。
+
 **迭代 5**（2026-10-16）：follower 侧采样（5/95，~49k）显示 follower
 总负载约为 leader 2 倍：apply 738 + 快照构建 474 + WAL IO 为三大项
 （follower 也要逐条 apply 并按 policy 重建快照 blob）。对照实验：
