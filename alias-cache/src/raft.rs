@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, Semaphore, SemaphorePermit, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 use tokio::time::interval;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -87,14 +87,6 @@ static CLIENT_WRITE_PERMITS: Semaphore = Semaphore::const_new(CLIENT_WRITE_PERMI
 /// control-plane collapse.
 const CLIENT_WRITE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 
-async fn acquire_client_write_permits(count: usize) -> Result<SemaphorePermit<'static>, String> {
-    let count = u32::try_from(count).unwrap_or(u32::MAX);
-    match timeout(CLIENT_WRITE_ADMISSION_TIMEOUT, CLIENT_WRITE_PERMITS.acquire_many(count)).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err("raft is shutting down".to_string()),
-        Err(_) => Err("raft write overloaded: admission queue timed out".to_string()),
-    }
-}
 #[cfg(test)]
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -329,9 +321,8 @@ fn encode_delta_record(segment: &DeltaSegment) -> io::Result<Vec<u8>> {
     let payload = bincode::serialize(segment).map_err(io::Error::other)?;
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "delta length overflows u64"))?;
-    let mut record = Vec::with_capacity(
-        RAFT_DELTA_HEADER_LEN + payload.len() + RAFT_DELTA_CHECKSUM_LEN,
-    );
+    let mut record =
+        Vec::with_capacity(RAFT_DELTA_HEADER_LEN + payload.len() + RAFT_DELTA_CHECKSUM_LEN);
     record.extend_from_slice(&RAFT_DELTA_FILE_MAGIC);
     record.extend_from_slice(&RAFT_DELTA_FILE_VERSION.to_le_bytes());
     record.extend_from_slice(&payload_len.to_le_bytes());
@@ -394,15 +385,16 @@ fn load_delta_records(path: &Path) -> io::Result<Vec<(DeltaSegment, u64)>> {
         let stored_checksum = u64::from_le_bytes(
             bytes[checksum_offset..checksum_offset + RAFT_DELTA_CHECKSUM_LEN]
                 .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delta checksum"))?,
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid delta checksum")
+                })?,
         );
         if snapshot_checksum(&bytes[offset..checksum_offset]) != stored_checksum {
             break;
         }
-        let segment: DeltaSegment = bincode::deserialize(
-            &bytes[offset + RAFT_DELTA_HEADER_LEN..checksum_offset],
-        )
-        .map_err(io::Error::other)?;
+        let segment: DeltaSegment =
+            bincode::deserialize(&bytes[offset + RAFT_DELTA_HEADER_LEN..checksum_offset])
+                .map_err(io::Error::other)?;
         if segment.version != RAFT_DELTA_FILE_VERSION {
             break;
         }
@@ -426,9 +418,8 @@ fn build_snapshot_envelope(snapshot_path: &Path) -> io::Result<Vec<u8>> {
     // The envelope embeds the base file's raw payload bytes (a StoredSnapshot
     // serialization): pure file-to-blob copies, no deserialize on the build
     // path. The decoder unwraps the wrapper at install/read time.
-    let base_payload = read_persisted_snapshot_payload(snapshot_path)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "raft snapshot base is missing")
-    })?;
+    let base_payload = read_persisted_snapshot_payload(snapshot_path)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "raft snapshot base is missing"))?;
     let base_len = u64::try_from(base_payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "base length overflows u64"))?;
     let delta_bytes = read_raw_delta_records(&delta_file_path(snapshot_path))?;
@@ -475,11 +466,10 @@ fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
         ));
     }
     let checksum_offset = data.len() - RAFT_SNAPSHOT_ENVELOPE_CHECKSUM_LEN;
-    let expected_checksum = u64::from_le_bytes(
-        data[checksum_offset..]
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid envelope checksum"))?,
-    );
+    let expected_checksum =
+        u64::from_le_bytes(data[checksum_offset..].try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid envelope checksum")
+        })?);
     if snapshot_checksum(&data[..checksum_offset]) != expected_checksum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -489,14 +479,21 @@ fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
     let base_len = u64::from_le_bytes(
         data[6..RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN]
             .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid envelope base length"))?,
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid envelope base length")
+            })?,
     );
     let base_len = usize::try_from(base_len).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "envelope base length overflows usize")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "envelope base length overflows usize",
+        )
     })?;
     let base_end = RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN
         .checked_add(base_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "envelope base length overflows"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "envelope base length overflows")
+        })?;
     if base_end > checksum_offset {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -555,7 +552,9 @@ fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
         let stored_checksum = u64::from_le_bytes(
             data[record_checksum_offset..record_checksum_offset + RAFT_DELTA_CHECKSUM_LEN]
                 .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delta checksum"))?,
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid delta checksum")
+                })?,
         );
         if snapshot_checksum(&data[offset..record_checksum_offset]) != stored_checksum {
             return Err(io::Error::new(
@@ -563,10 +562,9 @@ fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
                 "raft snapshot envelope delta checksum mismatch",
             ));
         }
-        let segment: DeltaSegment = bincode::deserialize(
-            &data[offset + RAFT_DELTA_HEADER_LEN..record_checksum_offset],
-        )
-        .map_err(io::Error::other)?;
+        let segment: DeltaSegment =
+            bincode::deserialize(&data[offset + RAFT_DELTA_HEADER_LEN..record_checksum_offset])
+                .map_err(io::Error::other)?;
         if segment.version != RAFT_DELTA_FILE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1614,12 +1612,7 @@ impl MemStateMachine {
         let guard = self.inner.read().await;
         guard
             .state
-            .prepare_transaction_with_id(
-                requests,
-                write_time,
-                Some(request_id),
-                watch_expectations,
-            )
+            .prepare_transaction_with_id(requests, write_time, Some(request_id), watch_expectations)
             .map(|(operation, _)| operation)
             .map_err(|error| error.to_string())
     }
@@ -1668,7 +1661,9 @@ pub async fn execute_client_request_with_id(
     // acknowledgements, so a partitioned leader stops answering reads within
     // that window.
     if !is_replicated_write(request.command_name())
-        && let Err(error) = raft.ensure_linearizable(openraft::ReadPolicy::LeaseRead).await
+        && let Err(error) = raft
+            .ensure_linearizable(openraft::ReadPolicy::LeaseRead)
+            .await
     {
         if let Some(forward) = error.forward_to_leader() {
             if let Some(node) = &forward.leader_node {
@@ -2001,11 +1996,7 @@ async fn commit_batch_items(
     {
         Ok(Ok(permits)) => permits,
         Ok(Err(_)) => return Err("raft is shutting down".to_string()),
-        Err(_) => {
-            return Err(
-                "raft write overloaded: admission queue timed out".to_string(),
-            )
-        }
+        Err(_) => return Err("raft write overloaded: admission queue timed out".to_string()),
     };
     let mut stream = raft
         .client_write_many(payloads)
@@ -2061,12 +2052,7 @@ pub async fn execute_transaction_request_with_id(
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
                 state_machine
-                    .prepare_transaction_live(
-                        &requests,
-                        write_time,
-                        request_id,
-                        watch_expectations,
-                    )
+                    .prepare_transaction_live(&requests, write_time, request_id, watch_expectations)
                     .await
             })
         })
@@ -5711,20 +5697,18 @@ mod tests {
             committer.execute(&raft, build_batch(b"coalesce-key-b", 100, 2_000)),
         );
 
-        let assert_increments = |outcome: Result<ClientBatchOutcome, String>, step: u128| {
-            match outcome.expect("batch should commit") {
+        let assert_increments =
+            |outcome: Result<ClientBatchOutcome, String>, step: u128| match outcome
+                .expect("batch should commit")
+            {
                 ClientBatchOutcome::Applied(frames) => {
                     assert_eq!(frames.len(), 74);
                     for (index, frame) in frames.iter().enumerate() {
-                        assert_eq!(
-                            frame,
-                            &Frame::Integer(((index as u128 + 1) * step) as i64)
-                        );
+                        assert_eq!(frame, &Frame::Integer(((index as u128 + 1) * step) as i64));
                     }
                 }
                 other => panic!("batch should apply locally, got {other:?}"),
-            }
-        };
+            };
         assert_increments(outcome_a, 1);
         assert_increments(outcome_b, 100);
 
@@ -8901,9 +8885,7 @@ mod tests {
         // 514 builds a run without compaction would have accumulated).
         let coverage = node
             .with_state_machine(|state_machine| {
-                Box::pin(async move {
-                    state_machine.inner.read().await.snapshot.clone()
-                })
+                Box::pin(async move { state_machine.inner.read().await.snapshot.clone() })
             })
             .await
             .expect("coverage should be readable")
@@ -8951,8 +8933,9 @@ mod tests {
         };
         let mut bytes = Vec::new();
         for last_index in [10_u64, 20, 30] {
-            bytes.extend_from_slice(&encode_delta_record(&segment(last_index))
-                .expect("delta record should encode"));
+            bytes.extend_from_slice(
+                &encode_delta_record(&segment(last_index)).expect("delta record should encode"),
+            );
         }
         // A torn append: the last record is cut short mid-payload.
         bytes.truncate(bytes.len() - 8);
