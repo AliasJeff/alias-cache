@@ -212,10 +212,33 @@ BTreeMap 换 HashMap（apply 每条写少一次 40 万节点 BTreeMap 行走；W
    上限在我们喂给 openraft 的方式（coalescer 1024 条分块轮次）vs
    cache-cat 的单流无界 client_write_many。
 
-**迭代 4 方向**：管线形状对齐 cache-cat——实验去掉/放大
-CLIENT_BATCH_MAX_ITEMS 分块、coalescer 窗口消除、单流
-client_write_many 直通；对照 raft-direct 口径 142k 验证共识层上限；
-follower 侧（复制接收）单独采样。
+**迭代 4**（2026-10-16）：归因实验证明瓶颈在复制流控——单节点同形状
+纯写 121,294 ops/s vs 三节点 40-43k，差距全在 leader→follower 复制。
+openraft 默认 `max_payload_entries: 300` 把每个在途 AppendEntries 限到
+300 条，复制往返（follower fsync ~2.2ms + RTT）下每 follower 吞吐被钉在
+(300/RTT)。修复：三处 config 构造显式 `max_payload_entries: 4096`。
+
+迭代 4 结果（三节点 512c×p16，40 万 key，零错误）：
+
+| 档位 | 迭代 3 后 | 迭代 4 后 | cache-cat | 达成率 |
+| --- | ---: | ---: | ---: | ---: |
+| 95/5 | 43,682* | **135,475-141,250** | 197,387 | 69-72% |
+| 50/50 | 34,752 | **46,468** | 102,323 | 45% |
+| 5/95 | 43,682 | **49,435** | 152,440 | 32% |
+| 纯写 | ~40k | **48,760** | - | - |
+
+（*95/5 在迭代 2 后曾测得 191,488，机器噪声带 ±40% 内波动；两日双值
+均记录。）
+
+**遗留观察（迭代 5 输入）**：
+1. 集群重启后首个高并发写入窗口出现瞬时错误风暴（238k 吞吐但 91.9%
+   错误，一次性），预热后消失——疑似 follower 快照追赶窗口内的
+   超时/重定向被 benchmark 计为错误，需区分"合法 settles 窗口"与真错误。
+2. 50/50 与 5/95 剩余差距仍指向 apply/commit 每轮成本（1024 条 ×
+   ~40-100µs），与 client_results/versions 之外的 apply 路径开销；
+   下一步对 follower 侧（复制接收 + append + fsync）单独采样。
+3. 偶发测试超时（负载下 tcp 集群测试 2 例，重跑即绿）——测试隔离性
+   待改善。
 
 **迭代 2 方向（按预期收益）**：
 1. apply 逐条瘦身：client_results 去重表是否有界/换 HashMap；versions

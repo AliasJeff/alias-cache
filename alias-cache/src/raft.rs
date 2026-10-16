@@ -3611,6 +3611,11 @@ pub async fn new_file_raft_with_metrics(
         election_timeout_min: 150,
         election_timeout_max: 300,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_policy.max(1)),
+        // Replication flow control: the default caps one in-flight
+        // AppendEntries at 300 entries, which binds a follower's acknowledge
+        // rate to (300 / replication RTT). Large commit batches need large
+        // payloads or the follower fsync latency dominates throughput.
+        max_payload_entries: 4096,
         enable_tick: true,
         ..Default::default()
     }
@@ -3756,6 +3761,8 @@ async fn new_tcp_raft_inner_with_metrics(
         election_timeout_min: 150,
         election_timeout_max: 300,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_policy.max(1)),
+        // Replication flow control: see new_file_raft_with_metrics.
+        max_payload_entries: 4096,
         enable_tick: bootstrap,
         ..Default::default()
     }
