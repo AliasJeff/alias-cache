@@ -1514,7 +1514,7 @@ const RAFT_DELTA_HEADER_LEN: usize = 4 + 2 + 8;
 const RAFT_DELTA_CHECKSUM_LEN: usize = 8;
 /// Rebuild the base once accumulated deltas reach either bound; both keep the
 /// delta replay (and the follower-catch-up materialization) small.
-const RAFT_DELTA_COMPACTION_BYTES: u64 = 64 * 1024 * 1024;
+const RAFT_DELTA_COMPACTION_BYTES: u64 = 16 * 1024 * 1024;
 const RAFT_DELTA_COMPACTION_COUNT: u64 = 512;
 
 impl MemStateMachine {
