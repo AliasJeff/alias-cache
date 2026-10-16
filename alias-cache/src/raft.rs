@@ -399,13 +399,12 @@ const RAFT_SNAPSHOT_ENVELOPE_CHECKSUM_LEN: usize = 8;
 /// needed (openraft build bookkeeping, follower catch-up, startup install), so
 /// the steady-state snapshot cost stays at one small append plus a copy.
 fn build_snapshot_envelope(snapshot_path: &Path) -> io::Result<Vec<u8>> {
-    // The base file stores a StoredSnapshot wrapper; the envelope embeds the
-    // inner RaftSnapshotPayload bytes so a decode never sees the wrapper.
-    let base_payload = load_persisted_raft_snapshot(snapshot_path)?
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "raft snapshot base is missing")
-        })?
-        .data;
+    // The envelope embeds the base file's raw payload bytes (a StoredSnapshot
+    // serialization): pure file-to-blob copies, no deserialize on the build
+    // path. The decoder unwraps the wrapper at install/read time.
+    let base_payload = read_persisted_snapshot_payload(snapshot_path)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "raft snapshot base is missing")
+    })?;
     let base_len = u64::try_from(base_payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "base length overflows u64"))?;
     let delta_bytes = read_raw_delta_records(&delta_file_path(snapshot_path))?;
@@ -480,7 +479,12 @@ fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
             "raft snapshot envelope base exceeds blob",
         ));
     }
-    let (mut state, pending_operations) = decode_raft_snapshot(&data[RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN..base_end])?;
+    // The embedded base payload is a StoredSnapshot serialization; unwrap it
+    // (a straight copy of the inner data) and decode the inner payload.
+    let stored: StoredSnapshot =
+        bincode::deserialize(&data[RAFT_SNAPSHOT_ENVELOPE_HEADER_LEN..base_end])
+            .map_err(io::Error::other)?;
+    let (mut state, pending_operations) = decode_raft_snapshot(&stored.data)?;
     for operation in &pending_operations {
         state.advance_logical_time(operation.write_time());
         let _ = state.apply(operation.clone());
@@ -1220,7 +1224,7 @@ impl RaftLogStorage<TypeConfig> for FileLogStore {
         self.inner.lock().await.committed = committed;
         let due = self
             .last_sidecar_flush
-            .map_or(true, |flushed| flushed.elapsed() >= Duration::from_millis(200));
+            .is_none_or(|flushed| flushed.elapsed() >= Duration::from_millis(200));
         if due {
             let committed = self.inner.lock().await.committed;
             save_committed_sidecar(&self.committed_path, &committed)

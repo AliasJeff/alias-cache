@@ -198,10 +198,24 @@ BTreeMap 换 HashMap（apply 每条写少一次 40 万节点 BTreeMap 行走；W
 | 50/50 | 25,673 | **39,189** | 102,323 | 38% |
 | 5/95 | 13,563 | **29,599** | 152,440 | 19% |
 
-**迭代 3 方向**：写侧剩余归因（values BTreeMap 每次 SET 两次行走 →
-entry API 合一；client_results BTreeMap 插入+淘汰；Frame 分配）；
-50/50 与 5/95 的轮延迟在并发下仍是 ~40-100ms/轮量级，需对 openraft
-core 单任务串行与 coalescer 窗口做进一步归因。
+**迭代 3**（2026-10-16）：
+
+1. apply 微基准落地（`apply_throughput_microbenchmark_400k_hot_state`）：
+   40 万 key 热态逐条 apply = **4.9µs/条（202,633 ops/s）**——状态机
+   不是瓶颈，apply 瘦身假设证伪（数据驱动否决）。
+2. 快照开销再压：envelope 直接嵌入 base 文件原始载荷字节（免每次构建
+   的全量反序列化提取）；默认 snapshot policy 4096 → 65536（delta 便宜
+   后构建频率才是成本）。采样确认 build_snapshot 从 ~36% 降到 ~1%。
+3. 5/95 = **43,682**（+48%）；深管线（512c×p128，65k 在途）无进一步
+   提升 → **存在 ~40k/s 的结构性串行点，与在途深度无关**。
+4. 精确符号采样：replication + append_entries 机制占最大 CPU 份额——
+   上限在我们喂给 openraft 的方式（coalescer 1024 条分块轮次）vs
+   cache-cat 的单流无界 client_write_many。
+
+**迭代 4 方向**：管线形状对齐 cache-cat——实验去掉/放大
+CLIENT_BATCH_MAX_ITEMS 分块、coalescer 窗口消除、单流
+client_write_many 直通；对照 raft-direct 口径 142k 验证共识层上限；
+follower 侧（复制接收）单独采样。
 
 **迭代 2 方向（按预期收益）**：
 1. apply 逐条瘦身：client_results 去重表是否有界/换 HashMap；versions

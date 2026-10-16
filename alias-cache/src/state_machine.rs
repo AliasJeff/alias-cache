@@ -7079,4 +7079,30 @@ mod tests {
             Frame::Integer(2_000)
         );
     }
+
+    #[tokio::test]
+    async fn apply_throughput_microbenchmark_400k_hot_state() {
+        let mut state = StateMachine::default();
+        // Hot state: 400k keys, matching the cluster benchmark working set.
+        for index in 0..400_000u64 {
+            let _ = state.apply(Operation::Set {
+                key: Bytes::from(format!("preload-key-{index}")),
+                value: Bytes::from(format!("value-{index}")),
+            });
+        }
+        let rounds = 100_000u64;
+        let started = std::time::Instant::now();
+        for index in 0..rounds {
+            let _ = state.apply(Operation::Set {
+                key: Bytes::from(format!("benchmark-key-{}", index % 400_000)),
+                value: Bytes::from_static(b"xxxxxxxxxxxxxxxx"),
+            });
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "APPLY-BENCH: {rounds} sets on 400k-key state in {elapsed:?} ({:.0} ops/s, {:.1}us/op)",
+            rounds as f64 / elapsed.as_secs_f64(),
+            elapsed.as_micros() as f64 / rounds as f64
+        );
+    }
 }
