@@ -1840,7 +1840,15 @@ impl BatchCommitterHandle {
                 loop {
                     match rx.try_recv() {
                         Ok(queued) => group.push(queued),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            // One more short grace pass: segments that were
+                            // mid-flight when the first drain hit empty.
+                            tokio::time::sleep(BATCH_COALESCE_WINDOW).await;
+                            match rx.try_recv() {
+                                Ok(queued) => group.push(queued),
+                                _ => break,
+                            }
+                        }
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                     }
                 }
@@ -1928,7 +1936,7 @@ impl BatchCommitterHandle {
 
 /// How long the committer waits for in-flight segments before committing.
 /// Two passes of this window bound the added latency at well under 1ms.
-const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(150);
+const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(350);
 
 /// Commit one batch directly, without the leader coalescing queue.
 ///

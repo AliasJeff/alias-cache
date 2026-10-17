@@ -17,7 +17,6 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytes",
- "futures-util",
  "mlua",
  "openraft",
  "rcgen",

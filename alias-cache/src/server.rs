@@ -309,8 +309,6 @@ async fn handle_connection(
     }
 }
 
-use futures_util::future::join_all;
-
 #[allow(clippy::too_many_arguments)]
 async fn handle_raft_connection(
     mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -430,16 +428,13 @@ async fn handle_raft_connection(
                                     .await?;
                             }
                             Stage::ReadRun(run) => {
-                                let replies =
-                                    join_all(run.into_iter().map(|request| {
-                                        execute_client_command_with_tls(
-                                            &raft,
-                                            request,
-                                            tls_connector.clone(),
-                                        )
-                                    }))
+                                for request in run {
+                                    let response = execute_client_command_with_tls(
+                                        &raft,
+                                        request,
+                                        tls_connector.clone(),
+                                    )
                                     .await;
-                                for response in replies {
                                     buffer_response(
                                         &mut stream,
                                         &mut output,
