@@ -35,7 +35,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 use tokio::time::interval;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub type NodeId = u64;
@@ -1835,22 +1835,22 @@ impl BatchCommitterHandle {
                 // moment to land, then drain everything queued. The wait is
                 // bounded well under one millisecond so p50 impact stays
                 // negligible against multi-millisecond fsync latency.
-                tokio::time::sleep(BATCH_COALESCE_WINDOW).await;
+                // Size-or-time group commit: a group commits when it reaches
+                // RAFT_COMMIT_TARGET_ENTRIES operations or when
+                // RAFT_COMMIT_MAX_LATENCY has passed since its first op —
+                // whichever comes first. Under load this amortizes one WAL
+                // fsync over thousands of entries (the fsync rate, not CPU,
+                // is the write ceiling); when idle the latency bound keeps
+                // commits prompt.
                 let mut group: Vec<QueuedBatch> = vec![QueuedBatch { items, response }];
-                loop {
-                    match rx.try_recv() {
-                        Ok(queued) => group.push(queued),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                            // One more short grace pass: segments that were
-                            // mid-flight when the first drain hit empty.
-                            tokio::time::sleep(BATCH_COALESCE_WINDOW).await;
-                            match rx.try_recv() {
-                                Ok(queued) => group.push(queued),
-                                _ => break,
-                            }
-                        }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                    }
+                let mut group_entries = group[0].items.len();
+                let deadline = tokio::time::Instant::now() + RAFT_COMMIT_MAX_LATENCY;
+                while group_entries < RAFT_COMMIT_TARGET_ENTRIES {
+                    let Some(queued) = timeout_at(deadline, rx.recv()).await.ok().flatten() else {
+                        break;
+                    };
+                    group_entries += queued.items.len();
+                    group.push(queued);
                 }
 
                 // Split the backlog into chunks of at most
@@ -1934,9 +1934,13 @@ impl BatchCommitterHandle {
     }
 }
 
-/// How long the committer waits for in-flight segments before committing.
-/// Two passes of this window bound the added latency at well under 1ms.
-const BATCH_COALESCE_WINDOW: Duration = Duration::from_micros(350);
+/// A commit group flushes once it holds this many operations: WAL fsyncs
+/// amortize over the whole group, so the fsync rate (the write ceiling)
+/// scales down as the entry rate scales up.
+const RAFT_COMMIT_TARGET_ENTRIES: usize = 2_048;
+/// Upper bound on how long the first operation of a group waits for more
+/// company before the group commits anyway.
+const RAFT_COMMIT_MAX_LATENCY: Duration = Duration::from_millis(2);
 
 /// Commit one batch directly, without the leader coalescing queue.
 ///
