@@ -396,6 +396,20 @@ fsync 不再是约束；与 cache-cat 的剩余差距在其更轻的每条管线
 迭代 14 方向：apply 每条瘦身（client_results BTreeMap → 有界 HashMap、
 Frame 复用）与复制载荷编码。
 
+**迭代 14**（2026-10-17）：组提交目标条数扫描——2048 → 8192 定稿
+（16384 过冲回落）：**5/95 92,481（+22%）、50/50 85,073、95/5
+141,921**，全部零错误。机制：目标越大 fsync 摊销越充分，直到单轮
+apply 时长的增长反噬；8192 是该形状的甜点。
+
+**当前对 cache-cat 记分（三档中位/最优）**：95/5 85%、5/95 44%、
+50/50 51%。
+
+**CI 状态说明（2026-10-17 起）**：CI 报错为 GitHub 账户计费问题
+（"recent account payments have failed or your spending limit needs
+to be increased"，job 未启动即失败），非代码问题；本地 pinned 1.88
+全门禁（fmt + clippy -D warnings + 172 测试）通过。需账户持有人在
+Billing & plans 处理后重跑。
+
 ## 完成标准
 
 - 同机三方对测（plans/16 步骤 7 口径）混合负载进入 cache-cat 同量级
