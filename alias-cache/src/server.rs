@@ -15,11 +15,12 @@ use crate::node_state::{NodeState, SharedNodeState};
 use crate::protocol::{Decoder, Frame, Request, RespVersion, command_from_frame};
 use crate::raft::{
     BatchCommitterHandle, ClientBatchOutcome, ClientRequestOutcome, RaftHandle, client_batch_fits,
-    enable_raft_runtime, execute_client_request_with_id, execute_transaction_request_with_id,
-    new_client_request_id, new_tcp_raft_for_server_with_metrics, open_single_node_with_metrics,
-    run_expiration_worker, run_leader_time_worker, send_client_batch_request_with_ids,
-    send_client_request_with_id, send_transaction_request_with_id, serve_raft_rpc_with_tls,
-    split_client_batch_requests, wait_for_any_leader, watch_key_versions,
+    current_time_millis, enable_raft_runtime, execute_client_request_with_id,
+    execute_transaction_request_with_id, new_client_request_id,
+    new_tcp_raft_for_server_with_metrics, open_single_node_with_metrics, run_expiration_worker,
+    run_leader_time_worker, send_client_batch_request_with_ids, send_client_request_with_id,
+    send_transaction_request_with_id, serve_raft_rpc_with_tls, split_client_batch_requests,
+    wait_for_any_leader, watch_key_versions,
 };
 use crate::sentinel::{self, SentinelContext};
 use crate::state_machine::{
@@ -428,13 +429,10 @@ async fn handle_raft_connection(
                                     .await?;
                             }
                             Stage::ReadRun(run) => {
-                                for request in run {
-                                    let response = execute_client_command_with_tls(
-                                        &raft,
-                                        request,
-                                        tls_connector.clone(),
-                                    )
-                                    .await;
+                                let replies =
+                                    execute_read_run_with_tls(&raft, run, tls_connector.clone())
+                                        .await?;
+                                for response in replies {
                                     buffer_response(
                                         &mut stream,
                                         &mut output,
@@ -843,6 +841,92 @@ async fn execute_transaction_with_tls(
         },
         Err(error) => Frame::error(format!("ERR {error}")),
     }
+}
+
+/// Execute a run of pipeline reads under ONE shared lease barrier.
+///
+/// Reads in a run are independent point reads; a single barrier covers them
+/// all, saving (n-1) core round trips per run versus per-read barriers.
+/// When the lease timer has lapsed (bursty traffic leaves followers idle),
+/// the barrier falls back to the quorum-confirmed ReadIndex round: live
+/// leaders keep serving, partitioned leaders fail closed. Follower runs are
+/// forwarded to the leader per read, matching the single-read path.
+/// Returns one reply frame per read, in request order.
+async fn execute_read_run_with_tls(
+    raft: &RaftHandle,
+    reads: Vec<crate::protocol::Request>,
+    tls_connector: Option<TlsConnector>,
+) -> Result<Vec<Frame>> {
+    let option = openraft::network::RPCOption::new(std::time::Duration::from_secs(1));
+    let barrier = match raft
+        .ensure_linearizable(openraft::ReadPolicy::LeaseRead)
+        .await
+    {
+        Ok(done) => Ok(done),
+        Err(error) => {
+            let lease_lapsed_no_leader = error
+                .forward_to_leader()
+                .is_some_and(|forward| forward.leader_node.is_none());
+            if lease_lapsed_no_leader {
+                raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+                    .await
+            } else {
+                Err(error)
+            }
+        }
+    };
+    if let Err(error) = barrier {
+        let mut frames = Vec::with_capacity(reads.len());
+        if let Some(forward) = error.forward_to_leader() {
+            if let Some(node) = &forward.leader_node {
+                for request in reads {
+                    let request_id = new_client_request_id();
+                    frames.push(
+                        send_client_request_with_id(
+                            &node.addr,
+                            request_id,
+                            request,
+                            &option,
+                            tls_connector.clone(),
+                        )
+                        .await
+                        .unwrap_or_else(|error| Frame::error(format!("ERR {error}"))),
+                    );
+                }
+                return Ok(frames);
+            }
+        }
+        return Ok(vec![
+            Frame::error("ERR raft leader is not known");
+            reads.len()
+        ]);
+    }
+
+    // Barrier established: every read executes against the live state in
+    // order. None of them is a replicated write (the stage split guarantees
+    // it), so each yields its reply frame directly.
+    let write_time = current_time_millis();
+    let mut frames = Vec::with_capacity(reads.len());
+    for request in reads {
+        let request_id = new_client_request_id();
+        let response = raft
+            .with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    let (_, response) = state_machine
+                        .prepare_request_live(request, write_time, Some(request_id))
+                        .await
+                        .map_err(|error| Frame::error(format!("ERR {error}")))?;
+                    Ok::<_, Frame>(response)
+                })
+            })
+            .await
+            .map_err(|error| Error::server(format!("raft state machine: {error}")))?;
+        match response {
+            Ok(response) => frames.push(response),
+            Err(error_frame) => frames.push(error_frame),
+        }
+    }
+    Ok(frames)
 }
 
 async fn execute_client_command_with_tls(
