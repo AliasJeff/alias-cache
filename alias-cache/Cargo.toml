@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bytes.workspace = true
 bincode.workspace = true
+futures-util.workspace = true
 openraft.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true

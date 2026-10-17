@@ -309,6 +309,8 @@ async fn handle_connection(
     }
 }
 
+use futures_util::future::join_all;
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_raft_connection(
     mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -360,58 +362,93 @@ async fn handle_raft_connection(
                 // current at its production point.
                 let mut output = BytesMut::new();
                 if parallel {
-                    // Consecutive writes share one OpenRaft client_write_many
-                    // call. Reads and response-heavy writes remain barriers so
-                    // later commands observe the same order as a Redis
-                    // pipeline. Replies are still written FIFO.
-                    let mut write_batch = Vec::new();
+                    // The segment splits into alternating stages: runs of
+                    // batchable writes commit as one coalesced batch; a read
+                    // run starts only after the preceding write run has
+                    // committed (read-your-pipeline-writes), but the reads
+                    // INSIDE a run are independent of each other and execute
+                    // concurrently — one lease barrier each, no per-read
+                    // serialization. Replies are written FIFO either way.
+                    enum Stage {
+                        Batch(Vec<Request>),
+                        Single(Request),
+                        ReadRun(Vec<Request>),
+                    }
+                    let mut stages: Vec<Stage> = Vec::new();
                     for result in parsed {
                         let Ok(request) = result else { continue };
                         let command = request.command_name();
                         if is_batchable_write(command, &request)
                             && batch_request_has_unique_keys(command, &request)
                         {
-                            write_batch.push(request);
+                            match stages.last_mut() {
+                                Some(Stage::Batch(batch)) => batch.push(request),
+                                _ => stages.push(Stage::Batch(vec![request])),
+                            }
                             continue;
                         }
+                        if is_replicated_write(command) {
+                            // Order-critical writes (duplicate keys, oversized
+                            // payloads) commit one at a time.
+                            stages.push(Stage::Single(request));
+                            continue;
+                        }
+                        match stages.last_mut() {
+                            Some(Stage::ReadRun(run)) => run.push(request),
+                            _ => stages.push(Stage::ReadRun(vec![request])),
+                        }
+                    }
 
-                        if !write_batch.is_empty() {
-                            for response in execute_client_batch_with_tls(
-                                &raft,
-                                std::mem::take(&mut write_batch),
-                                &batch_committer,
-                                tls_connector.clone(),
-                            )
-                            .await
-                            {
+                    for stage in stages {
+                        match stage {
+                            Stage::Batch(batch) => {
+                                for response in execute_client_batch_with_tls(
+                                    &raft,
+                                    batch,
+                                    &batch_committer,
+                                    tls_connector.clone(),
+                                )
+                                .await
+                                {
+                                    buffer_response(
+                                        &mut stream,
+                                        &mut output,
+                                        &response,
+                                        resp_version,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Stage::Single(request) => {
+                                let response = execute_client_command_with_tls(
+                                    &raft,
+                                    request,
+                                    tls_connector.clone(),
+                                )
+                                .await;
                                 buffer_response(&mut stream, &mut output, &response, resp_version)
                                     .await?;
                             }
-                        }
-                        if is_replicated_write(command) {
-                            let response =
-                                execute_client_command_with_tls(&raft, request, tls_connector.clone())
+                            Stage::ReadRun(run) => {
+                                let replies =
+                                    join_all(run.into_iter().map(|request| {
+                                        execute_client_command_with_tls(
+                                            &raft,
+                                            request,
+                                            tls_connector.clone(),
+                                        )
+                                    }))
                                     .await;
-                            buffer_response(&mut stream, &mut output, &response, resp_version)
-                                .await?;
-                            continue;
-                        }
-                        let response =
-                            execute_client_command_with_tls(&raft, request, tls_connector.clone())
-                                .await;
-                        buffer_response(&mut stream, &mut output, &response, resp_version).await?;
-                    }
-                    if !write_batch.is_empty() {
-                        for response in execute_client_batch_with_tls(
-                            &raft,
-                            write_batch,
-                            &batch_committer,
-                            tls_connector.clone(),
-                        )
-                        .await
-                        {
-                            buffer_response(&mut stream, &mut output, &response, resp_version)
-                                .await?;
+                                for response in replies {
+                                    buffer_response(
+                                        &mut stream,
+                                        &mut output,
+                                        &response,
+                                        resp_version,
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
                     }
                     flush_buffered(&mut stream, &mut output).await?;
