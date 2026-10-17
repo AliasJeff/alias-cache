@@ -1664,23 +1664,43 @@ pub async fn execute_client_request_with_id(
 ) -> Result<ClientRequestOutcome, String> {
     // Reads establish the leader-lease barrier BEFORE touching the state
     // machine: a valid lease proves this node still leads without a log
-    // append or a quorum round (the same lease-read model cache-cat uses);
-    // an expired lease fails closed into the redirect path. The lease spans
-    // election_timeout_max and is renewed by follower heartbeat
-    // acknowledgements, so a partitioned leader stops answering reads within
-    // that window.
-    if !is_replicated_write(request.command_name())
-        && let Err(error) = raft
+    // append or a quorum round (the same lease-read model cache-cat uses).
+    // The lease spans election_timeout_max and is renewed by follower
+    // heartbeat acknowledgements, so a partitioned leader stops answering
+    // reads within that window.
+    //
+    // When the lease TIMER has lapsed but this node still believes it leads
+    // (bursty traffic leaves followers idle; their next ack renews the
+    // lease), fall back to the quorum-confirmed ReadIndex barrier: live
+    // leaders keep serving reads, and a partitioned leader fails the
+    // probes — still never serving stale data.
+    if !is_replicated_write(request.command_name()) {
+        let barrier = raft
             .ensure_linearizable(openraft::ReadPolicy::LeaseRead)
-            .await
-    {
-        if let Some(forward) = error.forward_to_leader() {
-            if let Some(node) = &forward.leader_node {
-                return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
+            .await;
+        let barrier = match barrier {
+            Ok(done) => Ok(done),
+            Err(error) => {
+                let lease_lapsed_no_leader = error
+                    .forward_to_leader()
+                    .is_some_and(|forward| forward.leader_node.is_none());
+                if lease_lapsed_no_leader {
+                    raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+                        .await
+                } else {
+                    Err(error)
+                }
             }
-            return Err("raft leader is not known".to_string());
+        };
+        if let Err(error) = barrier {
+            if let Some(forward) = error.forward_to_leader() {
+                if let Some(node) = &forward.leader_node {
+                    return Ok(ClientRequestOutcome::Redirect(node.addr.clone()));
+                }
+                return Err("raft leader is not known".to_string());
+            }
+            return Err(format!("raft read barrier failed: {error}"));
         }
-        return Err(format!("raft read barrier failed: {error}"));
     }
     let write_time = current_time_millis();
     let (operation, response) = raft
@@ -7773,9 +7793,13 @@ mod tests {
             .expect("minority read should finish");
             match minority_read {
                 Err(error) => {
-                    assert_eq!(
-                        error, "raft leader is not known",
-                        "expired lease must fail closed"
+                    // Fail-closed forms: the lease path reports an unknown
+                    // leader; the ReadIndex fallback reports the quorum
+                    // failure. Either way no value is served.
+                    assert!(
+                        error == "raft leader is not known"
+                            || error.starts_with("raft read barrier failed"),
+                        "expired lease must fail closed, got {error}"
                     );
                     break;
                 }

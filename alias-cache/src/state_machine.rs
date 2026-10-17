@@ -2084,12 +2084,26 @@ impl StateMachine {
     }
 
     /// Replace or create a key, keeping the memory counter exact.
+    ///
+    /// One BTreeMap walk via the entry API: the previous get-then-insert
+    /// pair walked the tree twice per write.
     fn insert_entry(&mut self, key: Bytes, entry: Entry) {
-        if let Some(old) = self.values.get(&key) {
-            self.memory_bytes = self.memory_bytes.saturating_sub(entry_size(&key, old));
+        match self.values.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let new_size = entry_size(&key, &entry);
+                let old = slot.insert(entry);
+                self.memory_bytes = self
+                    .memory_bytes
+                    .saturating_sub(entry_size(&key, &old))
+                    .saturating_add(new_size);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                self.memory_bytes = self
+                    .memory_bytes
+                    .saturating_add(entry_size(slot.key(), &entry));
+                slot.insert(entry);
+            }
         }
-        self.memory_bytes = self.memory_bytes.saturating_add(entry_size(&key, &entry));
-        self.values.insert(key, entry);
     }
 
     /// Delete a key, keeping the memory counter exact; reports whether the
