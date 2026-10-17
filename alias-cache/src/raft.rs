@@ -1851,6 +1851,7 @@ impl BatchCommitterHandle {
                 // concurrent appends into large batches, and responses reach
                 // submitters via their oneshots when the chunk finishes.
                 type CommitChunk = (Vec<(ClientRequestId, Request)>, Vec<(usize, QueuedBatch)>);
+
                 let mut chunks: Vec<CommitChunk> = Vec::new();
                 let mut current_items: Vec<(ClientRequestId, Request)> = Vec::new();
                 let mut current_group: Vec<(usize, QueuedBatch)> = Vec::new();
