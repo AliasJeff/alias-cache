@@ -99,7 +99,16 @@ impl Frame {
 
     pub fn encode_for(&self, version: RespVersion, output: &mut BytesMut) -> Result<()> {
         match self {
-            Self::SimpleString(value) => encode_line(b'+', value, output),
+            Self::SimpleString(value) => {
+                // The SET reply is the single hottest frame in the write
+                // path; one constant-slice extend replaces the three-part
+                // line encode (and its CR/LF scan).
+                if value.as_ref() == b"OK" {
+                    output.extend_from_slice(b"+OK\r\n");
+                    return Ok(());
+                }
+                encode_line(b'+', value, output)
+            }
             Self::Error(value) => encode_line(b'-', value, output),
             Self::Integer(value) => {
                 output.extend_from_slice(b":");

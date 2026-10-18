@@ -24,7 +24,7 @@ use crate::raft::{
 };
 use crate::sentinel::{self, SentinelContext};
 use crate::state_machine::{
-    batch_request_has_unique_keys, is_batchable_write, is_replicated_write,
+    ClientRequestId, batch_request_has_unique_keys, is_batchable_write, is_replicated_write,
 };
 use crate::tls::TlsContext;
 
@@ -963,18 +963,18 @@ async fn execute_client_batch_with_tls(
 ) -> Vec<Frame> {
     let mut responses = Vec::with_capacity(requests.len());
     for chunk in split_client_batch_requests(requests) {
-        if !client_batch_fits(&chunk) {
-            for request in chunk {
+        let items: Vec<(ClientRequestId, Request)> = chunk
+            .into_iter()
+            .map(|request| (new_client_request_id(), request))
+            .collect();
+        if !client_batch_fits(&items) {
+            for (_, request) in items {
                 responses.push(
                     execute_client_command_with_tls(raft, request, tls_connector.clone()).await,
                 );
             }
             continue;
         }
-        let items = chunk
-            .into_iter()
-            .map(|request| (new_client_request_id(), request))
-            .collect();
         responses.extend(
             execute_client_batch_chunk_with_tls(
                 raft,

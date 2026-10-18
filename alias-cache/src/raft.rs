@@ -1735,25 +1735,41 @@ pub async fn execute_client_request_with_id(
     }
 }
 
+/// Serialized size of one `(ClientRequestId, Request)` item inside a
+/// `NetworkRequest::ClientBatch`, in closed form: u128 id (16) + Request
+/// variant tag (4) + `Vec<Bytes>` length prefix (8) + per-argument
+/// (u64 length prefix + bytes). bincode 1.3 fixed-width encoding; pinned
+/// against `bincode::serialized_size` by `client_batch_wire_size_matches_bincode`.
+fn client_batch_item_wire_size(request: &Request) -> u64 {
+    let Request::Command(arguments) = request;
+    28 + arguments
+        .iter()
+        .map(|argument| 8 + argument.len() as u64)
+        .sum::<u64>()
+}
+
+/// Envelope size: `ClientBatch` variant tag (4) + `Vec` length prefix (8)
+/// plus the items themselves.
+fn client_batch_wire_size(item_wire_bytes: u64) -> u64 {
+    12 + item_wire_bytes
+}
+
 /// Return whether a set of independent pipeline writes fits one batch RPC.
 ///
 /// The limit is deliberately smaller than the generic Raft frame limit so a
 /// client pipeline cannot consume the same memory budget as a snapshot.
-pub fn client_batch_fits(requests: &[Request]) -> bool {
-    if requests.is_empty()
-        || requests.len() > CLIENT_BATCH_MAX_ITEMS
-        || requests.iter().any(|request| {
-            request.command_name().len() + request_memory_bytes(request) > CLIENT_BATCH_MAX_BYTES
-        })
-    {
+pub fn client_batch_fits(items: &[(ClientRequestId, Request)]) -> bool {
+    if items.is_empty() || items.len() > CLIENT_BATCH_MAX_ITEMS {
         return false;
     }
-    let items = requests
-        .iter()
-        .cloned()
-        .map(|request| (0, request))
-        .collect::<Vec<_>>();
-    client_batch_items_fit(&items)
+    let mut total_wire = 0u64;
+    for (_, request) in items {
+        if request.command_name().len() + request_memory_bytes(request) > CLIENT_BATCH_MAX_BYTES {
+            return false;
+        }
+        total_wire += client_batch_item_wire_size(request);
+    }
+    client_batch_wire_size(total_wire) <= CLIENT_BATCH_MAX_BYTES as u64
 }
 
 fn request_memory_bytes(request: &Request) -> usize {
@@ -1763,19 +1779,13 @@ fn request_memory_bytes(request: &Request) -> usize {
 }
 
 pub fn split_client_batch_requests(requests: Vec<Request>) -> Vec<Vec<Request>> {
-    let base_size = bincode::serialized_size(&NetworkRequest::ClientBatch { items: Vec::new() })
-        .ok()
-        .and_then(|size| usize::try_from(size).ok())
-        .unwrap_or(CLIENT_BATCH_MAX_BYTES);
+    let base_size = 12u64;
     let mut chunks = Vec::new();
     let mut chunk = Vec::new();
     let mut chunk_size = base_size;
 
     for request in requests {
-        let item_size = bincode::serialized_size(&(0_u128, &request))
-            .ok()
-            .and_then(|size| usize::try_from(size).ok())
-            .unwrap_or(CLIENT_BATCH_MAX_BYTES);
+        let item_size = client_batch_item_wire_size(&request);
         if request.command_name().len() + request_memory_bytes(&request) > CLIENT_BATCH_MAX_BYTES {
             if !chunk.is_empty() {
                 chunks.push(std::mem::take(&mut chunk));
@@ -1786,7 +1796,7 @@ pub fn split_client_batch_requests(requests: Vec<Request>) -> Vec<Vec<Request>> 
         }
         if !chunk.is_empty()
             && (chunk.len() == CLIENT_BATCH_MAX_ITEMS
-                || chunk_size.saturating_add(item_size) > CLIENT_BATCH_MAX_BYTES)
+                || chunk_size.saturating_add(item_size) > CLIENT_BATCH_MAX_BYTES as u64)
         {
             chunks.push(std::mem::take(&mut chunk));
             chunk_size = base_size;
@@ -1798,16 +1808,6 @@ pub fn split_client_batch_requests(requests: Vec<Request>) -> Vec<Vec<Request>> 
         chunks.push(chunk);
     }
     chunks
-}
-
-fn client_batch_items_fit(items: &[(ClientRequestId, Request)]) -> bool {
-    if items.is_empty() || items.len() > CLIENT_BATCH_MAX_ITEMS {
-        return false;
-    }
-    bincode::serialized_size(&NetworkRequest::ClientBatch {
-        items: items.to_vec(),
-    })
-    .is_ok_and(|size| size <= CLIENT_BATCH_MAX_BYTES as u64)
 }
 
 pub async fn execute_client_batch_request(
@@ -1979,8 +1979,7 @@ async fn commit_batch_items(
     raft: &RaftHandle,
     items: Vec<(ClientRequestId, Request)>,
 ) -> Result<ClientBatchOutcome, String> {
-    let requests: Vec<Request> = items.iter().map(|(_, request)| request.clone()).collect();
-    if !client_batch_fits(&requests) {
+    if !client_batch_fits(&items) {
         let max_bytes = CLIENT_BATCH_MAX_BYTES;
         return Err(format!("client batch exceeds {max_bytes} bytes"));
     }
@@ -2006,6 +2005,7 @@ async fn commit_batch_items(
     }
     let request_ids: Vec<ClientRequestId> =
         items.iter().map(|(request_id, _)| *request_id).collect();
+    let requests: Vec<Request> = items.into_iter().map(|(_, request)| request).collect();
     let write_time = current_time_millis();
     let max_batch_memory = (CLIENT_BATCH_MAX_BYTES.min(1 + CLIENT_BATCH_MAX_ITEMS * 4_096)) as u64;
     // Pure validation + wrapping executed under the live state lock (no
@@ -3005,7 +3005,7 @@ pub async fn send_client_batch_request_with_ids(
     option: &RPCOption,
     tls_connector: Option<TlsConnector>,
 ) -> CacheResult<ClientBatchOutcome> {
-    if !client_batch_items_fit(&items) {
+    if !client_batch_fits(&items) {
         return Err(Error::protocol("client batch exceeds configured limits"));
     }
     let response = send_rpc(
@@ -4468,21 +4468,71 @@ mod tests {
 
     #[test]
     fn client_batch_limits_split_by_item_and_serialized_size() {
+        fn items(requests: &[Request]) -> Vec<(ClientRequestId, Request)> {
+            requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| (index as u128, request.clone()))
+                .collect()
+        }
         let small = request(&[b"SET", b"key", b"value"]);
         let mut by_count = vec![small.clone(); CLIENT_BATCH_MAX_ITEMS + 1];
         assert!(!client_batch_fits(&[]));
-        assert!(!client_batch_fits(&by_count));
+        assert!(!client_batch_fits(&items(&by_count)));
         let chunks = split_client_batch_requests(std::mem::take(&mut by_count));
         assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [1024, 1]);
-        assert!(chunks.iter().all(|chunk| client_batch_fits(chunk)));
+        assert!(chunks.iter().all(|chunk| client_batch_fits(&items(chunk))));
 
         let oversized = request(&[b"SET", b"key", &vec![b'x'; CLIENT_BATCH_MAX_BYTES]]);
-        assert!(!client_batch_fits(std::slice::from_ref(&oversized)));
+        assert!(!client_batch_fits(&items(std::slice::from_ref(&oversized))));
         let chunks = split_client_batch_requests(vec![oversized, small]);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 1);
-        assert!(!client_batch_fits(&chunks[0]));
-        assert!(client_batch_fits(&chunks[1]));
+        assert!(!client_batch_fits(&items(&chunks[0])));
+        assert!(client_batch_fits(&items(&chunks[1])));
+    }
+
+    #[test]
+    fn client_batch_wire_size_matches_bincode() {
+        // Pin the closed-form wire sizes to bincode 1.3's fixed-width
+        // encoding: if the encoding of NetworkRequest::ClientBatch, the
+        // (u128, Request) tuple, or Vec<Bytes> ever changes, this fails
+        // before the admission limits silently drift.
+        let shapes: Vec<Vec<Request>> = vec![
+            vec![],
+            vec![request(&[])],
+            vec![request(&[b"SET", b"key", b"value"])],
+            vec![
+                request(&[b"SET", b"key", b"value"]),
+                request(&[b"RPUSH", b"list"]),
+                request(&[]),
+            ],
+            vec![request(&[b"SET", &vec![b'k'; 1_000], &vec![b'v'; 7_000]]); 3],
+        ];
+        for requests in &shapes {
+            let items: Vec<(ClientRequestId, Request)> = requests
+                .iter()
+                .enumerate()
+                .map(|(index, req)| (index as u128, req.clone()))
+                .collect();
+            let expected = bincode::serialized_size(&NetworkRequest::ClientBatch {
+                items: items.clone(),
+            })
+            .unwrap();
+            let actual = client_batch_wire_size(
+                items
+                    .iter()
+                    .map(|(_, req)| client_batch_item_wire_size(req))
+                    .sum(),
+            );
+            assert_eq!(actual, expected, "batch shapes drifted: {requests:?}");
+            if let Some((id, req)) = items.first() {
+                assert_eq!(
+                    client_batch_item_wire_size(req),
+                    bincode::serialized_size(&(*id, req)).unwrap()
+                );
+            }
+        }
     }
 
     #[tokio::test]

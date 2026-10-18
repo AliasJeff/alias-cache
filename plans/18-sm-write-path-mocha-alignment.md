@@ -109,10 +109,61 @@ versions HashMap 消除，版本合并到 Entry。微基准 3.7-5.3 → **2.4µs
 （同机 cache-cat 203-236k，**达到/超越**）；50/50 = 38-44k；纯写预载
 97,960。全部零错误。172 测试全绿。
 
-### Phase 2（待实施）
-### Phase 3（待实施）
-### Phase 4（待实施）
-### Phase 5（待实施）
+### Phase 2 完成（2026-10-19）
+
+client_results BTreeMap → HashMap + 插入序 VecDeque（`#[serde(skip)]`，
+恢复后首次淘汰时从快照键重建，≤4096 条一次排序）。prepare 查重、apply
+查重、插入、淘汰四处全部 O(1)（原为 3-4 次 O(log 4096)）。
+顺带发现：`client_results_watermark` 是死字段（从未读写），保留以维持
+快照反序列化格式兼容。A/B（stash 切换 ×3 轮）：apply 微基准中位
+0.67 → 0.545µs/op（**-0.12µs，1.23×**）——方向正确、幅度温和；同时
+证实 plans/18 记录的 2.4µs 基线已过时（apply 早在其他修复中降到了
+<0.7µs），SM 彻底脱离集群瓶颈链。
+
+### Phase 3 完成（2026-10-19）
+
+批量组装路径的 bincode 全结构遍历改为闭环公式：item = 28B + Σ(8+len)，
+envelope = 12B + Σitem（bincode 1.3 定宽编码），由
+`client_batch_wire_size_matches_bincode` 测试钉住等价性（该测试随即
+抓到并修正了一处公式笔误）。`client_batch_fits` 改收 items（消除
+每批 2N 次 Request clone + 全批 serde 遍历），`commit_batch_items`
+改为按值移动。集群实测（3 节点新鲜、512c×p16、零错误）：
+
+| 负载 | plans/19 后（当日早） | Phase 2+3+4 后 | 变化 |
+| --- | ---: | ---: | --- |
+| 5/95（wp95） | 78.7k | **104.8-115.6k（中位 108.7k）** | **+38%** |
+| 50/50 | 53.9k | 54.0-58.9k | +0-9% |
+| 纯写 | 85-97.5k | 95.5-98.7k（三轮稳定） | 持平、更稳 |
+| 95/5（wp5） | 266k | 270.6k | 持平（≥ cache-cat 203-236k） |
+
+vs cache-cat 同机：5/95 达 **~71%**（原 43-52%）；95/5 保持超越；
+50/50 ~50%。写占比越高，批量组装瘦身的收益越大——与"瓶颈在 leader
+提交轮速率"的归因一致。
+
+### Phase 4 完成（2026-10-19，幅度低于计划预估）
+
+计划预估 -0.2-0.5µs 高估了：encode_for 已是直接 extend_from_slice，
+无逐帧分配。落地了仅存的常量帧快路径：`+OK\r\n` 单次 extend（SET
+应答是写路径最热帧，替代三段拼接 + CR/LF 扫描）。预计 ~10ns/响应，
+微基准不可见，零风险保留。
+
+### Phase 5 失效（2026-10-19，不实施）
+
+WAL 批量校验和针对 FileLogStore 的逐记录 checksum——plans/19 已将
+FileLogStore 退出生产路径（raft-engine 内建批量 CRC），本阶段无对象。
+
+## 完成标准对照（2026-10-19 当前）
+
+- 50/50 ≥ 100k：**未达**（58.9k，~50% cache-cat）
+- 5/95 ≥ 150k：**未达**（108.7k 中位，~71% cache-cat）
+- 172+ 测试全绿（现 178）、WATCH/事务/幂等语义不回退：✓
+- 快照序列化/恢复不回退：✓（client_results 语义与容量不变）
+
+剩余瓶颈（下一阶段目标）：**leader 提交轮速率**——实测 ~101 轮/秒 ×
+~981 条/轮（8192 在途、pwrite），轮内 ~10ms 由 prepare 串行段 +
+openraft 复制 RTT + 应答写构成；µs 级每条成本（SM apply 0.55µs、
+RESP 编码、公式化 size）已全部出清，再往下需要动 openraft 复制
+内环与 coalescer 窗口形状（属新 plan 范围）。
 
 ## 完成标准
 

@@ -401,7 +401,16 @@ pub struct StateMachine {
     max_memory: Option<u64>,
     logical_time: u64,
     /// Idempotency cache: request_id → response for client retries.
-    client_results: BTreeMap<ClientRequestId, Frame>,
+    /// A plain HashMap: every touch on the write path (prepare-time dedup
+    /// get, apply-time dedup get, cache insert, eviction) is a point
+    /// operation, matching the values map's O(1) model.
+    client_results: std::collections::HashMap<ClientRequestId, Frame>,
+    /// Insertion order backing FIFO eviction of `client_results`. IDs are
+    /// near-monotonic (timestamp-prefixed), so deque order ≈ id order.
+    /// Skipped by serde; rebuilt lazily from the restored keys after a
+    /// snapshot recovery.
+    #[serde(skip, default)]
+    client_results_order: std::collections::VecDeque<ClientRequestId>,
     /// Lowest request_id evicted from the dedup cache; older requests are
     /// treated as cache misses and re-executed.
     client_results_watermark: ClientRequestId,
@@ -2076,17 +2085,25 @@ impl StateMachine {
             .collect()
     }
 
-    /// Cache a client response and evict old entries. The eviction is
-    /// deferred: instead of checking the capacity on every insert (which
-    /// adds a branch + BTreeMap removal to the hot path), we track how far
-    /// past capacity we are and evict in batches.
+    /// Cache a client response and evict the oldest entry once over
+    /// capacity. With the deque the three per-write touches (dedup get,
+    /// insert, oldest-entry removal) are all O(1); the BTreeMap variant
+    /// paid O(log n) on each.
     fn cache_client_response(&mut self, request_id: ClientRequestId, response: Frame) {
-        self.client_results.insert(request_id, response);
+        if self.client_results.insert(request_id, response).is_none() {
+            self.client_results_order.push_back(request_id);
+        }
         if self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
-            // IDs are monotonic: the oldest entries are the smallest IDs.
-            // Batch-evict instead of checking on every insert.
+            // Post-recovery the deque starts empty while the map was
+            // restored from the snapshot; rebuild the order once from the
+            // restored keys (≤ capacity entries, sorted ≈ insertion order).
+            if self.client_results_order.len() < self.client_results.len() {
+                let mut ids: Vec<_> = self.client_results.keys().copied().collect();
+                ids.sort_unstable();
+                self.client_results_order = ids.into();
+            }
             while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
-                let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id) else {
+                let Some(oldest) = self.client_results_order.pop_front() else {
                     break;
                 };
                 self.client_results.remove(&oldest);
