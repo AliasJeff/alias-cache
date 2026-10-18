@@ -2069,13 +2069,19 @@ impl StateMachine {
             .collect()
     }
 
+    /// Cache a client response and evict old entries. The eviction is
+    /// deferred: instead of checking the capacity on every insert (which
+    /// adds a branch + BTreeMap removal to the hot path), we track how far
+    /// past capacity we are and evict in batches.
     fn cache_client_response(&mut self, request_id: ClientRequestId, response: Frame) {
         self.client_results.insert(request_id, response);
-        while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
-            let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id) else {
-                break;
-            };
-            self.client_results.remove(&oldest);
+        if self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY + 256 {
+            while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
+                let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id) else {
+                    break;
+                };
+                self.client_results.remove(&oldest);
+            }
         }
     }
 
@@ -2083,10 +2089,8 @@ impl StateMachine {
         *self.versions.entry(key.clone()).or_insert(0) += 1;
     }
 
-    /// Replace or create a key, keeping the memory counter exact.
-    ///
-    /// One BTreeMap walk via the entry API: the previous get-then-insert
-    /// pair walked the tree twice per write.
+    /// Replace or create a key, keeping the memory counter exact via one
+    /// HashMap entry-API walk (merged get+insert into a single lookup).
     fn insert_entry(&mut self, key: Bytes, entry: Entry) {
         match self.values.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {

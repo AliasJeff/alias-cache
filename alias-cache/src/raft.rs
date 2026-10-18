@@ -1957,10 +1957,10 @@ impl BatchCommitterHandle {
 /// A commit group flushes once it holds this many operations: WAL fsyncs
 /// amortize over the whole group, so the fsync rate (the write ceiling)
 /// scales down as the entry rate scales up.
-const RAFT_COMMIT_TARGET_ENTRIES: usize = 8_192;
+const RAFT_COMMIT_TARGET_ENTRIES: usize = 65_536;
 /// Upper bound on how long the first operation of a group waits for more
 /// company before the group commits anyway.
-const RAFT_COMMIT_MAX_LATENCY: Duration = Duration::from_millis(2);
+const RAFT_COMMIT_MAX_LATENCY: Duration = Duration::from_millis(20);
 
 /// Commit one batch directly, without the leader coalescing queue.
 ///
