@@ -12,10 +12,10 @@ use crate::raft::{Entry, LogId, LogStoreMetrics, TypeConfig, Vote};
 use openraft::LogState;
 use openraft::OptionalSend;
 use openraft::RaftLogReader;
-use openraft::storage::RaftLogStorage;
 use openraft::alias::EntryOf;
 use openraft::entry::RaftEntry;
 use openraft::storage::IOFlushed;
+use openraft::storage::RaftLogStorage;
 use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize, ValueCodec};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -38,15 +38,17 @@ const RAFT_GROUP_ID: u64 = 1;
 /// throughputs this node targets.
 pub fn create_raft_engine(path: impl AsRef<Path>) -> CacheResult<Arc<Engine>> {
     let path = path.as_ref();
-    std::fs::create_dir_all(path).map_err(|source| Error::io("create raft engine directory", source))?;
+    std::fs::create_dir_all(path)
+        .map_err(|source| Error::io("create raft engine directory", source))?;
     let config = Config {
         dir: path.to_string_lossy().into_owned(),
         purge_threshold: ReadableSize::gb(2),
         batch_compression_threshold: ReadableSize::kb(0),
         ..Default::default()
     };
-    let engine = Engine::open(config)
-        .map_err(|error| Error::server(format!("open raft engine at {}: {error}", path.display())))?;
+    let engine = Engine::open(config).map_err(|error| {
+        Error::server(format!("open raft engine at {}: {error}", path.display()))
+    })?;
     Ok(Arc::new(engine))
 }
 
@@ -147,8 +149,7 @@ impl RaftEngineLogStore {
             engine.sync().map_err(|e| io::Error::other(e.to_string()))
         })
         .await
-        .map_err(|error| io::Error::other(format!("raft engine sync task: {error}")))?
-        ;
+        .map_err(|error| io::Error::other(format!("raft engine sync task: {error}")))?;
         metrics.record_sync_data(started.elapsed());
         result
     }
@@ -213,13 +214,15 @@ impl RaftLogReader<TypeConfig> for RaftEngineLogStore {
             if clamped_start >= clamped_end {
                 return Ok(Vec::new());
             }
-            match self.engine.fetch_entries_to_with::<MessageExtTyped, Bincode2Codec>(
-                RAFT_GROUP_ID,
-                clamped_start,
-                clamped_end,
-                None,
-                &mut res,
-            ) {
+            match self
+                .engine
+                .fetch_entries_to_with::<MessageExtTyped, Bincode2Codec>(
+                    RAFT_GROUP_ID,
+                    clamped_start,
+                    clamped_end,
+                    None,
+                    &mut res,
+                ) {
                 Ok(_) => return Ok(res.into_iter().map(|stored| stored.0).collect()),
                 Err(raft_engine::Error::EntryCompacted) if attempt < ATTEMPTS => {
                     res.clear();
@@ -275,7 +278,11 @@ impl RaftLogStorage<TypeConfig> for RaftEngineLogStore {
         Self::sync_engine(Arc::clone(&self.engine), Arc::clone(&self.metrics)).await
     }
 
-    async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> Result<(), io::Error>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<TypeConfig>,
+    ) -> Result<(), io::Error>
     where
         I: IntoIterator<Item = EntryOf<TypeConfig>> + Send,
     {
@@ -545,11 +552,7 @@ mod tests {
     #[tokio::test]
     async fn append_read_roundtrip_and_vote_persistence() {
         let (_dir, mut store) = new_store().await;
-        append(
-            &mut store,
-            vec![blank(1, 1), blank(1, 2), blank(1, 3)],
-        )
-        .await;
+        append(&mut store, vec![blank(1, 1), blank(1, 2), blank(1, 3)]).await;
 
         let entries = store.try_get_log_entries(2..4).await.unwrap();
         assert_eq!(
