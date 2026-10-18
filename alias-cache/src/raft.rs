@@ -79,7 +79,7 @@ static NEXT_CLIENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// exhausted. The permit cap keeps the write queue bounded so the control
 /// plane stays alive; clients beyond it simply wait (TCP backpressure)
 /// instead of melting the cluster.
-const CLIENT_WRITE_PERMIT_LIMIT: u32 = 4_096;
+const CLIENT_WRITE_PERMIT_LIMIT: u32 = 16_384;
 static CLIENT_WRITE_PERMITS: Semaphore = Semaphore::const_new(CLIENT_WRITE_PERMIT_LIMIT as usize);
 
 /// How long a write waits for admission permits before shedding with an
