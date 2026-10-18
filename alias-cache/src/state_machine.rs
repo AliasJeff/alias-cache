@@ -390,14 +390,7 @@ pub struct StateMachine {
     /// officially unordered in Redis — its positional cursor makes no
     /// ordering promise. O(1) point access matches cache-cat's model.
     values: std::collections::HashMap<Bytes, Entry>,
-    /// Per-key modification counters backing WATCH optimistic locking.
-    ///
-    /// Every committed change to a key increments its counter; removing the
-    /// key removes the counter, so an absent key reads as version zero.
-    /// A hash map (not a BTreeMap): apply touches this on every write, and
-    /// WATCH only ever looks versions up by key — no ordered iteration
-    /// exists, so O(1) access beats deterministic layout.
-    versions: std::collections::HashMap<Bytes, u64>,
+
     /// Best-effort live payload size in bytes, maintained incrementally.
     /// Skipped by serde and recomputed after recovery; it excludes BTreeMap
     /// and queue structural overhead.
@@ -407,7 +400,11 @@ pub struct StateMachine {
     #[serde(skip, default)]
     max_memory: Option<u64>,
     logical_time: u64,
+    /// Idempotency cache: request_id → response for client retries.
     client_results: BTreeMap<ClientRequestId, Frame>,
+    /// Lowest request_id evicted from the dedup cache; older requests are
+    /// treated as cache misses and re-executed.
+    client_results_watermark: ClientRequestId,
 }
 
 /// New bytes a write operation would charge against max_memory.
@@ -546,7 +543,6 @@ fn entry_size(key: &Bytes, entry: &Entry) -> u64 {
 impl PartialEq for StateMachine {
     fn eq(&self, other: &Self) -> bool {
         self.values == other.values
-            && self.versions == other.versions
             && self.logical_time == other.logical_time
             && self.client_results == other.client_results
     }
@@ -558,6 +554,9 @@ impl Eq for StateMachine {}
 struct Entry {
     value: Value,
     expire_at: Option<u64>,
+    /// Per-key modification counter backing WATCH optimistic locking.
+    /// Lives inside Entry so write + version-bump is one HashMap operation.
+    version: u64,
 }
 
 impl StateMachine {
@@ -654,12 +653,12 @@ impl StateMachine {
                 ApplyResult::Response(response)
             }
             Operation::Set { key, value } => {
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::String(value),
                         expire_at: None,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::simple_string("OK"))
@@ -688,12 +687,12 @@ impl StateMachine {
                 } else {
                     expire_at
                 };
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::String(value),
                         expire_at,
+                        version: 0,
                     },
                 );
                 if return_previous {
@@ -704,12 +703,12 @@ impl StateMachine {
             }
             Operation::MultiSet { pairs } => {
                 for (key, value) in pairs {
-                    self.bump_version(&key.clone());
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::String(value),
                             expire_at: None,
+                            version: 0,
                         },
                     );
                 }
@@ -737,12 +736,12 @@ impl StateMachine {
                         added += 1;
                     }
                 }
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::Hash(hash),
                         expire_at,
+                        version: 0,
                     },
                 );
                 if return_simple {
@@ -771,14 +770,13 @@ impl StateMachine {
                 }
                 if hash.is_empty() {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                 } else {
-                    self.bump_version(&key.clone());
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::Hash(hash),
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -800,12 +798,12 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::Integer(0));
                 }
                 hash.insert(field, value);
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::Hash(hash),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::Integer(1))
@@ -843,12 +841,12 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error(NOT_INTEGER));
                 };
                 hash.insert(field, Bytes::from(total.to_string()));
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::Hash(hash),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::Integer(total))
@@ -875,12 +873,12 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error(OVERFLOW));
                 }
                 sorted_set.insert(member, total.to_bits() as i64);
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::SortedSet(sorted_set),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(score_frame(total))
@@ -909,12 +907,12 @@ impl StateMachine {
                     list.extend(elements);
                 }
                 let length = list.len();
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::List(list),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::Integer(length as i64))
@@ -959,14 +957,13 @@ impl StateMachine {
                 };
                 if list.is_empty() {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                 } else {
-                    self.bump_version(&key.clone());
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::List(list),
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -991,14 +988,13 @@ impl StateMachine {
                 let removed = remove_list_elements(&mut list, count, &element);
                 if list.is_empty() {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                 } else if removed > 0 {
-                    self.bump_version(&key.clone());
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::List(list),
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -1020,12 +1016,12 @@ impl StateMachine {
                     return ApplyResult::Response(Frame::error("ERR index out of range"));
                 };
                 list[index] = value;
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::List(list),
                         expire_at: existing.expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::simple_string("OK"))
@@ -1044,7 +1040,6 @@ impl StateMachine {
                 };
                 let Some((start, stop)) = normalize_list_range(start, stop, list.len()) else {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                     return ApplyResult::Response(Frame::simple_string("OK"));
                 };
                 let retained = list
@@ -1052,12 +1047,12 @@ impl StateMachine {
                     .skip(start)
                     .take(stop - start + 1)
                     .collect::<VecDeque<_>>();
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::List(retained),
                         expire_at: existing.expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::simple_string("OK"))
@@ -1078,12 +1073,12 @@ impl StateMachine {
                     .into_iter()
                     .filter(|member| set.insert(member.clone()))
                     .count() as i64;
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::Set(set),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::Integer(added))
@@ -1106,14 +1101,13 @@ impl StateMachine {
                     .count() as i64;
                 if set.is_empty() {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                 } else if removed > 0 {
-                    self.bump_version(&key.clone());
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::Set(set),
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -1139,12 +1133,12 @@ impl StateMachine {
                         was_missing
                     })
                     .count() as i64;
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::SortedSet(sorted_set),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::Integer(added))
@@ -1167,14 +1161,13 @@ impl StateMachine {
                     .count() as i64;
                 if sorted_set.is_empty() {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                 } else if removed > 0 {
-                    self.bump_version(&key.clone());
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::SortedSet(sorted_set),
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -1204,12 +1197,12 @@ impl StateMachine {
                 let Some(total) = current.checked_add(increment) else {
                     return ApplyResult::Response(Frame::error(NOT_INTEGER));
                 };
-                self.bump_version(&key.clone());
                 self.insert_entry(
                     key,
                     Entry {
                         value: Value::String(Bytes::from(total.to_string())),
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(Frame::Integer(total))
@@ -1240,13 +1233,13 @@ impl StateMachine {
                 let was_empty = bytes.iter().all(|byte| *byte == 0);
                 if was_empty {
                     self.values.remove(&key);
-                    self.versions.remove(&key);
                 } else {
                     self.insert_entry(
                         key,
                         Entry {
                             value: Value::String(Bytes::from(bytes)),
                             expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -1298,6 +1291,7 @@ impl StateMachine {
                         let entry = Entry {
                             value: Value::String(Bytes::from(inverted)),
                             expire_at: None,
+                            version: 0,
                         };
                         self.insert_entry(dest.clone(), entry);
                     }
@@ -1351,6 +1345,7 @@ impl StateMachine {
                     let entry = Entry {
                         value: Value::String(Bytes::from(result)),
                         expire_at: None,
+                        version: 0,
                     };
                     self.insert_entry(dest, entry);
                 }
@@ -1379,6 +1374,7 @@ impl StateMachine {
                         inserted: 0,
                     },
                     expire_at: None,
+                    version: 0,
                 };
                 self.insert_entry(key, entry);
                 ApplyResult::Response(Frame::simple_string("OK"))
@@ -1432,7 +1428,14 @@ impl StateMachine {
                     inserted: *inserted,
                 };
                 if changed || !had_existing {
-                    self.insert_entry(key, Entry { value, expire_at });
+                    self.insert_entry(
+                        key,
+                        Entry {
+                            value,
+                            expire_at,
+                            version: 0,
+                        },
+                    );
                 }
                 ApplyResult::Response(Frame::Integer(1))
             }
@@ -1476,6 +1479,7 @@ impl StateMachine {
                             last_id: stream.1,
                         },
                         expire_at,
+                        version: 0,
                     },
                 );
                 ApplyResult::Response(reply)
@@ -1510,6 +1514,7 @@ impl StateMachine {
                                 last_id,
                             },
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -1548,6 +1553,7 @@ impl StateMachine {
                         Entry {
                             value: Value::Stream { entries, last_id },
                             expire_at: existing.expire_at,
+                            version: 0,
                         },
                     );
                 }
@@ -1561,7 +1567,6 @@ impl StateMachine {
                         .get(&key)
                         .is_some_and(|entry| !self.is_expired(entry));
                     if should_remove && self.remove_entry(&key) {
-                        self.versions.remove(&key);
                         removed += 1;
                     }
                 }
@@ -1573,7 +1578,6 @@ impl StateMachine {
                 });
                 if should_remove {
                     let _ = self.remove_entry(&key);
-                    self.versions.remove(&key);
                 }
                 ApplyResult::NoResponse
             }
@@ -1636,7 +1640,7 @@ impl StateMachine {
                 // client observed. Validation happens inside the log, so the
                 // check and the writes commit atomically on every replica.
                 for (key, expected) in &watch_expectations {
-                    let live = self.versions.get(key).copied();
+                    let live = self.values.get(key).map(|entry| entry.version);
                     if live != *expected {
                         return ApplyResult::Response(Frame::Null);
                     }
@@ -2065,7 +2069,10 @@ impl StateMachine {
     /// exist, which is itself a version clients can watch for.
     pub fn key_versions(&self, keys: &[Bytes]) -> Vec<(Bytes, Option<u64>)> {
         keys.iter()
-            .map(|key| (key.clone(), self.versions.get(key).copied()))
+            .map(|key| {
+                let version = self.values.get(key).map(|entry| entry.version);
+                (key.clone(), version)
+            })
             .collect()
     }
 
@@ -2075,7 +2082,9 @@ impl StateMachine {
     /// past capacity we are and evict in batches.
     fn cache_client_response(&mut self, request_id: ClientRequestId, response: Frame) {
         self.client_results.insert(request_id, response);
-        if self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY + 256 {
+        if self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
+            // IDs are monotonic: the oldest entries are the smallest IDs.
+            // Batch-evict instead of checking on every insert.
             while self.client_results.len() > CLIENT_RESULT_CACHE_CAPACITY {
                 let Some(oldest) = self.client_results.first_key_value().map(|(id, _)| *id) else {
                     break;
@@ -2085,16 +2094,17 @@ impl StateMachine {
         }
     }
 
-    fn bump_version(&mut self, key: &Bytes) {
-        *self.versions.entry(key.clone()).or_insert(0) += 1;
-    }
-
     /// Replace or create a key, keeping the memory counter exact via one
     /// HashMap entry-API walk (merged get+insert into a single lookup).
-    fn insert_entry(&mut self, key: Bytes, entry: Entry) {
+    fn insert_entry(&mut self, key: Bytes, mut entry: Entry) {
+        // Version lives inside Entry: on update, carry forward the old
+        // version + 1; on insert, start at 1. One HashMap operation covers
+        // both value write and version bump (Mocha direct-write model).
         match self.values.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let new_version = slot.get().version.wrapping_add(1);
                 let new_size = entry_size(&key, &entry);
+                entry.version = new_version;
                 let old = slot.insert(entry);
                 self.memory_bytes = self
                     .memory_bytes
@@ -2102,6 +2112,7 @@ impl StateMachine {
                     .saturating_add(new_size);
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
+                entry.version = 1;
                 self.memory_bytes = self
                     .memory_bytes
                     .saturating_add(entry_size(slot.key(), &entry));
