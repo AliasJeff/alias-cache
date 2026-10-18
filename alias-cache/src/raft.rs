@@ -618,7 +618,7 @@ impl LogStoreMetrics {
         }
     }
 
-    fn record_append(&self, entries: usize) {
+    pub(crate) fn record_append(&self, entries: usize) {
         if entries == 0 {
             return;
         }
@@ -629,7 +629,7 @@ impl LogStoreMetrics {
             .fetch_max(entries as u64, Ordering::Relaxed);
     }
 
-    fn record_sync_data(&self, elapsed: Duration) {
+    pub(crate) fn record_sync_data(&self, elapsed: Duration) {
         let elapsed_nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
         self.sync_data_calls.fetch_add(1, Ordering::Relaxed);
         self.sync_data_nanos
@@ -3691,8 +3691,10 @@ pub async fn new_file_raft_with_metrics(
     .map_err(|_| openraft::error::Fatal::Panicked)?;
     let data_dir = data_dir.as_ref();
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
-    let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
-        .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let log_store = crate::raft_engine_store::RaftEngineLogStore::open(
+        data_dir.join("raft").join("raft-engine"),
+    )
+    .map_err(|_| openraft::error::Fatal::Panicked)?;
     let metrics = log_store.metrics();
     let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;
@@ -3838,8 +3840,10 @@ async fn new_tcp_raft_inner_with_metrics(
     .map_err(|_| openraft::error::Fatal::Panicked)?;
     let data_dir = data_dir.as_ref();
     std::fs::create_dir_all(data_dir).map_err(|_| openraft::error::Fatal::Panicked)?;
-    let log_store = FileLogStore::open(data_dir.join("raft").join("log"))
-        .map_err(|_| openraft::error::Fatal::Panicked)?;
+    let log_store = crate::raft_engine_store::RaftEngineLogStore::open(
+        data_dir.join("raft").join("raft-engine"),
+    )
+    .map_err(|_| openraft::error::Fatal::Panicked)?;
     let metrics = log_store.metrics();
     let state_machine = MemStateMachine::persistent(data_dir.join("raft").join("snapshot"))
         .map_err(|_| openraft::error::Fatal::Panicked)?;

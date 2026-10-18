@@ -49,9 +49,33 @@ impl StatsContext {
     }
 
     fn file_bytes(&self, relative: &str) -> u64 {
-        std::fs::metadata(self.data_dir.join(relative))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0)
+        let path = self.data_dir.join(relative);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return 0;
+        };
+        // The raft log used to be a single append-only file; raft-engine owns
+        // a directory of segments, so sum the tree instead of the inode.
+        if !metadata.is_dir() {
+            return metadata.len();
+        }
+        let mut total = 0;
+        let mut stack = vec![path];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(entry_metadata) = entry.metadata() else {
+                    continue;
+                };
+                if entry_metadata.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    total += entry_metadata.len();
+                }
+            }
+        }
+        total
     }
 }
 
@@ -197,7 +221,7 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
         let _ = writeln!(output, "memory_usage_bytes:{memory}");
         let max_memory_bytes = stats.max_memory.unwrap_or(0);
         let _ = writeln!(output, "max_memory_bytes:{max_memory_bytes}");
-        let raft_log_bytes = stats.file_bytes("raft/log");
+        let raft_log_bytes = stats.file_bytes("raft/raft-engine");
         let _ = writeln!(output, "raft_log_bytes:{raft_log_bytes}");
         let raft_snapshot_bytes = stats.file_bytes("raft/snapshot");
         let _ = writeln!(output, "raft_snapshot_bytes:{raft_snapshot_bytes}");

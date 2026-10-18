@@ -5,6 +5,7 @@ pub mod lua;
 pub mod node_state;
 pub mod protocol;
 pub mod raft;
+pub mod raft_engine_store;
 pub mod sentinel;
 pub mod server;
 pub mod snapshot;

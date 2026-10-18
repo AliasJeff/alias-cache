@@ -8,7 +8,9 @@ rust-version.workspace = true
 [dependencies]
 bytes.workspace = true
 bincode.workspace = true
+bincode2.workspace = true
 openraft.workspace = true
+raft-engine.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
@@ -21,3 +23,4 @@ mlua.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
+tempfile.workspace = true

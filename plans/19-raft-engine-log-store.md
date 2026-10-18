@@ -91,3 +91,58 @@ base 文件 + delta 文件的结构保持不变。唯一变化是：截断日志
 
 本重构是独立的日志存储层替换，不影响 SM（已优化）、不影响 RESP 层、
 不影响读路径。可以安全地独立实施和验证。
+
+## 实施记录（2026-10-19 完成）
+
+### 落地内容
+
+- 新模块 `alias-cache/src/raft_engine_store.rs`：`RaftEngineLogStore`
+  包装 `Arc<raft_engine::Engine>`（单 raft group，REGION_ID=1），
+  实现 openraft v2 `RaftLogStorage` + `RaftLogReader`：
+  - `append`：`LogBatch::with_capacity(256)` 合批 + `write(sync=false)`，
+    `engine.sync()` 在 `spawn_blocking` 中执行并回调 `IOFlushed`
+  - `save_vote`/`truncate_after`：写后显式 sync（vote 与截断必须持久）
+  - `truncate_after`：用"重写边界 entry"实现删尾（raft-engine 无 drop-tail
+    原语；`compact_to` 只删前缀）——直接采用 cache-cat 的已验证方案
+  - `purge`：LastPurged 元数据 + `engine.compact_to(index+1)`
+  - vote / last_purged 存 engine 元数据（`ValueCodec` bincode2）；
+    committed sidecar（200ms 去抖）原样保留
+  - 5 个单元测试（roundtrip / 截断重追加 / purge 后 clamp 读 / sidecar 重开恢复）
+- 依赖：`raft-engine` git 锁 rev `097c499`（default-features=false，去掉 rhai）
+  + `bincode2 2.0.1` + dev `tempfile`
+- 构造函数切换：`new_file_raft_with_metrics` 与 `new_tcp_raft_inner_with_metrics`
+  改用 `data_dir/raft/raft-engine`；`FileLogStore` 保留（其崩溃恢复单元测试
+  是 16 个已落地修复的回归网，生产路径不再使用）
+- `INFO stats` 的 `raft_log_bytes` 改为递归统计 `raft/raft-engine` 目录
+- **177 测试全绿（172+5）、clippy 零告警（pinned 1.88.0）**
+
+### 验证结果（2026-10-19，同机 3 节点新鲜集群，512c×p16，ks=400k，v=16B，node1=leader）
+
+| 指标 | 改前（plans/18 Phase 1 记录） | 改后 | 变化 |
+| --- | ---: | ---: | --- |
+| fsync 均值 @1.6GB WAL | 2.3ms @700MB（随大小增长，峰值 54ms） | **0.31-0.33ms**（max 23-40ms） | **~8×，且与 WAL 大小无关** |
+| 纯写吞吐 vs WAL 增长 | 衰减（186k→100k→持续恶化） | **85-88k 平稳**（4 轮，WAL 0.4→1.6GB） | **衰减消除** |
+| 5/95（wp95） | 43.7k | **78.7k** | **+80%** |
+| 50/50 | 38-44k | **53.9k** | +23-42% |
+| 95/5（wp5） | 250-261k | 266k | 持平（仍 ≥ cache-cat 203-236k） |
+| 纯写（绝对值） | 预载 97,960 | 85-97k | 持平——瓶颈已移至下一层 |
+
+全部零错误。
+
+### 结论与下一步
+
+- **根因修复达成**：fsync 与 WAL 大小解耦（1.6GB 下仍 0.3ms）、吞吐无时间
+  衰减。plans/19 立项时的 E1 稳定性判据满足。
+- 混合负载大幅受益（写占比越高收益越大），95/5 读档不受影响。
+- 纯写绝对值（~90k）未达 150-250k 预期带：**纯写瓶颈已不在存储层**——
+  8192 在途下批量均值 981 条/append、~101 append/s（~10ms/轮），上限由
+  RESP 客户端路径 + commit round 速率决定，属 plans/18 Phase 2-5 范围。
+  plans/19 的预期表假设存储仍是混合档之外的全部约束，实测证明纯写档
+  的约束早已转移到每条成本层。
+- 旧记录"首轮 186k"无复现口径（仅存在于 plans/19 根因表），不作为对照基线。
+
+### 遗留
+
+- 长时 soak（>1h）未跑（挂起项，与 CI 账单一起由用户决策）
+- `FileLogStore` 及其测试保留在树中，待 plans/18 Phase 2-5 落地后
+  评估是否删除
