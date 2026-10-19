@@ -144,5 +144,7 @@ base 文件 + delta 文件的结构保持不变。唯一变化是：截断日志
 ### 遗留
 
 - 长时 soak（>1h）未跑（挂起项，与 CI 账单一起由用户决策）
-- `FileLogStore` 及其测试保留在树中，待 plans/18 Phase 2-5 落地后
-  评估是否删除
+- ~~`FileLogStore` 及其测试保留在树中，待评估删除~~ **已删除**
+  （2026-10-19 设计清理：生产路径确认全部走 raft-engine 后，
+  FileLogStore 格式机、rewrite 机制及其 12 项格式测试移除，
+  openraft 官方存储契约套件改跑在 RaftEngineLogStore 上）

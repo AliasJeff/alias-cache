@@ -1,8 +1,9 @@
-//! TiKV raft-engine backed [`RaftLogStorage`], replacing [`crate::raft::FileLogStore`].
+//! TiKV raft-engine backed [`RaftLogStorage`] — the production log store.
 //!
-//! FileLogStore's fsync cost grows linearly with the WAL file size (2.3ms
-//! average / 54ms peak at ~700MB, vs 0.1-0.3ms right after a truncation),
-//! which is the measured root cause of the write-side throughput decay.
+//! The hand-rolled append-only store this replaces had fsync costs that
+//! grew linearly with the WAL file size (2.3ms average / 54ms peak at
+//! ~700MB, vs 0.1-0.3ms right after a truncation) and decayed write
+//! throughput over a run's life.
 //! raft-engine segments the log internally, batches writes through
 //! [`raft_engine::LogBatch`], and coalesces fsyncs, so the per-append cost no
 //! longer depends on the log length.
@@ -33,8 +34,8 @@ const RAFT_GROUP_ID: u64 = 1;
 
 /// Create the raft-engine instance rooted at `path` (a directory owned by the
 /// engine). `purge_threshold` keeps closed segments compacted before they grow
-/// into the multi-hundred-MB WAL ranges that made FileLogStore's fsyncs
-/// collapse; compression stays off because its CPU cost is measurable at the
+/// into the multi-hundred-MB WAL ranges that degraded the previous
+/// store's fsyncs; compression stays off because its CPU cost is measurable at the
 /// throughputs this node targets.
 pub fn create_raft_engine(path: impl AsRef<Path>) -> CacheResult<Arc<Engine>> {
     let path = path.as_ref();
@@ -648,5 +649,100 @@ mod tests {
         }
         let mut reopened = RaftEngineLogStore::open(dir.path().join("raft-engine")).unwrap();
         assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id));
+    }
+
+    #[tokio::test]
+    async fn corrupt_sidecar_falls_back_to_no_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("raft-engine");
+        {
+            let mut store = RaftEngineLogStore::open(&engine_dir).unwrap();
+            store.save_committed(Some(log_id(4, 9))).await.unwrap();
+        }
+        // The sidecar is a recovery hint, never a correctness record: any
+        // parse failure degrades to "no remembered commit" and openraft
+        // re-confirms the commit from the log and quorum after a restart.
+        let sidecar_path = engine_dir.with_extension("committed");
+        std::fs::write(&sidecar_path, b"garbage-not-a-sidecar").unwrap();
+        let mut reopened = RaftEngineLogStore::open(&engine_dir).unwrap();
+        assert_eq!(reopened.read_committed().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_appends_and_sync_latency() {
+        let (_dir, mut store) = new_store().await;
+        append(&mut store, (1..=10).map(|i| blank(1, i)).collect()).await;
+        let snapshot = store.metrics().snapshot();
+        assert_eq!(snapshot.append_calls, 1);
+        assert_eq!(snapshot.appended_entries, 10);
+        assert_eq!(snapshot.append_batch_entries_max, 10);
+        // The sync runs on the blocking pool and append returns before it
+        // completes; wait for it to land rather than racing it.
+        let metrics = store.metrics();
+        let mut sync_calls = 0;
+        for _ in 0..100 {
+            sync_calls = metrics.snapshot().sync_data_calls;
+            if sync_calls >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(sync_calls >= 1);
+        assert!(metrics.snapshot().sync_data_nanos > 0);
+    }
+}
+
+#[cfg(test)]
+mod storage_suite {
+    use super::*;
+    use crate::raft::MemStateMachine;
+    use openraft::StorageError;
+    use openraft::testing::log::{StoreBuilder, Suite};
+    use openraft::type_config::TypeConfigExt;
+
+    /// Removes the engine directory when the suite finishes.
+    #[derive(Debug)]
+    struct EngineGuard {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for EngineGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct EngineBuilder;
+
+    impl StoreBuilder<TypeConfig, RaftEngineLogStore, MemStateMachine, EngineGuard> for EngineBuilder {
+        async fn build(
+            &self,
+        ) -> Result<(EngineGuard, RaftEngineLogStore, MemStateMachine), StorageError<TypeConfig>>
+        {
+            let path = std::env::temp_dir().join(format!(
+                "alias-cache-raft-engine-suite-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock should be after epoch")
+                    .as_nanos()
+            ));
+            let store = RaftEngineLogStore::open(&path)
+                .map_err(|error| StorageError::read(TypeConfig::err_from_error(&error)))?;
+            Ok((EngineGuard { path }, store, MemStateMachine::default()))
+        }
+    }
+
+    /// The production log store must satisfy OpenRaft's full storage
+    /// contract: append/truncate/purge invariants, vote persistence, and
+    /// log-state consistency across the non-destructive suite.
+    #[tokio::test]
+    async fn raft_engine_storage_satisfies_openraft_contract() {
+        Suite::<TypeConfig, RaftEngineLogStore, MemStateMachine, EngineBuilder, EngineGuard>::test_all(
+            EngineBuilder,
+        )
+        .await
+        .expect("raft-engine storage should satisfy OpenRaft storage contract");
     }
 }

@@ -43,9 +43,10 @@ alias-cache 的兼容目标是“对支持的命令提供可测试的 Redis 协�
   replication/cluster 取自单一 openraft metrics 快照；stats 为运行指标
   （连接计数与上限、内存用量与上限、raft 日志/快照文件字节大小、命令
   计数、WAL append 批次大小、sync_data 次数及耗时），其中计数器为进程内
-  原子量、文件大小按路径即时读取，不进复制状态机；WAL 指标仅统计
-  `FileLogStore::append` 的成功追加批次和成功返回的 `sync_data` 调用，不包括
-  vote、日志重写/清理、目录同步或失败的 sync；平均批次大小为成功 append
+  原子量、文件大小按路径递归即时读取（raft-engine 目录），不进复制状态机；
+  WAL 指标仅统计 `RaftEngineLogStore::append` 的成功追加批次和
+  `engine.sync()` 成功返回的调用，不包括 vote、truncate/purge 元数据写或
+  失败的 sync；平均批次大小为成功 append
   entry 数除以成功非空 append 调用数，在线读取各原子计数器并非同一时刻的事务快照；
   fsync 耗时是本机调用耗时而非跨节点提交延迟；未知 section 返回空
   body；RESP3 为 VerbatimString，RESP2 降级
