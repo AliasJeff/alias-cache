@@ -30,6 +30,7 @@ dependencies = [
  "bincode",
  "bincode2",
  "bytes",
+ "futures-util",
  "mlua",
  "openraft",
  "raft-engine",
