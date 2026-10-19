@@ -1825,7 +1825,78 @@ pub async fn execute_client_batch_request(
 struct QueuedBatch {
     items: Vec<(ClientRequestId, Request)>,
     response: tokio::sync::oneshot::Sender<Result<ClientBatchOutcome, String>>,
+    /// When `execute` handed the batch to the committer; the difference to
+    /// group-formation time is the coalescing queue wait.
+    enqueued_at: std::time::Instant,
 }
+
+/// Cumulative commit-round phase timers for the `INFO stats` surface.
+///
+/// One leader per process, so a static is the cheapest way to let the
+/// committer task (writer) and the INFO handler (reader) share the numbers
+/// without threading a handle through every constructor. All values are
+/// RELAXED microsecond accumulators; averages are derived at read time.
+pub struct CommitRoundMetrics {
+    rounds: AtomicU64,
+    entries: AtomicU64,
+    /// Queue wait summed per entry (batch wait × its entry count).
+    queue_wait_us: AtomicU64,
+    prepare_us: AtomicU64,
+    admit_us: AtomicU64,
+    /// `client_write_many` completion per chunk (append→replicate→commit→apply).
+    raft_us: AtomicU64,
+    raft_us_max: AtomicU64,
+    respond_us: AtomicU64,
+}
+
+impl CommitRoundMetrics {
+    const fn new() -> Self {
+        Self {
+            rounds: AtomicU64::new(0),
+            entries: AtomicU64::new(0),
+            queue_wait_us: AtomicU64::new(0),
+            prepare_us: AtomicU64::new(0),
+            admit_us: AtomicU64::new(0),
+            raft_us: AtomicU64::new(0),
+            raft_us_max: AtomicU64::new(0),
+            respond_us: AtomicU64::new(0),
+        }
+    }
+
+    fn record_queue(&self, groups: usize, entries: u64, wait_us: u64) {
+        self.rounds.fetch_add(groups as u64, Ordering::Relaxed);
+        self.entries.fetch_add(entries, Ordering::Relaxed);
+        self.queue_wait_us.fetch_add(wait_us, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> CommitRoundMetricsSnapshot {
+        CommitRoundMetricsSnapshot {
+            rounds: self.rounds.load(Ordering::Relaxed),
+            entries: self.entries.load(Ordering::Relaxed),
+            queue_wait_us: self.queue_wait_us.load(Ordering::Relaxed),
+            prepare_us: self.prepare_us.load(Ordering::Relaxed),
+            admit_us: self.admit_us.load(Ordering::Relaxed),
+            raft_us: self.raft_us.load(Ordering::Relaxed),
+            raft_us_max: self.raft_us_max.load(Ordering::Relaxed),
+            respond_us: self.respond_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One-shot read of the cumulative commit-round phase timers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitRoundMetricsSnapshot {
+    pub rounds: u64,
+    pub entries: u64,
+    pub queue_wait_us: u64,
+    pub prepare_us: u64,
+    pub admit_us: u64,
+    pub raft_us: u64,
+    pub raft_us_max: u64,
+    pub respond_us: u64,
+}
+
+pub static COMMIT_ROUND_METRICS: CommitRoundMetrics = CommitRoundMetrics::new();
 
 /// Handle to the leader-side write coalescer.
 ///
@@ -1850,7 +1921,12 @@ impl BatchCommitterHandle {
     pub fn spawn(raft: RaftHandle) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedBatch>(256);
         tokio::spawn(async move {
-            while let Some(QueuedBatch { items, response }) = rx.recv().await {
+            while let Some(QueuedBatch {
+                items,
+                response,
+                enqueued_at,
+            }) = rx.recv().await
+            {
                 // Coalescing window: give in-flight TCP segments a brief
                 // moment to land, then drain everything queued. The wait is
                 // bounded well under one millisecond so p50 impact stays
@@ -1862,7 +1938,11 @@ impl BatchCommitterHandle {
                 // fsync over thousands of entries (the fsync rate, not CPU,
                 // is the write ceiling); when idle the latency bound keeps
                 // commits prompt.
-                let mut group: Vec<QueuedBatch> = vec![QueuedBatch { items, response }];
+                let mut group: Vec<QueuedBatch> = vec![QueuedBatch {
+                    items,
+                    response,
+                    enqueued_at,
+                }];
                 let mut group_entries = group[0].items.len();
                 let deadline = tokio::time::Instant::now() + RAFT_COMMIT_MAX_LATENCY;
                 while group_entries < RAFT_COMMIT_TARGET_ENTRIES {
@@ -1878,6 +1958,13 @@ impl BatchCommitterHandle {
                 // concurrently: spawning each chunk lets openraft merge
                 // concurrent appends into large batches, and responses reach
                 // submitters via their oneshots when the chunk finishes.
+                let formed_at = std::time::Instant::now();
+                let mut wait_us = 0u64;
+                for queued in &group {
+                    wait_us += (formed_at - queued.enqueued_at).as_micros() as u64
+                        * queued.items.len() as u64;
+                }
+                COMMIT_ROUND_METRICS.record_queue(1, group_entries as u64, wait_us);
                 type CommitChunk = (Vec<(ClientRequestId, Request)>, Vec<(usize, QueuedBatch)>);
 
                 let mut chunks: Vec<CommitChunk> = Vec::new();
@@ -1907,6 +1994,7 @@ impl BatchCommitterHandle {
                     let raft = raft.clone();
                     tokio::spawn(async move {
                         let outcome = commit_batch_items(&raft, chunk_items).await;
+                        let respond_started = std::time::Instant::now();
                         for (offset, queued) in chunk_group {
                             // A merged chunk's replies must be partitioned
                             // back per submitter; only a whole-chunk failure
@@ -1926,6 +2014,10 @@ impl BatchCommitterHandle {
                             };
                             let _ = queued.response.send(sliced);
                         }
+                        COMMIT_ROUND_METRICS.respond_us.fetch_add(
+                            respond_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
                     });
                 }
             }
@@ -1945,6 +2037,7 @@ impl BatchCommitterHandle {
         tx.send(QueuedBatch {
             items,
             response: response_tx,
+            enqueued_at: std::time::Instant::now(),
         })
         .await
         .map_err(|_| "raft batch committer stopped".to_string())?;
@@ -2012,6 +2105,7 @@ async fn commit_batch_items(
     // clone, no trial execution): the authoritative responses come from the
     // applied stream.
     let request_count = requests.len();
+    let prepare_started = std::time::Instant::now();
     let operations: Vec<Operation> = raft
         .with_state_machine(move |state_machine| {
             Box::pin(async move {
@@ -2028,8 +2122,13 @@ async fn commit_batch_items(
         })
         .await
         .map_err(|error| format!("raft state machine: {error}"))??;
+    COMMIT_ROUND_METRICS.prepare_us.fetch_add(
+        prepare_started.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
 
     let payloads: Vec<RaftRequest> = operations.into_iter().map(RaftRequest::Apply).collect();
+    let admit_started = std::time::Instant::now();
     let admission = match timeout(
         CLIENT_WRITE_ADMISSION_TIMEOUT,
         CLIENT_WRITE_PERMITS.acquire_many(payloads.len().min(u32::MAX as usize) as u32),
@@ -2040,6 +2139,11 @@ async fn commit_batch_items(
         Ok(Err(_)) => return Err("raft is shutting down".to_string()),
         Err(_) => return Err("raft write overloaded: admission queue timed out".to_string()),
     };
+    COMMIT_ROUND_METRICS.admit_us.fetch_add(
+        admit_started.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
+    let raft_started = std::time::Instant::now();
     let mut stream = raft
         .client_write_many(payloads)
         .await
@@ -2065,6 +2169,13 @@ async fn commit_batch_items(
             }
         }
     }
+    let raft_elapsed_us = raft_started.elapsed().as_micros() as u64;
+    COMMIT_ROUND_METRICS
+        .raft_us
+        .fetch_add(raft_elapsed_us, Ordering::Relaxed);
+    COMMIT_ROUND_METRICS
+        .raft_us_max
+        .fetch_max(raft_elapsed_us, Ordering::Relaxed);
     drop(admission);
     if responses.len() != request_count {
         return Err(format!(

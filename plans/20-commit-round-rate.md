@@ -66,6 +66,60 @@ RTT ≈ 组队等待 + prepare + openraft（append→复制→提交→apply）+
 3. 完成标准：5/95 ≥ 150k、50/50 ≥ 100k（同机同负载）；期间任何
    参数回调必须带三方 A/B 数据。
 
+## 实验结果（2026-10-19，仪表已落地并合入）
+
+相位仪表（`CommitRoundMetrics` → `INFO stats` 的 `commit_*` 字段 +
+`raft_apply_lag`）落地后实测（3 节点新鲜集群、512c×p16、纯写 30s、
+零错误；负载中 t=12s/24s 两次采样）：
+
+| 层 | 测量 | 判定 |
+| --- | --- | --- |
+| coalescer 排队+组窗 | **12.9-20.4ms/条**（负载/累计口径） | 最大单项，但为下游反压的症状 |
+| prepare | 5µs/条（累计）、22µs/条（负载中，含读锁争用） | 无辜（≤0.02ms） |
+| admission | ~0µs/条 | 无辜 |
+| openraft chunk 提交 | 累计 7.95ms/轮；**负载中 30ms+/chunk（max 685ms）** | 真正的串行段 |
+| 应答扇出 | 0.2-1.2ms/轮 | 无辜 |
+| `raft_apply_lag`（3 节点） | 负载中 **4032 → 8193 增长**；空载归零 | 未提交积压（等 follower），非 apply |
+| `raft_apply_lag`（单节点对照） | **0-1，全程无积压** | SM/apply 无辜的确定性证据 |
+
+**决定性对照（E5）：单节点纯写 = 150,042 ops/s（零错误），三节点
+= 95.9-98.9k。** 单节点每条 raft 相位成本 ~8.5µs——本地路径（RESP +
+coalescer + openraft 单机提交 + apply + 应答）能撑 150k+。
+
+### 结论：瓶颈 = leader→follower 提交往返容量
+
+三节点下每 chunk（~1000 条）的 append→复制→quorum 确认往返在负载中
+耗 30ms+ 且在 openraft 内串行排队，管道只允许 ~98k 条/s 流入；上游
+coalescer 的 20.4ms 排队是这一容量的反压表现（5ms 窗口 A/B 已证明
+提前放行只会在 core 内堆队列，吞吐不变、混合档更差）。
+
+排除清单（均有数据）：fsync/存储（plans/19 已修，0.31ms 平坦）、
+SM apply（单节点 lag=0 + 0.545µs）、prepare、admission、响应扇出、
+组窗参数（两轮 A/B 证伪）。
+
+### 空载延迟地板（独立小发现）
+
+1 连接 × p1 空载 SET p50 = **22.3ms** = 20ms 组窗 + ~2ms 真实路径。
+组窗在空载时总是等满（`timeout_at` 到期才提交），这是纯延迟选择而
+非吞吐需要。若要低空载延迟，可做"仅当上一组仍在提交时才等窗"的
+自适应窗口——不影响吞吐上限（负载中窗口不 binding 已证）。
+
+### 下一层归因对象（本 plan 的第 2 步）
+
+openraft 复制内环：为什么每 chunk 往返在 loopback 上耗 30ms+。
+候选机制：(i) leader 每 follower 的 AppendEntries 串行轮次 + ack
+RTT 累积；(ii) openraft 复制流控窗口（`max_payload_entries` 之外
+的内部限制）；(iii) follower 侧 receive→append→ack 路径的调度延迟。
+工具：给 follower 接收路径加同款相位计数；对照 cache-cat 同配置
+的复制参数；必要时读 openraft 0.10.0-alpha.34 复制源码逐段排除。
+
+### 附注
+
+- 本机单节点 ceiling ≥150k（含 20ms 组窗 pacing），距 cache-cat
+  同机 185k 还有 ~20%——即便复制问题解决，本地段仍有余量可挖。
+- 所有数字：512c×p16、ks=400k、v=16B、30s 轮、零错误；本机噪声
+  ±10-30%，结论只采信不重叠区间与方向一致的重复观测。
+
 ## 附注
 
 - 4096 chunk cap 的 +5% 纯写收益若后续 (a) 修复落地后仍成立，可

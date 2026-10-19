@@ -273,6 +273,53 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
             .unwrap_or(0)
             / 1_000;
         let _ = writeln!(output, "raft_log_sync_data_avg_us:{average_sync_us}");
+        // Commit-round phase attribution: where a write's wall time goes
+        // between leaving the connection and the response coming back.
+        // Averages are per entry except raft_us_per_round (per chunk commit).
+        let commit = crate::raft::COMMIT_ROUND_METRICS.snapshot();
+        let commit_entries = commit.entries.max(1);
+        let commit_rounds = commit.rounds.max(1);
+        let _ = writeln!(output, "commit_rounds:{}", commit.rounds);
+        let _ = writeln!(output, "commit_entries:{}", commit.entries);
+        let _ = writeln!(
+            output,
+            "commit_queue_wait_us_per_entry:{}",
+            commit.queue_wait_us / commit_entries
+        );
+        let _ = writeln!(
+            output,
+            "commit_prepare_us_per_entry:{}",
+            commit.prepare_us / commit_entries
+        );
+        let _ = writeln!(
+            output,
+            "commit_admit_us_per_entry:{}",
+            commit.admit_us / commit_entries
+        );
+        let _ = writeln!(
+            output,
+            "commit_raft_us_per_round:{}",
+            commit.raft_us / commit_rounds
+        );
+        let _ = writeln!(output, "commit_raft_us_max_round:{}", commit.raft_us_max);
+        let _ = writeln!(
+            output,
+            "commit_respond_us_per_round:{}",
+            commit.respond_us / commit_rounds
+        );
+        // How far the apply stream trails the log tail: a persistently
+        // large lag points at the apply/SM stage, ~0 at the upstream queue.
+        let last_log_index = metrics.last_log_index;
+        let last_applied_index = metrics.last_applied.as_ref().map(|log_id| log_id.index);
+        let _ = writeln!(output, "raft_last_log_index:{last_log_index:?}");
+        let _ = writeln!(output, "raft_last_applied_index:{last_applied_index:?}");
+        if let (Some(log_index), Some(applied_index)) = (last_log_index, last_applied_index) {
+            let _ = writeln!(
+                output,
+                "raft_apply_lag:{}",
+                log_index.saturating_sub(applied_index)
+            );
+        }
     }
     if wants("cluster") {
         let _ = writeln!(output, "# Cluster");
