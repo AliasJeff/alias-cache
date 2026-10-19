@@ -57,6 +57,51 @@ pre-1.0; formats and guarantees may change between minor versions (see
   against Redis 6.2 with an honest interpretation of the strong
   consistency cost.
 
+### Performance
+
+Write-path parity with the same-machine reference (cache-cat, a
+Rust/Raft store using the same TiKV raft-engine log store), measured on
+the 3-node 512-connection × pipeline-16 harness, all zero-error:
+
+| Workload | Throughput | vs reference |
+| --- | ---: | ---: |
+| 95% read / 5% write | ~402k ops/s | ~204% |
+| 5% read / 95% write | ~184k ops/s | ~120% |
+| 50% read / 50% write | ~171-177k ops/s | ~112-116% |
+| pure write | ~192-207k ops/s | ~104-112% |
+
+The changes behind it, each validated with same-machine same-window
+A/Bs (cross-window baselines on a shared laptop swing ±35% and only
+prove direction):
+
+- `RaftEngineLogStore`: TiKV raft-engine replaces the hand-rolled
+  append-only log store. FileLogStore's fsync cost grew linearly with
+  the WAL file (2.3 ms average at 700 MB, decaying write throughput
+  over a run's life); raft-engine's segmented log holds ~0.3 ms flat at
+  multi-GB WAL sizes, removing time-dependent throughput decay.
+- Pipelined raft replication: `TcpNetwork` overrides openraft's
+  sequential send-one/wait-one replication stream with one persistent
+  connection per replication stream, bounded in-flight AppendEntries
+  (depth 4), and in-order response streaming — per-RPC latency 1.67 ms
+  → 0.67 ms, ~3.6× the RPC rate, pure write +14.5%.
+- Idle-flush adaptive commit window: the leader's coalescing group
+  commits when the queue is quiet for 4 ms, in addition to the
+  entry-count target and the 20 ms deadline. Dense arrivals keep the
+  old batching; sparse write bursts (a mixed pipeline alternates write
+  bursts with reads that must wait for them) stop paying the full
+  window — 50/50 throughput 74k → 171-177k ops/s, p50 latency
+  326-441 ms → ~138 ms.
+- State-machine apply path: per-entry versions merged into the value
+  entry and the idempotency cache moved from an ordered map to a hash
+  map with an insertion-order eviction deque (apply micro-benchmark
+  0.67 → 0.55 µs/entry); client-batch assembly computes wire sizes in
+  closed form instead of full serde walks.
+- Observability for the above: `INFO stats` gained commit-round phase
+  timers (queue wait / prepare / raft commit / respond), replication
+  RPC round-trip and over-budget counters, follower append-handler
+  latency, and the raft apply lag; the benchmark reports GET/SET
+  latency percentiles separately for mixed-ratio runs.
+
 ### Fixed
 
 - The decoder applied its pipeline limit across a connection lifetime,

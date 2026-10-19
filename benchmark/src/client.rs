@@ -139,21 +139,30 @@ pub struct WorkerStats {
     pub first_error: Option<String>,
     /// Per-request latency in microseconds, only recorded when sampling.
     pub latencies: Vec<u32>,
+    /// The same samples split by command: mixed-ratio runs collapse GET and
+    /// SET into one distribution that hides which side carries the tail.
+    pub read_latencies: Vec<u32>,
+    pub write_latencies: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SentRequest {
     started: tokio::time::Instant,
     sampled: bool,
+    is_write: bool,
 }
 
 fn record_latency(stats: &mut WorkerStats, request: SentRequest, completed: tokio::time::Instant) {
     if request.sampled {
-        stats.latencies.push(
-            completed
-                .saturating_duration_since(request.started)
-                .as_micros() as u32,
-        );
+        let latency = completed
+            .saturating_duration_since(request.started)
+            .as_micros() as u32;
+        stats.latencies.push(latency);
+        if request.is_write {
+            stats.write_latencies.push(latency);
+        } else {
+            stats.read_latencies.push(latency);
+        }
     }
 }
 
@@ -231,6 +240,7 @@ async fn run_batch_worker(config: &WorkerConfig, worker_id: usize) -> std::io::R
             pending.push_back(SentRequest {
                 started,
                 sampled: request_index.is_multiple_of(*sample_rate as u64),
+                is_write,
             });
         }
 
@@ -334,6 +344,7 @@ async fn run_pwrite_worker(
                 sent: SentRequest {
                     started: tokio::time::Instant::now(),
                     sampled: request_index.is_multiple_of(config.sample_rate as u64),
+                    is_write,
                 },
             };
             tokio::time::timeout(timeout, request_tx.send(job))
@@ -651,6 +662,7 @@ mod tests {
                     sent: SentRequest {
                         started: tokio::time::Instant::now() - Duration::from_millis(delay_ms),
                         sampled: true,
+                        is_write: true,
                     },
                 })
                 .await

@@ -121,6 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             totals.first_error = stats.first_error;
         }
         totals.latencies.extend(stats.latencies);
+        totals.read_latencies.extend(stats.read_latencies);
+        totals.write_latencies.extend(stats.write_latencies);
     }
 
     let percentiles = client::percentiles(&totals.latencies, &[0.50, 0.95, 0.99, 1.0]);
@@ -132,6 +134,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "latency us: p50={} p95={} p99={} max={}",
         percentiles[0], percentiles[1], percentiles[2], percentiles[3]
     );
+    if args.write_percent.is_some() {
+        // Mixed-ratio runs: report each side separately — the combined
+        // distribution hides which command carries the tail.
+        for (label, samples) in [
+            ("read", &totals.read_latencies),
+            ("write", &totals.write_latencies),
+        ] {
+            if samples.is_empty() {
+                continue;
+            }
+            let split = client::percentiles(samples, &[0.50, 0.95, 0.99]);
+            println!(
+                "{label} latency us: p50={} p95={} p99={} n={}",
+                split[0],
+                split[1],
+                split[2],
+                samples.len()
+            );
+        }
+    }
     println!(
         "errors: {} ({:.4}%)",
         totals.errors,
