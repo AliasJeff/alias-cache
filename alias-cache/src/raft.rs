@@ -1990,12 +1990,16 @@ impl BatchCommitterHandle {
                 // bounded well under one millisecond so p50 impact stays
                 // negligible against multi-millisecond fsync latency.
                 // Size-or-time group commit: a group commits when it reaches
-                // RAFT_COMMIT_TARGET_ENTRIES operations or when
-                // RAFT_COMMIT_MAX_LATENCY has passed since its first op —
-                // whichever comes first. Under load this amortizes one WAL
-                // fsync over thousands of entries (the fsync rate, not CPU,
-                // is the write ceiling); when idle the latency bound keeps
-                // commits prompt.
+                // RAFT_COMMIT_TARGET_ENTRIES operations, when
+                // RAFT_COMMIT_MAX_LATENCY has passed since its first op, or
+                // when the queue has been quiet for
+                // RAFT_COMMIT_IDLE_FLUSH — whichever comes first. Under
+                // dense arrivals (pure write) the window fills and the
+                // batching is unchanged; under sparse arrivals (a mixed
+                // pipeline's write bursts) the group flushes as soon as the
+                // burst ends, because every millisecond of window is a
+                // millisecond that read-your-pipeline-writes makes every
+                // subsequent read in that connection wait.
                 let mut group: Vec<QueuedBatch> = vec![QueuedBatch {
                     items,
                     response,
@@ -2004,7 +2008,10 @@ impl BatchCommitterHandle {
                 let mut group_entries = group[0].items.len();
                 let deadline = tokio::time::Instant::now() + RAFT_COMMIT_MAX_LATENCY;
                 while group_entries < RAFT_COMMIT_TARGET_ENTRIES {
-                    let Some(queued) = timeout_at(deadline, rx.recv()).await.ok().flatten() else {
+                    let wait_until =
+                        deadline.min(tokio::time::Instant::now() + RAFT_COMMIT_IDLE_FLUSH);
+                    let Some(queued) = timeout_at(wait_until, rx.recv()).await.ok().flatten()
+                    else {
                         break;
                     };
                     group_entries += queued.items.len();
@@ -2112,6 +2119,12 @@ const RAFT_COMMIT_TARGET_ENTRIES: usize = 65_536;
 /// Upper bound on how long the first operation of a group waits for more
 /// company before the group commits anyway.
 const RAFT_COMMIT_MAX_LATENCY: Duration = Duration::from_millis(20);
+/// Flush a forming group this soon after the last arrival when nothing new
+/// shows up: mixed pipelines alternate write bursts with read runs (which
+/// wait for the write to commit), so a quiet queue means the burst is over
+/// and waiting longer only adds latency. Dense arrivals never hit this —
+/// each recv returns immediately, reproducing the old full-window behavior.
+const RAFT_COMMIT_IDLE_FLUSH: Duration = Duration::from_millis(4);
 
 /// Commit one batch directly, without the leader coalescing queue.
 ///
