@@ -495,6 +495,9 @@ fn is_pipeline_safe(request: &crate::protocol::Request) -> bool {
     !matches!(
         command.as_ref(),
         b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"SENTINEL" | b"INFO"
+        // Lua executes on the leader through the ordered path's handler;
+        // the parallel staging has no branch for it.
+        | b"EVAL" | b"EVALSHA" | b"SCRIPT"
     ) && !connection_command_names()
         .iter()
         .any(|name| command.eq_ignore_ascii_case(name))
@@ -1089,6 +1092,19 @@ async fn write_frame(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lua_commands_stay_on_the_ordered_path() {
+        // The parallel pipeline staging has no branch for Lua; if these
+        // routed there, EVAL would surface as "unknown command" (regression
+        // found by the three-way capability probe, 2026-10-19).
+        for name in ["EVAL", "EVALSHA", "SCRIPT"] {
+            let request = crate::protocol::Request::Command(vec![bytes::Bytes::copy_from_slice(
+                name.as_bytes(),
+            )]);
+            assert!(!is_pipeline_safe(&request), "{name} must be ordered-path");
+        }
+    }
+
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::time::Duration;
