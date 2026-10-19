@@ -9,6 +9,7 @@ rust-version.workspace = true
 bytes.workspace = true
 bincode.workspace = true
 bincode2.workspace = true
+futures-util.workspace = true
 openraft.workspace = true
 raft-engine.workspace = true
 rustls.workspace = true

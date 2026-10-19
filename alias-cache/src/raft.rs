@@ -7,10 +7,13 @@ use crate::state_machine::{
     is_replicated_write,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
+use openraft::entry::RaftEntry;
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, StreamAppendResult, VoteRequest,
+    VoteResponse,
 };
 use openraft::storage::{
     EntryResponder, IOFlushed, LogState, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine,
@@ -150,6 +153,11 @@ pub enum NetworkResponse {
 
 pub const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const CLIENT_BATCH_MAX_ITEMS: usize = 1_024;
+
+/// How many AppendEntries RPCs one replication stream may have in flight.
+/// Four covers ~4 round trips of flight; the sequential fallback this
+/// replaces allowed exactly one.
+const APPEND_PIPELINE_DEPTH: usize = 4;
 pub const CLIENT_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_CHUNK_SIZE: usize = 256 * 1024;
 const NETWORK_MAX_SNAPSHOT_SIZE: u64 = 512 * 1024 * 1024;
@@ -3208,6 +3216,149 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
             option.soft_ttl().as_micros() as u64,
         );
         result
+    }
+
+    /// Pipelined replication over one persistent connection.
+    ///
+    /// The default `stream_append_sequential` sends one AppendEntries and
+    /// waits for its response before the next, so every batch pays a full
+    /// round trip plus a fresh TCP handshake (our `send` connects per
+    /// call), and the follower's WAL syncs never coalesce across batches.
+    /// This implementation opens one connection per replication stream,
+    /// forwards requests as they arrive (bounded in-flight), and reads
+    /// responses in request order — the follower's session loop processes
+    /// frames sequentially, so responses come back ordered.
+    fn stream_append<'s, S>(
+        &'s mut self,
+        input: S,
+        option: RPCOption,
+    ) -> openraft::base::BoxFuture<
+        's,
+        Result<
+            openraft::base::BoxStream<
+                's,
+                Result<StreamAppendResult<TypeConfig>, RPCError<TypeConfig>>,
+            >,
+            RPCError<TypeConfig>,
+        >,
+    >
+    where
+        S: futures_util::Stream<Item = AppendEntriesRequest<TypeConfig>>
+            + OptionalSend
+            + Unpin
+            + 'static,
+    {
+        let source = self.source;
+        let target = self.target;
+        let address = self.address.clone();
+        let control = self.control.clone();
+        let tls_connector = self.tls_connector.clone();
+
+        Box::pin(async move {
+            if control.is_blocked(source, target).await {
+                return Err(RPCError::Unreachable(Unreachable::from_string(format!(
+                    "raft network link {source} -> {target} is blocked"
+                ))));
+            }
+            let soft_ttl = option.soft_ttl();
+            let stream = connect(&address, &option, tls_connector).await?;
+            let (reader, mut writer) = tokio::io::split(stream);
+
+            // (prev, last] per sent request, consumed by the reader in send
+            // order. The bounded channel caps in-flight RPCs so a stalled
+            // follower cannot grow the queue without bound.
+            let (range_tx, range_rx) =
+                tokio::sync::mpsc::channel::<(Option<LogId>, Option<LogId>)>(APPEND_PIPELINE_DEPTH);
+
+            tokio::spawn(async move {
+                let mut input = input;
+                while let Some(request) = input.next().await {
+                    // Partition control stays per-request: an established
+                    // stream must stop the moment its link is blocked.
+                    if control.is_blocked(source, target).await {
+                        break;
+                    }
+                    let prev = request.prev_log_id;
+                    let last = request
+                        .entries
+                        .last()
+                        .map(|entry| entry.log_id())
+                        .or(request.prev_log_id);
+                    let payload = match bincode::serialize(&NetworkRequest::Append(request)) {
+                        Ok(payload) => payload,
+                        Err(_) => break,
+                    };
+                    if payload.len() > NETWORK_MAX_FRAME {
+                        break;
+                    }
+                    let write = async {
+                        writer
+                            .write_all(&(payload.len() as u32).to_be_bytes())
+                            .await?;
+                        writer.write_all(&payload).await?;
+                        writer.flush().await
+                    };
+                    if timeout(soft_ttl, write).await.is_err() {
+                        break;
+                    }
+                    if range_tx.send((prev, last)).await.is_err() {
+                        break;
+                    }
+                }
+                // Dropping range_tx tells the reader the stream is done
+                // once every outstanding response has been consumed.
+            });
+
+            let output = futures_util::stream::unfold(
+                (reader, range_rx, false, soft_ttl, option),
+                |(mut reader, mut range_rx, stopped, soft_ttl, option)| async move {
+                    if stopped {
+                        return None;
+                    }
+                    // Safe to wait on the queue first: a response cannot
+                    // arrive before its request (and range) was sent, and a
+                    // closed empty queue means the writer is done.
+                    let (prev, last) = range_rx.recv().await?;
+                    let started = std::time::Instant::now();
+                    let response = match read_network_response(&mut reader, &option).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            LEADER_APPEND_RPC_METRICS.record(
+                                started.elapsed().as_micros() as u64,
+                                soft_ttl.as_micros() as u64,
+                            );
+                            return None;
+                        }
+                    };
+                    LEADER_APPEND_RPC_METRICS.record(
+                        started.elapsed().as_micros() as u64,
+                        soft_ttl.as_micros() as u64,
+                    );
+                    let NetworkResponse::Append(append) = response else {
+                        return None;
+                    };
+                    match append {
+                        Ok(resp) => {
+                            let stop = match &resp {
+                                AppendEntriesResponse::Success => false,
+                                AppendEntriesResponse::PartialSuccess(matched) => {
+                                    matched.as_ref() != last.as_ref()
+                                }
+                                _ => true,
+                            };
+                            let item = Ok(resp.into_stream_result(prev, last));
+                            Some((item, (reader, range_rx, stop, soft_ttl, option)))
+                        }
+                        Err(error) => {
+                            let item = Err(rpc_response_error(error));
+                            Some((item, (reader, range_rx, true, soft_ttl, option)))
+                        }
+                    }
+                },
+            );
+
+            Ok(Box::pin(output) as openraft::base::BoxStream<'s, _>)
+        })
     }
 
     async fn vote(

@@ -125,6 +125,54 @@ RTT ≈ 组队等待 + prepare + openraft（append→复制→提交→apply）+
 - (iii) **分机基准**：客户端与集群分机部署，量出共享机器剩余的
   本底争用，为 50/50 的归因画上句号。
 
+## 杠杆 (i) 落地：管线化 stream_append（2026-10-19）
+
+### 实现
+
+`TcpNetwork::stream_append` 覆写 openraft 的默认
+`stream_append_sequential`（发一收一）：每个复制流一条持久连接
+（`tokio::io::split` 读写分离），writer 任务按序转发请求（每请求前
+检查 `is_blocked` 保留分区语义；有界通道 `APPEND_PIPELINE_DEPTH=4`
+限制在途），reader 按序读响应并映射 `into_stream_result`
+（PartialSuccess 语义与 sequential 完全一致：matched != last 即终止）。
+读/写均套 `soft_ttl` 超时。`log_id_range()`/`get_partial_success()`
+是 pub(crate)，用公开字段复现（`entries.last().log_id().or(prev_log_id)`、
+直接 match 枚举）。依赖：`futures-util`（workspace 直依赖）。
+
+### 同机同时窗 A/B（新旧二进制交替，30s×3+，512c×p16，全部零错误）
+
+| 负载 | sequential（同窗） | pipelined（同窗） | vs cache-cat 同机 |
+| --- | ---: | ---: | ---: |
+| 纯写 | 156.5-179.2k（中位 163.2k） | **157.7-200.0k（中位 186.9k）** | **101-108%（185k）** |
+| 5/95 | （旧基线 104.9-115.6k） | **117.1-124.9k** | 79%（152.4k） |
+| 50/50 | （旧基线 54.0-59.9k） | **65.2k** | 43-64% |
+
+纯写 5 轮稳定在 187-200k——**3 节点纯写首次追平并超越 cache-cat**。
+
+### 探针证实流式路径生效
+
+- leader RPC 计数从 278/s（串行）→ **~1000/s**（管线），单响应延迟
+  1.67ms → **668µs**（按序响应流，无每 RPC 连接建立）
+- follower 处理耗时不变（564µs/次——单次工作没变，变的是在途密度）
+- over_soft_ttl 46/75254（0.06%）：一次 follower 538ms 快照停顿期间
+  管线吸收了在途请求后重连，吞吐未受影响——流式连接对 follower
+  停顿的韧性优于串行模式
+
+### 修订后的完成标准对照
+
+- 纯写 ≥ cache-cat：**达成**（187-200k vs 185k）
+- 5/95 ≥ 150k：未达（121k，79%）
+- 50/50 ≥ 100k：未达（65.2k，43-64%）
+- 50/50 是最后短板，其构成是读租约 RTT 与写提交轮在闭环里的耦合
+  （每读一次 lease 续约 + 每写一个提交轮），属下一个 plan 的范围
+  （候选：读批次跨连接合租约、50/50 档读写分离调度）。
+
+### 遗留
+
+- LEADER_APPEND_RPC_METRICS 现统计流式单响应延迟（非整往返），
+  语义已注明
+- 自适应组窗（杠杆 ii）与分机基准（杠杆 iii）仍未做
+
 ### 附注
 
 - 本机单节点 ceiling ≥150k（含 20ms 组窗 pacing），距 cache-cat
