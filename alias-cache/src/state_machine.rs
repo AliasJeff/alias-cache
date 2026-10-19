@@ -84,6 +84,12 @@ const WRITES: &[&[u8]] = &[
     b"DEL",
     b"MSET",
     b"INCRBY",
+    b"INCR",
+    b"DECR",
+    b"DECRBY",
+    b"SETEX",
+    b"SETNX",
+    b"APPEND",
     b"HSET",
     b"HMSET",
     b"HSETNX",
@@ -220,6 +226,10 @@ pub enum Operation {
         key: Bytes,
         increment: i64,
     },
+    Append {
+        key: Bytes,
+        suffix: Bytes,
+    },
     BitmapSet {
         key: Bytes,
         offset: u64,
@@ -323,6 +333,7 @@ impl Operation {
             | Self::SortedSetAdd { .. }
             | Self::SortedSetRemove { .. }
             | Self::Increment { .. }
+            | Self::Append { .. }
             | Self::BitmapSet { .. }
             | Self::BitmapOp { .. }
             | Self::BloomReserve { .. }
@@ -360,6 +371,7 @@ impl Operation {
             | Self::SortedSetAdd { .. }
             | Self::SortedSetRemove { .. }
             | Self::Increment { .. }
+            | Self::Append { .. }
             | Self::BitmapSet { .. }
             | Self::BitmapOp { .. }
             | Self::BloomReserve { .. }
@@ -460,6 +472,7 @@ fn incoming_bytes(operation: &Operation) -> u64 {
                     .sum::<u64>()
         }
         Operation::SortedSetIncrement { key, member, .. } => (key.len() + member.len()) as u64,
+        Operation::Append { key, suffix } => (key.len() + suffix.len()) as u64,
         _ => 0,
     }
 }
@@ -579,6 +592,7 @@ impl StateMachine {
             | Operation::Persist { write_time, .. } => Some(*write_time),
             Operation::Set { .. }
             | Operation::MultiSet { .. }
+            | Operation::Append { .. }
             | Operation::HashSet { .. }
             | Operation::HashDelete { .. }
             | Operation::HashSetNx { .. }
@@ -1182,6 +1196,7 @@ impl StateMachine {
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
+            Operation::Append { key, suffix } => self.apply_append(key, suffix),
             Operation::Increment { key, increment } => {
                 const NOT_INTEGER: &str = "ERR value is not an integer or out of range";
                 let existing = self
@@ -1801,6 +1816,50 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"INCRBY") {
             return self.execute_increment(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"INCR") || command.eq_ignore_ascii_case(b"DECR") {
+            let name = if command.eq_ignore_ascii_case(b"DECR") {
+                "DECR"
+            } else {
+                "INCR"
+            };
+            return self.execute_increment_simple(&arguments, name);
+        }
+        if command.eq_ignore_ascii_case(b"DECRBY") {
+            return self.execute_decrby(&arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SETEX") {
+            if arguments.len() != 4 {
+                return Err(Error::protocol(
+                    "ERR wrong number of arguments for 'setex' command",
+                ));
+            }
+            return self.execute_set(vec![
+                Bytes::from_static(b"SET"),
+                arguments[1].clone(),
+                arguments[3].clone(),
+                Bytes::from_static(b"EX"),
+                arguments[2].clone(),
+            ]);
+        }
+        if command.eq_ignore_ascii_case(b"SETNX") {
+            if arguments.len() != 3 {
+                return Err(Error::protocol(
+                    "ERR wrong number of arguments for 'setnx' command",
+                ));
+            }
+            return self.execute_set(vec![
+                Bytes::from_static(b"SET"),
+                arguments[1].clone(),
+                arguments[2].clone(),
+                Bytes::from_static(b"NX"),
+            ]);
+        }
+        if command.eq_ignore_ascii_case(b"APPEND") {
+            return self.execute_append(&arguments);
+        }
+        if command.eq_ignore_ascii_case(b"STRLEN") {
+            return self.execute_strlen(&arguments);
         }
         if command.eq_ignore_ascii_case(b"SETBIT") {
             return self.execute_set_bit(arguments);
@@ -2427,6 +2486,78 @@ impl StateMachine {
             .map_err(|_| Error::protocol(NOT_INTEGER))?
             .parse::<i64>()
             .map_err(|_| Error::protocol(NOT_INTEGER))?;
+        self.prepare_increment(key, increment)
+    }
+
+    /// INCR/DECR: INCRBY with an implicit ±1 step.
+    fn execute_increment_simple(
+        &self,
+        arguments: &[Bytes],
+        name: &str,
+    ) -> Result<(Option<Operation>, Frame)> {
+        let increment: i64 = if name == "DECR" { -1 } else { 1 };
+        expect_arity(name, arguments, 2)?;
+        self.prepare_increment(arguments[1].clone(), increment)
+    }
+
+    /// DECRBY key n: INCRBY with the negated step.
+    fn execute_decrby(&self, arguments: &[Bytes]) -> Result<(Option<Operation>, Frame)> {
+        const NOT_INTEGER: &str = "value is not an integer or out of range";
+        expect_arity("DECRBY", arguments, 3)?;
+        let key = arguments[1].clone();
+        let increment = std::str::from_utf8(&arguments[2])
+            .map_err(|_| Error::protocol(NOT_INTEGER))?
+            .parse::<i64>()
+            .map_err(|_| Error::protocol(NOT_INTEGER))?;
+        self.prepare_increment(key, increment.wrapping_neg())
+    }
+
+    /// APPEND key suffix: read-modify-write must happen at apply time so
+    /// concurrent appends in one batch cannot lose updates; prepare only
+    /// predicts the reply length.
+    fn execute_append(&self, arguments: &[Bytes]) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("APPEND", arguments, 3)?;
+        let key = arguments[1].clone();
+        let suffix = arguments[2].clone();
+        let current_len = match self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry))
+            .map(|entry| &entry.value)
+        {
+            None => 0,
+            Some(Value::String(bytes)) => bytes.len() as u64,
+            Some(_) => return Err(Error::protocol(WRONG_TYPE)),
+        };
+        let operation = Operation::Append {
+            key: key.clone(),
+            suffix: suffix.clone(),
+        };
+        Ok((
+            Some(operation),
+            Frame::Integer((current_len + suffix.len() as u64) as i64),
+        ))
+    }
+
+    /// STRLEN key: the length of the string value, or 0 when missing.
+    fn execute_strlen(&self, arguments: &[Bytes]) -> Result<(Option<Operation>, Frame)> {
+        expect_arity("STRLEN", arguments, 2)?;
+        let key = &arguments[1];
+        let length = match self
+            .values
+            .get(key)
+            .filter(|entry| !self.is_expired(entry))
+            .map(|entry| &entry.value)
+        {
+            None => 0,
+            Some(Value::String(bytes)) => bytes.len() as u64,
+            Some(_) => return Err(Error::protocol(WRONG_TYPE)),
+        };
+        Ok((None, Frame::Integer(length as i64)))
+    }
+
+    fn prepare_increment(&self, key: Bytes, increment: i64) -> Result<(Option<Operation>, Frame)> {
+        const NOT_INTEGER: &str = "value is not an integer or out of range";
         let current = match self
             .values
             .get(&key)
@@ -2447,6 +2578,39 @@ impl StateMachine {
             Some(Operation::Increment { key, increment }),
             Frame::Integer(total),
         ))
+    }
+
+    /// Apply-time APPEND: concatenate and report the combined length.
+    fn apply_append(&mut self, key: Bytes, suffix: Bytes) -> ApplyResult {
+        const WRONG_TYPE: &str =
+            "WRONGTYPE Operation against a key holding the wrong kind of value";
+        let existing = self
+            .values
+            .get(&key)
+            .filter(|entry| !self.is_expired(entry))
+            .cloned();
+        let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+        let mut base = match existing.map(|entry| entry.value) {
+            None => Bytes::new(),
+            Some(Value::String(bytes)) => bytes,
+            Some(_) => {
+                return ApplyResult::Response(Frame::error(WRONG_TYPE));
+            }
+        };
+        let mut combined = Vec::with_capacity(base.len() + suffix.len());
+        combined.extend_from_slice(&base);
+        combined.extend_from_slice(&suffix);
+        base = Bytes::from(combined);
+        let length = base.len() as i64;
+        self.insert_entry(
+            key,
+            Entry {
+                value: Value::String(base),
+                expire_at,
+                version: 0,
+            },
+        );
+        ApplyResult::Response(Frame::Integer(length))
     }
 
     fn execute_bloom_reserve(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -3031,7 +3195,7 @@ impl StateMachine {
     fn execute_scan(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("SCAN", &arguments, 2)?;
         let cursor = parse_scan_cursor(&arguments[1], "SCAN")?;
-        let count = parse_scan_count(&arguments[2..], "SCAN")?;
+        let (count, pattern) = parse_scan_options(&arguments[2..], "SCAN")?;
         let live_keys = self
             .values
             .iter()
@@ -3039,14 +3203,22 @@ impl StateMachine {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let live_count = live_keys.len();
-        let taken: Vec<Frame> = live_keys
-            .into_iter()
-            .skip(cursor)
-            .take(count)
-            .map(Frame::bulk_string)
+        // COUNT bounds how many keys this page EXAMINES (positions in the
+        // live-key snapshot), not how many it returns: MATCH filters the
+        // examined slice and the cursor advances by the examined count, so
+        // an empty page still makes progress exactly like Redis.
+        let start = cursor.min(live_count);
+        let end = (start + count).min(live_count);
+        let taken: Vec<Frame> = live_keys[start..end]
+            .iter()
+            .filter(|key| {
+                pattern
+                    .as_ref()
+                    .is_none_or(|pattern| glob_match(pattern, key))
+            })
+            .map(|key| Frame::bulk_string(key.clone()))
             .collect();
-        let returned = taken.len();
-        Ok((None, scan_reply(cursor, taken, returned, live_count)))
+        Ok((None, scan_reply_page(end, taken, live_count)))
     }
 
     /// Cursor over the deterministic member order of one collection.
@@ -3065,7 +3237,7 @@ impl StateMachine {
         };
         expect_min_arity(name, &arguments, 3)?;
         let cursor = parse_scan_cursor(&arguments[2], name)?;
-        let count = parse_scan_count(&arguments[3..], name)?;
+        let (count, pattern) = parse_scan_options(&arguments[3..], name)?;
         let key = arguments[1].clone();
         let members: Vec<Bytes> = match self.values.get(&key) {
             Some(entry) if !self.is_expired(entry) => match &entry.value {
@@ -3098,8 +3270,15 @@ impl StateMachine {
         };
         let members_total = members.len();
         let mut taken: Vec<Frame> = Vec::new();
-        let mut returned = 0_usize;
+        let mut examined = 0_usize;
         for member in members.into_iter().skip(cursor).take(count) {
+            examined += 1;
+            if pattern
+                .as_ref()
+                .is_some_and(|pattern| !glob_match(pattern, &member))
+            {
+                continue;
+            }
             if value_type == "zset" {
                 let score = self
                     .values
@@ -3114,9 +3293,11 @@ impl StateMachine {
             } else {
                 taken.push(Frame::bulk_string(member));
             }
-            returned += 1;
         }
-        Ok((None, scan_reply(cursor, taken, returned, members_total)))
+        Ok((
+            None,
+            scan_reply_page(cursor + examined, taken, members_total),
+        ))
     }
 
     fn execute_pexpire(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
@@ -3994,9 +4175,11 @@ fn parse_scan_cursor(value: &Bytes, name: &str) -> Result<usize> {
         .map_err(|_| Error::protocol(format!("{name} cursor is not a valid integer")))
 }
 
-/// Decode the optional `COUNT <n>` argument; defaults to 10 like Redis.
-fn parse_scan_count(options: &[Bytes], name: &str) -> Result<usize> {
+/// Decode the optional `COUNT <n>` and `MATCH <pattern>` arguments; COUNT
+/// defaults to 10 like Redis and the options may appear in any order.
+fn parse_scan_options(options: &[Bytes], name: &str) -> Result<(usize, Option<Bytes>)> {
     let mut count = 10;
+    let mut pattern: Option<Bytes> = None;
     let mut index = 0;
     while index < options.len() {
         if options[index].eq_ignore_ascii_case(b"COUNT") {
@@ -4011,13 +4194,123 @@ fn parse_scan_count(options: &[Bytes], name: &str) -> Result<usize> {
                 return Err(Error::protocol(format!("{name} COUNT must be positive")));
             }
             index += 2;
+        } else if options[index].eq_ignore_ascii_case(b"MATCH") {
+            if index + 1 >= options.len() {
+                return Err(Error::protocol(format!("{name} MATCH requires a pattern")));
+            }
+            pattern = Some(options[index + 1].clone());
+            index += 2;
         } else {
             return Err(Error::protocol(format!(
-                "{name} supports only the COUNT option"
+                "{name} supports only the COUNT and MATCH options"
             )));
         }
     }
-    Ok(count)
+    Ok((count, pattern))
+}
+
+/// Redis glob matching: `*` any sequence, `?` any one byte, `[...]` a
+/// character class (leading `^` negates, `a-z` ranges, `\` escapes inside
+/// and outside classes), `\x` a literal byte anywhere else.
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    fn class_matches(class: &[u8], byte: u8) -> bool {
+        let (negated, class) = match class.first() {
+            Some(b'^') => (true, &class[1..]),
+            _ => (false, class),
+        };
+        let mut matched = false;
+        let mut index = 0;
+        while index < class.len() {
+            if class[index] == b'\\' && index + 1 < class.len() {
+                if class[index + 1] == byte {
+                    matched = true;
+                }
+                index += 2;
+            } else if index + 2 < class.len() && class[index + 1] == b'-' {
+                if class[index] <= byte && byte <= class[index + 2] {
+                    matched = true;
+                }
+                index += 3;
+            } else {
+                if class[index] == byte {
+                    matched = true;
+                }
+                index += 1;
+            }
+        }
+        matched != negated
+    }
+
+    fn inner(mut pattern: &[u8], mut text: &[u8]) -> bool {
+        while let Some((&p, rest)) = pattern.split_first() {
+            match p {
+                b'*' => {
+                    // Collapse consecutive stars and try every suffix.
+                    let tail = pattern;
+                    let _ = tail;
+                    pattern = rest;
+                    if pattern.is_empty() {
+                        return true;
+                    }
+                    // Try to match the remainder at each position; use the
+                    // iterative form so long inputs cannot blow the stack on
+                    // pathological `*` nesting.
+                    for offset in 0..=text.len() {
+                        if inner(pattern, &text[offset..]) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                b'?' => {
+                    let Some((&t, t_rest)) = text.split_first() else {
+                        return false;
+                    };
+                    let _ = t;
+                    pattern = rest;
+                    text = t_rest;
+                }
+                b'\\' => {
+                    let Some((&literal, p_rest)) = rest.split_first() else {
+                        return false;
+                    };
+                    let Some((&t, t_rest)) = text.split_first() else {
+                        return false;
+                    };
+                    if literal != t {
+                        return false;
+                    }
+                    pattern = p_rest;
+                    text = t_rest;
+                }
+                b'[' => {
+                    let Some(class_end) = rest.iter().position(|&b| b == b']') else {
+                        return false;
+                    };
+                    let Some((&t, t_rest)) = text.split_first() else {
+                        return false;
+                    };
+                    if !class_matches(&rest[..class_end], t) {
+                        return false;
+                    }
+                    pattern = &rest[class_end + 1..];
+                    text = t_rest;
+                }
+                literal => {
+                    let Some((&t, t_rest)) = text.split_first() else {
+                        return false;
+                    };
+                    if literal != t {
+                        return false;
+                    }
+                    pattern = rest;
+                    text = t_rest;
+                }
+            }
+        }
+        text.is_empty()
+    }
+    inner(pattern, text)
 }
 
 /// Shape a scan reply: the next cursor followed by the returned elements.
@@ -4025,12 +4318,10 @@ fn parse_scan_count(options: &[Bytes], name: &str) -> Result<usize> {
 /// `returned` counts logical members, which is one frame for SCAN/HSCAN/SSCAN
 /// but two frames (member and score) for ZSCAN. The cursor reaches zero once
 /// every member of the snapshot has been visited.
-fn scan_reply(cursor: usize, taken: Vec<Frame>, returned: usize, total: usize) -> Frame {
-    let next = if cursor + returned >= total {
-        0
-    } else {
-        cursor + returned
-    };
+/// `next_cursor` advances by how many entries were EXAMINED (filtered or
+/// not); the scan terminates once every entry has been visited.
+fn scan_reply_page(next_cursor: usize, taken: Vec<Frame>, total: usize) -> Frame {
+    let next = if next_cursor >= total { 0 } else { next_cursor };
     Frame::Array(vec![
         Frame::bulk_string(next.to_string()),
         Frame::Array(taken),
@@ -5758,11 +6049,183 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(wrong_type.contains("WRONGTYPE"));
+        // MATCH filters the page and the cursor still advances over the
+        // whole keyspace (Redis semantics): pages may come back empty while
+        // the cursor progresses, so walk until the cursor reaches zero and
+        // collect every match.
+        let mut cursor = 0_usize;
+        let mut matched: Vec<Frame> = Vec::new();
+        loop {
+            let (next, elements) = scan_parts(
+                state
+                    .execute_request(command(&[
+                        b"SCAN",
+                        &Bytes::from(cursor.to_string().into_bytes()),
+                        b"MATCH",
+                        b"a*",
+                        b"COUNT",
+                        b"2",
+                    ]))
+                    .unwrap()
+                    .1,
+            );
+            matched.extend(elements);
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(matched, vec![Frame::bulk_string("alpha")]);
         let unknown_option = state
-            .execute_request(command(&[b"SCAN", b"0", b"MATCH", b"*"]))
+            .execute_request(command(&[b"SCAN", b"0", b"TYPE", b"string"]))
             .unwrap_err()
             .to_string();
-        assert!(unknown_option.contains("COUNT"));
+        assert!(unknown_option.contains("COUNT and MATCH"));
+    }
+
+    #[test]
+    fn glob_matcher_supports_star_question_and_classes() {
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"ben*", b"benchmark-key-1"));
+        assert!(!glob_match(b"ben*", b"other"));
+        assert!(glob_match(b"key-?", b"key-1"));
+        assert!(!glob_match(b"key-?", b"key-12"));
+        assert!(glob_match(b"[abc]at", b"bat"));
+        assert!(!glob_match(b"[abc]at", b"dat"));
+        assert!(glob_match(b"[a-c]at", b"cat"));
+        assert!(glob_match(b"[^a-c]at", b"dat"));
+        assert!(!glob_match(b"[^a-c]at", b"bat"));
+        assert!(glob_match(b"\\*", b"*"));
+        assert!(!glob_match(b"\\*", b"x"));
+    }
+
+    #[test]
+    fn incr_family_counts_and_type_checks() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state.execute_request(command(&[b"INCR", b"c"])).unwrap().1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"INCR", b"c"])).unwrap().1,
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"DECR", b"c"])).unwrap().1,
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"DECRBY", b"c", b"4"]))
+                .unwrap()
+                .1,
+            Frame::Integer(-3)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"INCRBY", b"c", b"10"]))
+                .unwrap()
+                .1,
+            Frame::Integer(7)
+        );
+        state
+            .execute_request(command(&[b"SET", b"s", b"text"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"INCR", b"s"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("not an integer"));
+        // INCR on an expired key restarts from zero.
+        state
+            .execute_request(command(&[b"SET", b"e", b"5", b"EX", b"1"]))
+            .unwrap();
+        // The logical clock starts at 0: expire_at 0 means already expired.
+        state
+            .values
+            .entry(Bytes::from_static(b"e"))
+            .and_modify(|entry| entry.expire_at = Some(0));
+        assert_eq!(
+            state.execute_request(command(&[b"INCR", b"e"])).unwrap().1,
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn setex_setnx_rewrite_into_set_options() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SETEX", b"k", b"60", b"v"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+        let entry = state.values.get(&Bytes::from_static(b"k")).unwrap();
+        assert!(entry.expire_at.is_some());
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SETNX", b"k", b"other"]))
+                .unwrap()
+                .1,
+            Frame::Null
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"k"])).unwrap().1,
+            Frame::bulk_string("v")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SETNX", b"fresh", b"first"]))
+                .unwrap()
+                .1,
+            Frame::simple_string("OK")
+        );
+    }
+
+    #[test]
+    fn append_grows_strings_and_strlen_reports_length() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"APPEND", b"k", b"hello"]))
+                .unwrap()
+                .1,
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"APPEND", b"k", b" world"]))
+                .unwrap()
+                .1,
+            Frame::Integer(11)
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"GET", b"k"])).unwrap().1,
+            Frame::bulk_string("hello world")
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"STRLEN", b"k"]))
+                .unwrap()
+                .1,
+            Frame::Integer(11)
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"STRLEN", b"missing"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        state
+            .execute_request(command(&[b"RPUSH", b"l", b"x"]))
+            .unwrap();
+        let wrong_type = state
+            .execute_request(command(&[b"APPEND", b"l", b"x"]))
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type.contains("WRONGTYPE"));
     }
 
     /// Split a scan reply into (cursor, elements).
