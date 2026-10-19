@@ -11,6 +11,7 @@ pub mod server;
 pub mod snapshot;
 pub mod state_machine;
 pub mod time;
+pub mod timer_wheel;
 pub mod tls;
 pub mod wal;
 

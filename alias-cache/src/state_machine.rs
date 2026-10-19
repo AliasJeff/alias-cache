@@ -266,10 +266,6 @@ pub enum Operation {
     Delete {
         keys: Vec<Bytes>,
     },
-    DeleteIfExpired {
-        key: Bytes,
-        expire_at: u64,
-    },
     Expire {
         key: Bytes,
         expire_at: u64,
@@ -285,6 +281,13 @@ pub enum Operation {
         write_time: u64,
     },
     AdvanceTime {
+        write_time: u64,
+    },
+    /// Leader-initiated expiry sweep: carries the leader's clock so every
+    /// replica advances deterministically, and the apply unlinks all keys
+    /// whose TTL the wheel reports due. One consensus entry per sweep,
+    /// regardless of how many keys expire.
+    ExpireSweep {
         write_time: u64,
     },
     Transaction {
@@ -315,6 +318,7 @@ impl Operation {
             Self::SetWithExpiration { write_time, .. }
             | Self::Expire { write_time, .. }
             | Self::ExpireSeconds { write_time, .. }
+            | Self::ExpireSweep { write_time }
             | Self::Persist { write_time, .. } => *write_time,
             Self::Set { .. }
             | Self::MultiSet { .. }
@@ -341,8 +345,7 @@ impl Operation {
             | Self::StreamAdd { .. }
             | Self::StreamDelete { .. }
             | Self::StreamTrim { .. }
-            | Self::Delete { .. }
-            | Self::DeleteIfExpired { .. } => 0,
+            | Self::Delete { .. } => 0,
             Self::AdvanceTime { write_time } => *write_time,
             Self::Transaction { write_time, .. } => *write_time,
         }
@@ -379,11 +382,11 @@ impl Operation {
             | Self::StreamAdd { .. }
             | Self::StreamDelete { .. }
             | Self::StreamTrim { .. }
-            | Self::DeleteIfExpired { .. }
             | Self::Expire { .. }
             | Self::ExpireSeconds { .. }
             | Self::Persist { .. }
             | Self::AdvanceTime { .. }
+            | Self::ExpireSweep { .. }
             | Self::Transaction { .. } => &[],
         }
     }
@@ -426,6 +429,13 @@ pub struct StateMachine {
     /// Lowest request_id evicted from the dedup cache; older requests are
     /// treated as cache misses and re-executed.
     client_results_watermark: ClientRequestId,
+    /// Hierarchical timing wheel tracking keys with a TTL. Not replicated:
+    /// expire_at rides inside the replicated entries, so every replica
+    /// rebuilds equivalent timers locally; the wheel only schedules the
+    /// physical unlink (memory reclamation), which reads never observe
+    /// because expiry is enforced lazily on access.
+    #[serde(skip, default)]
+    expiry_wheel: crate::timer_wheel::TimerWheel,
 }
 
 /// New bytes a write operation would charge against max_memory.
@@ -434,7 +444,7 @@ pub struct StateMachine {
 fn incoming_bytes(operation: &Operation) -> u64 {
     match operation {
         Operation::Client { operation, .. } => incoming_bytes(operation),
-        Operation::ClientBatch { .. } => 0,
+        Operation::ClientBatch { .. } | Operation::ExpireSweep { .. } => 0,
         Operation::Transaction { operations, .. } => operations.iter().map(incoming_bytes).sum(),
         Operation::Set { key, value } | Operation::SetWithExpiration { key, value, .. } => {
             (key.len() + value.len()) as u64
@@ -589,7 +599,8 @@ impl StateMachine {
             Operation::SetWithExpiration { write_time, .. }
             | Operation::Expire { write_time, .. }
             | Operation::ExpireSeconds { write_time, .. }
-            | Operation::Persist { write_time, .. } => Some(*write_time),
+            | Operation::Persist { write_time, .. }
+            | Operation::ExpireSweep { write_time } => Some(*write_time),
             Operation::Set { .. }
             | Operation::MultiSet { .. }
             | Operation::Append { .. }
@@ -615,8 +626,7 @@ impl StateMachine {
             | Operation::StreamAdd { .. }
             | Operation::StreamDelete { .. }
             | Operation::StreamTrim { .. }
-            | Operation::Delete { .. }
-            | Operation::DeleteIfExpired { .. } => None,
+            | Operation::Delete { .. } => None,
             Operation::AdvanceTime { write_time } => Some(*write_time),
             Operation::Transaction { write_time, .. } => Some(*write_time),
         };
@@ -1596,15 +1606,6 @@ impl StateMachine {
                 }
                 ApplyResult::Response(Frame::Integer(removed as i64))
             }
-            Operation::DeleteIfExpired { key, expire_at } => {
-                let should_remove = self.values.get(&key).is_some_and(|entry| {
-                    entry.expire_at == Some(expire_at) && self.is_expired(entry)
-                });
-                if should_remove {
-                    let _ = self.remove_entry(&key);
-                }
-                ApplyResult::NoResponse
-            }
             Operation::Expire { key, expire_at, .. } => {
                 let response = if self
                     .values
@@ -1652,6 +1653,10 @@ impl StateMachine {
                     0
                 };
                 ApplyResult::Response(Frame::Integer(response))
+            }
+            Operation::ExpireSweep { .. } => {
+                self.expire_sweep();
+                ApplyResult::NoResponse
             }
             Operation::AdvanceTime { .. } => ApplyResult::NoResponse,
             Operation::Transaction {
@@ -2176,16 +2181,19 @@ impl StateMachine {
         // Version lives inside Entry: on update, carry forward the old
         // version + 1; on insert, start at 1. One HashMap operation covers
         // both value write and version bump (Mocha direct-write model).
-        match self.values.entry(key.clone()) {
+        let new_expire_at = entry.expire_at;
+        let old_expire_at = match self.values.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 let new_version = slot.get().version.wrapping_add(1);
                 let new_size = entry_size(&key, &entry);
+                let old_expire_at = slot.get().expire_at;
                 entry.version = new_version;
                 let old = slot.insert(entry);
                 self.memory_bytes = self
                     .memory_bytes
                     .saturating_sub(entry_size(&key, &old))
                     .saturating_add(new_size);
+                old_expire_at
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
                 entry.version = 1;
@@ -2193,7 +2201,73 @@ impl StateMachine {
                     .memory_bytes
                     .saturating_add(entry_size(slot.key(), &entry));
                 slot.insert(entry);
+                None
             }
+        };
+        // One timer per expiry change: rewrites that keep a TTL (INCR on a
+        // TTL'd counter) do not re-arm, and persisting (expire_at -> None)
+        // leaves the old timer to be discarded by the fire-time guard.
+        if new_expire_at != old_expire_at {
+            self.schedule_expiry(&key, new_expire_at);
+        }
+    }
+
+    /// Arm the expiry wheel for a key whose expiration changed. Timers are
+    /// advisory: the fire-time guard compares the entry's current expire_at,
+    /// so overwrites, persists, and deletes render stale timers harmless.
+    fn schedule_expiry(&mut self, key: &Bytes, expire_at: Option<u64>) {
+        if let Some(expire_at) = expire_at {
+            self.expiry_wheel.insert(key.clone(), expire_at);
+        }
+    }
+
+    /// Whether any tracked TTL is due relative to the logical clock. A peek
+    /// through the wheel — no keyspace scan.
+    pub fn expiration_due(&self) -> bool {
+        self.expiry_wheel
+            .has_due(self.logical_time, |key, expire_at| {
+                self.values
+                    .get(key)
+                    .is_some_and(|entry| entry.expire_at == Some(expire_at))
+            })
+    }
+
+    /// Advance the wheel and unlink every due key. Pure memory reclamation:
+    /// reads already hide logically expired entries, and this runs on every
+    /// replica through the replicated sweep operation.
+    pub fn expire_sweep(&mut self) -> usize {
+        let mut wheel = std::mem::take(&mut self.expiry_wheel);
+        let mut due: Vec<Bytes> = Vec::new();
+        wheel.advance_to(
+            self.logical_time,
+            |key, expire_at| {
+                self.values
+                    .get(key)
+                    .is_some_and(|entry| entry.expire_at == Some(expire_at))
+            },
+            |key, _| due.push(key),
+        );
+        self.expiry_wheel = wheel;
+        let mut unlinked = 0;
+        for key in &due {
+            if self.remove_entry(key) {
+                unlinked += 1;
+            }
+        }
+        unlinked
+    }
+
+    /// Rebuild the wheel from the recovered entries (the wheel itself is
+    /// not serialized).
+    pub fn rebuild_expiry_wheel(&mut self) {
+        self.expiry_wheel.reset(self.logical_time);
+        let timers: Vec<(Bytes, u64)> = self
+            .values
+            .iter()
+            .filter_map(|(key, entry)| entry.expire_at.map(|at| (key.clone(), at)))
+            .collect();
+        for (key, expire_at) in timers {
+            self.expiry_wheel.insert(key, expire_at);
         }
     }
 
@@ -7414,13 +7488,10 @@ mod tests {
             key: Bytes::from_static(b"key"),
             value: Bytes::from_static(b"new"),
         });
-        assert_eq!(
-            state.apply(Operation::DeleteIfExpired {
-                key: Bytes::from_static(b"key"),
-                expire_at: 10,
-            }),
-            ApplyResult::NoResponse
-        );
+        // The wheel's stale timer (expire_at 10) must not unlink the
+        // replaced value: the sweep's fire-time guard compares the entry's
+        // current expire_at and drops the timer instead.
+        state.apply(Operation::ExpireSweep { write_time: 10 });
         assert_eq!(
             state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
             Frame::BulkString(Bytes::from_static(b"new"))
@@ -7441,14 +7512,47 @@ mod tests {
             write_time: 10,
         });
         state.advance_logical_time(20);
-        state.apply(Operation::DeleteIfExpired {
-            key: Bytes::from_static(b"key"),
-            expire_at: 20,
-        });
+        state.apply(Operation::ExpireSweep { write_time: 20 });
         assert_eq!(
             state.execute_request(command(&[b"GET", b"key"])).unwrap().1,
             Frame::BulkString(Bytes::from_static(b"persistent"))
         );
+    }
+
+    #[test]
+    fn expiry_wheel_sweep_unlinks_due_keys_in_one_operation() {
+        let mut state = StateMachine::default();
+        // Ten keys sharing one TTL: a mass-expiration burst.
+        for index in 0..10_u8 {
+            let key = Bytes::from(format!("burst-{index}"));
+            state.apply(Operation::SetWithExpiration {
+                key,
+                value: Bytes::from_static(b"v"),
+                expire_at: Some(100),
+                write_time: 0,
+                only_if_exists: false,
+                only_if_missing: false,
+                keep_ttl: false,
+                return_previous: false,
+            });
+        }
+        state
+            .execute_request(command(&[b"SET", b"survivor", b"v"]))
+            .unwrap();
+        assert!(!state.expiration_due(), "nothing due yet");
+        state.advance_logical_time(100);
+        assert!(state.expiration_due());
+        // ONE replicated operation reclaims every due key.
+        state.apply(Operation::ExpireSweep { write_time: 100 });
+        for index in 0..10_u8 {
+            let key = Bytes::from(format!("burst-{index}"));
+            assert!(
+                !state.values.contains_key(&key),
+                "{key:?} should be unlinked"
+            );
+        }
+        assert!(state.values.contains_key(&Bytes::from_static(b"survivor")));
+        assert!(!state.expiration_due());
     }
 
     #[test]

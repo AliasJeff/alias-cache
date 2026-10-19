@@ -586,6 +586,7 @@ fn decode_snapshot_blob(data: &[u8]) -> io::Result<(StateMachine, Vec<Operation>
         offset += expected_len;
     }
     state.recompute_memory();
+    state.rebuild_expiry_wheel();
     Ok((state, Vec::new()))
 }
 
@@ -1686,24 +1687,23 @@ pub async fn run_expiration_worker(
                 if raft.current_leader().await != Some(node_id) {
                     continue;
                 }
-                let candidates = match raft
+                // O(wheel) due peek — no keyspace scan. Only when something
+                // is due does the leader spend one consensus entry, whose
+                // apply unlinks every due key on every replica.
+                let due = raft
                     .with_state_machine(|state_machine| {
-                        Box::pin(async move { state_machine.state().await.expired_entries() })
+                        Box::pin(async move { state_machine.state().await.expiration_due() })
                     })
                     .await
-                {
-                    Ok(candidates) => candidates,
-                    Err(error) => {
-                        tracing::debug!(node_id, %error, "expiration scan skipped");
-                        continue;
-                    }
+                    .unwrap_or(false);
+                if !due {
+                    continue;
+                }
+                let operation = Operation::ExpireSweep {
+                    write_time: current_time_millis(),
                 };
-                for (key, expire_at) in candidates {
-                    let operation = Operation::DeleteIfExpired { key, expire_at };
-                    if let Err(error) = raft.client_write(RaftRequest::Apply(operation)).await {
-                        tracing::debug!(node_id, %error, "expiration cleanup skipped");
-                        break;
-                    }
+                if let Err(error) = raft.client_write(RaftRequest::Apply(operation)).await {
+                    tracing::debug!(node_id, %error, "expiration sweep skipped");
                 }
             }
             changed = shutdown.changed() => {
@@ -1804,8 +1804,10 @@ impl RaftStateMachine<TypeConfig> for MemStateMachine {
             let _ = state.apply(operation);
         }
         // The memory counter is skipped by serde and must be rebuilt from
-        // the restored data before the node serves anything.
+        // the restored data before the node serves anything; so must the
+        // expiry wheel (also serde-skipped).
         state.recompute_memory();
+        state.rebuild_expiry_wheel();
         // Normalize whatever arrived (envelope or legacy payload) into a
         // clean full base so later envelope builds embed plain payload bytes.
         data = encode_raft_snapshot(&state, Vec::new())?;

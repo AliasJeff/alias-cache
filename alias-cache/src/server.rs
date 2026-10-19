@@ -115,7 +115,7 @@ impl Server {
                 time_worker_raft,
                 node_id,
                 time_worker_shutdown,
-                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(1),
             )
             .await;
         });
@@ -135,7 +135,7 @@ impl Server {
                 expiration_worker_raft,
                 node_id,
                 expiration_worker_shutdown,
-                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(1),
             )
             .await;
         });
