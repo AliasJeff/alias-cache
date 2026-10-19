@@ -1898,6 +1898,56 @@ pub struct CommitRoundMetricsSnapshot {
 
 pub static COMMIT_ROUND_METRICS: CommitRoundMetrics = CommitRoundMetrics::new();
 
+/// Replication RPC probes: client-side (leader → follower `append_entries`
+/// round trips) and follower-side (how long the follower's raft core takes
+/// to handle one AppendEntries). These localize where a slow commit round
+/// trip spends its time: a high over-soft-ttl count means the leader's RPCs
+/// are timing out and triggering replication backoff; high follower times
+/// mean the follower core (apply + append serial section) is the queue.
+pub struct RaftRpcMetrics {
+    calls: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+    over_soft_ttl: AtomicU64,
+}
+
+impl RaftRpcMetrics {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            total_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            over_soft_ttl: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, elapsed_us: u64, soft_ttl_us: u64) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+        if elapsed_us > soft_ttl_us {
+            self.over_soft_ttl.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.calls.load(Ordering::Relaxed),
+            self.total_us.load(Ordering::Relaxed),
+            self.max_us.load(Ordering::Relaxed),
+            self.over_soft_ttl.load(Ordering::Relaxed),
+        )
+    }
+}
+
+static LEADER_APPEND_RPC_METRICS: RaftRpcMetrics = RaftRpcMetrics::new();
+static FOLLOWER_APPEND_METRICS: RaftRpcMetrics = RaftRpcMetrics::new();
+
+/// Read-only handle for the `INFO stats` surface.
+pub fn raft_rpc_metrics() -> (&'static RaftRpcMetrics, &'static RaftRpcMetrics) {
+    (&LEADER_APPEND_RPC_METRICS, &FOLLOWER_APPEND_METRICS)
+}
+
 /// Handle to the leader-side write coalescer.
 ///
 /// Connections hand their batches to one committer task, which drains
@@ -3146,12 +3196,18 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match self.send(NetworkRequest::Append(rpc), &option).await? {
+        let started = std::time::Instant::now();
+        let result = match self.send(NetworkRequest::Append(rpc), &option).await? {
             NetworkResponse::Append(response) => response.map_err(rpc_response_error),
             _ => Err(rpc_response_error(
                 "unexpected raft rpc response".to_string(),
             )),
-        }
+        };
+        LEADER_APPEND_RPC_METRICS.record(
+            started.elapsed().as_micros() as u64,
+            option.soft_ttl().as_micros() as u64,
+        );
+        result
     }
 
     async fn vote(
@@ -3305,11 +3361,16 @@ async fn handle_raft_rpc(
             }
         };
         let response = match request {
-            NetworkRequest::Append(request) => NetworkResponse::Append(
-                raft.append_entries(request)
+            NetworkRequest::Append(request) => {
+                let append_started = std::time::Instant::now();
+                let append_result = raft
+                    .append_entries(request)
                     .await
-                    .map_err(|error| error.to_string()),
-            ),
+                    .map_err(|error| error.to_string());
+                FOLLOWER_APPEND_METRICS
+                    .record(append_started.elapsed().as_micros() as u64, u64::MAX);
+                NetworkResponse::Append(append_result)
+            }
             NetworkRequest::Vote(request) => {
                 NetworkResponse::Vote(raft.vote(request).await.map_err(|error| error.to_string()))
             }

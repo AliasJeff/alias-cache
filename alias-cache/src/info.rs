@@ -320,6 +320,28 @@ pub async fn execute(raft: &RaftHandle, stats: &StatsContext, request: &Request)
                 log_index.saturating_sub(applied_index)
             );
         }
+        // Replication RPC probes: on the leader these are append round trips
+        // to followers (over_soft_ttl counts RPCs slower than openraft's
+        // budget — each one risks a replication backoff); on a follower
+        // these show how long the local raft core takes per AppendEntries.
+        let (leader_rpc, follower_append) = crate::raft::raft_rpc_metrics();
+        let (rpc_calls, rpc_total_us, rpc_max_us, rpc_over) = leader_rpc.snapshot();
+        let _ = writeln!(output, "raft_append_rpc_calls:{rpc_calls}");
+        let _ = writeln!(
+            output,
+            "raft_append_rpc_avg_us:{}",
+            rpc_total_us / rpc_calls.max(1)
+        );
+        let _ = writeln!(output, "raft_append_rpc_max_us:{rpc_max_us}");
+        let _ = writeln!(output, "raft_append_rpc_over_soft_ttl:{rpc_over}");
+        let (f_calls, f_total_us, f_max_us, _) = follower_append.snapshot();
+        let _ = writeln!(output, "follower_append_calls:{f_calls}");
+        let _ = writeln!(
+            output,
+            "follower_append_avg_us:{}",
+            f_total_us / f_calls.max(1)
+        );
+        let _ = writeln!(output, "follower_append_max_us:{f_max_us}");
     }
     if wants("cluster") {
         let _ = writeln!(output, "# Cluster");

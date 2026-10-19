@@ -119,8 +119,31 @@ fn build_config(args: &Args) -> Result<Config> {
     .with_peers(&peers)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Tokio worker count; `ALIAS_CACHE_WORKERS` overrides the default (all
+/// cores) so several nodes can share one machine without every process
+/// spawning a full-width thread pool on top of each other.
+fn worker_threads() -> usize {
+    std::env::var("ALIAS_CACHE_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&workers| workers > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+        })
+}
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .enable_all()
+        .build()
+        .map_err(|error| Error::server(format!("start tokio runtime: {error}")))?;
+    runtime.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
