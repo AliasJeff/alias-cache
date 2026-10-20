@@ -1,208 +1,165 @@
 # alias-cache
 
-一个使用 Rust 实现的 Redis 兼容、基于 Raft 的强一致分布式内存 KV 存储。
+用 Rust 写的 Redis 兼容 KV 存储。单 raft 组强一致复制，线性一致读，
+WAL 用 TiKV 的 raft-engine。
 
-alias-cache 的重点不是复刻全部 Redis 命令，而是用一个足够完整、可验证的工程展示：
+起因很简单：想要一个"写进去就一定在"的缓存。Redis 的主从复制是异步
+的，failover 有丢失窗口；而我也不需要 Redis 那样的命令覆盖面。所以
+这个项目的取舍从一开始就是：**一致性语义优先，命令面够用就好**。
 
-- Redis RESP2/RESP3 协议实现
-- Raft 共识、Leader 选举和成员变更
-- 内存状态机与持久化日志
-- 快照、恢复和落后节点追赶
-- TTL 在复制状态机中的确定性语义
-- 故障切换、网络分区和重启恢复
-- 安全、可观测性、基准测试和可重复构建
-
-项目会逐步扩大功能范围。每次迭代都必须先保证一致性语义、恢复语义和测试质量，再增加 Redis 命令或外围能力。
-
-## 项目定位
-
-alias-cache 适合作为：
-
-- 分布式系统学习项目
-- Rust 后端和存储方向的个人项目
-- Redis 协议、Raft、WAL、快照和故障测试的综合实践
-
-它不是 Redis 的替代品，也不承诺第一阶段兼容全部 Redis 行为。所有兼容性声明都必须由测试和文档支持。
-
-## 目标能力
-
-最终版本计划支持：
-
-- Redis RESP2 和 RESP3
-- 字符串、Hash、List、Set、Sorted Set 等常用数据结构
-- TTL、事务、Pipeline
-- Raft 三节点及以上集群
-- Leader 转发、线性一致读和安全写入
-- WAL、快照、崩溃恢复和落后节点快照安装
-- 基础认证、TLS、管理接口和运行指标
-- Sentinel 风格的主节点发现兼容层
-- 故障注入、数据一致性测试和公开 benchmark
-
-## 非目标
-
-以下内容不作为早期目标：
-
-- 一开始实现全部 Redis 命令
-- 一开始追求极限吞吐量
-- 自研完整 Raft 算法替代成熟实现
-- 为了减少代码量而牺牲恢复测试
-- 在没有一致性测试的情况下宣传“绝不丢数据”
-
-## 文档入口
-
-- [项目章程](docs/00-project-charter.md)
-- [架构设计](docs/architecture.md)
-- [协议与一致性模型](docs/protocol-and-consistency.md)
-- [测试与验证标准](docs/testing-and-validation.md)
-- [开发规范](AGENT.md)
-- [开发计划](plans/README.md)
+它兼容 Redis 协议（RESP2/RESP3），绝大多数 Redis 客户端可以直接连，
+但它不是 Redis，也不打算成为 Redis。下面会说清楚它是什么、能干什么、
+不能干什么。
 
 ## 快速开始
 
 ```bash
 cargo build --release
+./target/release/alias-cache-cli --node-id 1
 ```
 
-单节点模式（自动初始化为单节点集群）：
+另开一个终端：
 
 ```bash
-./target/release/alias-cache-cli --node-id 1
 redis-cli -p 6379 SET hello world
 redis-cli -p 6379 GET hello
 ```
 
-三节点强一致集群（节点 1 种子成员，其余节点以 voter 加入）：
+三节点集群（节点 1 是种子）：
 
 ```bash
-./target/release/alias-cache-cli --node-id 1 --client-addr 127.0.0.1:6379 \
-  --raft-addr 127.0.0.1:16379 --data-dir data/node-1 --bootstrap \
-  --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
-  --peer 2=127.0.0.1:16380/127.0.0.1:6380 \
-  --peer 3=127.0.0.1:16381/127.0.0.1:6381 &
-
-./target/release/alias-cache-cli --node-id 2 --client-addr 127.0.0.1:6380 \
-  --raft-addr 127.0.0.1:16380 --data-dir data/node-2 \
-  --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
-  --peer 2=127.0.0.1:16380/127.0.0.1:6380 \
-  --peer 3=127.0.0.1:16381/127.0.0.1:6381 &
-
-./target/release/alias-cache-cli --node-id 3 --client-addr 127.0.0.1:6381 \
-  --raft-addr 127.0.0.1:16381 --data-dir data/node-3 \
-  --peer 1=127.0.0.1:16379/127.0.0.1:6379 \
-  --peer 2=127.0.0.1:16380/127.0.0.1:6380 \
-  --peer 3=127.0.0.1:16381/127.0.0.1:6381 &
+for i in 1 2 3; do
+  peers=""
+  for j in 1 2 3; do
+    peers="$peers --peer $j=127.0.0.1:1637$j/127.0.0.1:637$j"
+  done
+  extra=""
+  [ "$i" = "1" ] && extra="--bootstrap"
+  ./target/release/alias-cache-cli --node-id $i \
+    --client-addr 127.0.0.1:637$i --raft-addr 127.0.0.1:1637$i \
+    --data-dir data/node-$i --snapshot-policy 65536 $peers $extra &
+done
 ```
 
-行为说明：
+写在任意节点都会转发给 Leader 过多数派；读任意节点默认线性一致
+（follower 读转发 Leader）。杀掉 Leader，剩下的节点会选出新 Leader
+继续服务。`SENTINEL GET-MASTER-ADDR-BY-NAME` 可以发现当前 Leader——
+所以哨兵式接入也能用。
 
-- 写入任意节点都会被透明转发给 Leader 并经多数派提交。
-- 读取任意节点都走 ReadIndex 线性一致读，follower 读会转发到 Leader。
-- 杀掉 Leader 进程后，剩余节点会自动选出新 Leader 并继续接受写入。
-- `SENTINEL GET-MASTER-ADDR-BY-NAME alias-cache` 可发现当前 Leader 地址。
+Docker 的话：
 
-## 当前状态
+```bash
+docker compose up --build --detach
+```
 
-已实现并由测试覆盖（当前 `cargo test --workspace --locked`：核心 crate 158 个测试、
-CLI 9 个、benchmark 3 个测试全部通过）：
+## 能做什么
 
-- RESP2/RESP3：`HELLO 2/3` 协商、Pipeline、MULTI/EXEC/DISCARD 事务
-- 安全：`--password`/`ALIAS_CACHE_PASSWORD` 密码认证（AUTH/HELLO AUTH）、
-  客户端 TLS、Raft 复制 mTLS
-- 确定性状态机：String 类型全套 SET 选项、TTL 家族、INCRBY（i64 溢出保护）
-- Hash/List/Set/Sorted Set：含 HINCRBY、ZINCRBY（f64 score 位模式确定性存储）
-- SCAN/HSCAN/SSCAN/ZSCAN 确定性游标遍历
-- WATCH/UNWATCH 乐观锁：版本随复制状态机，EXEC 时日志内 CAS 校验，
-  检查与写入原子提交、无竞态窗口，被 watch 的 key 变更则事务整体 abort
-- OpenRaft 三节点集群：选举、复制、ReadIndex 线性一致读、Leader 转发
-- Learner 加入/提升/移除、网络分区、旧 Leader 冲突恢复
-- 分块快照传输、快照安装/持久化、落后节点追赶、重启恢复
-- 复制逻辑时钟 TTL：跨节点重放、故障切换、重启后语义一致
-- 可观测：`INFO server|replication|cluster`（term/leader/commit/复制滞后/membership）
-- WAL profiling：`INFO stats` 报告 append 批次与本机 sync_data 次数/耗时
-- 只读 Sentinel 风格主节点发现
-- CLI 配置化（单节点/集群拓扑/种子引导）、Dockerfile + docker-compose 三节点编排
-- 有界 Raft 批量写入口、RESP pipeline 连续写批处理、流式 pwrite 压测模式
-- 自带 `alias-cache-benchmark` 压测工具与基线数据（见 plans/12、plans/13）
+- **协议**：RESP2/RESP3（`HELLO` 协商）、pipeline、inline 命令
+- **数据结构**：String（SET 全选项矩阵：EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET）、
+  Hash、List、Set、Sorted Set、Bitmap（含 BITOP 五种位运算）、
+  Stream（XADD/XRANGE/XDEL/XTRIM，自动 ID 派生自复制逻辑时钟）、
+  Bloom Filter（确定性双 FNV-1a，跨副本一致）
+- **过期**：SET EX/PX、EXPIRE/PEXPIRE/PERSIST；内部用 8 级层级时间轮，
+  10 万个键同时过期只花一条 raft 日志（见下文）
+- **事务**：MULTI/EXEC/DISCARD + WATCH 乐观锁。版本号放在复制状态机里，
+  CAS 校验和写入在同一条日志内原子完成，不存在"检查完被改"的窗口
+- **Lua**：EVAL，leader 执行、结果作为确定性操作复制（副本永不执行脚本）；
+  mlua 沙箱限内存 + 指令中断 + 5s 预算
+- **安全**：密码认证（AUTH/HELLO AUTH）、客户端 TLS、raft 复制 mTLS
+- **运维**：INFO 五段（health/stats/replication/cluster/server）、
+  Sentinel 风格主从发现、`--max-memory` OOM 拒写、`--max-connections`、
+  Dockerfile + docker-compose 三节点编排
 
-可重复的三节点故障切换与恢复 smoke test：
+## 性能
+
+Apple Silicon 10 核笔记本，单机跑 3 节点集群 + 压测客户端。
+512 连接 × pipeline 16，40 万键，16B value，全部零错误。
+
+| 负载 | 吞吐 |
+| --- | ---: |
+| 95% 读 / 5% 写 | ~40 万 ops/s |
+| 50% 读 / 50% 写 | ~17 万 ops/s（连续 6 轮无衰减） |
+| 5% 读 / 95% 写 | ~18 万 ops/s |
+| 纯写 | ~20 万 ops/s |
+| 纯读（线性一致 GET） | ~37 万 ops/s |
+
+读为什么能这么快：默认走租约读（lease read），leader 在租约有效期内
+直接读本地状态机，不付共识往返；租约计时器失效时回退 ReadIndex，
+分区时 fail-closed。所以"快"没有牺牲线性一致性。
+
+写为什么到不了 Redis：每笔写要过 leader 的 raft-engine fsync + 复制到
+两个 follower 的网络往返 + 多数派确认。这是强一致复制的物理代价，
+另一个 Redis 是异步复制，failover 会丢数据——两者承诺的不是同一种东西。
+
+几个值得一提的数字：
+
+- WAL（raft-engine）fsync 均值 ~0.3ms，且不随文件涨到几个 GB 而变慢
+- 10 万个键同一秒过期，回收它们只写 **1 条** raft 日志（8 级层级时间轮
+  做到期发现，apply 期批量 unlink——过期键的物理删除基本不占共识带宽）
+- 增量快照：base + delta 段，快照构建是字节拼接不是全量序列化，
+  崩溃恢复从 16 分钟降到秒级
+
+## 值得一看的实现
+
+- **管线化 raft 复制**：不实现 openraft 默认的"发一条等一条"，每个复制
+  流一条持久连接，4 个在途 AppendEntries 按序应答。仅此一项纯写 +14.5%
+- **提交合批**：leader 把所有连接的 pipeline 写合并成组提交，条数达标、
+  20ms 上限、**队列静默 4ms 提前冲刷**三个条件任一触发。最后一 条是
+  混合负载的关键——读在 pipeline 里必须等前面的写提交（Redis 顺序
+  语义），写突发一停就提前提交，不让读陪等
+- **时间轮过期**：如上。惰性判定保证正确性，时间轮保证发现成本 O(1)
+  摊销，物理 unlink 与共识解耦
+- **增量快照**：base 段 + delta 追加段，compaction 限频重建
+
+## 做不了 / 没做
+
+说实话比装体面重要：
+
+- 单 raft 组，**没有分片**。想要 Redis Cluster 那种水平扩展，这里没有
+- 没有 Pub/Sub、没有 BLPOP 这类阻塞命令、没有 HyperLogLog
+- MULTI 里面只能放"会被复制执行"的写命令，GET 会被拒——事务是单条
+  日志，读不进日志
+- KEYS、RENAME、ZRANGEBYSCORE、GETRANGE/SETRANGE、XREAD 这些还没写
+- SELECT 接受但只有一个库
+- 每条写的 CPU 开销比极简实现高：RESP 解析、幂等去重、内存计费都在
+  热路径上。这是买 WATCH 语义和重试安全的钱
+
+## 测试
+
+```bash
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+181 个测试：命令兼容矩阵、WATCH 竞态、TTL 跨重启、分区 fail-closed、
+旧 Leader 冲突、快照安装、WAL 撕尾恢复、成员变更、时间轮语义。
+存储层跑在 openraft 官方 StorageContract 套件上。
+
+真实三节点故障切换 smoke test（起集群、写数据、杀 Leader、验证新
+Leader、重启旧节点验证追赶）：
 
 ```bash
 python3 scripts/smoke_cluster.py
 ```
 
-脚本会创建临时数据目录，启动三节点集群，写入并读取数据，终止当前
-Leader，验证新 Leader 继续写入，再重启原节点并验证其追赶已提交状态。
-需要 Python 3；脚本只使用标准库，不依赖 Redis 客户端。
-CI 还会通过 `python3 scripts/smoke_compose.py` 对 Docker Compose 部署执行相同的
-Leader 故障切换和重启恢复检查。
-
-复现三节点写入批次/fsync profiling：
+压测工具在仓库里：
 
 ```bash
-cargo build --release --locked
-python3 scripts/profile_batch_writes.py --clients 8 --duration 5
+cargo build --release
+./target/release/alias-cache-benchmark \
+  --address 127.0.0.1:9401 --mode pwrite \
+  --clients 512 --pipeline 16 --key-space 400000 \
+  --value-size 16 --time 30 --write-percent 50
 ```
 
-脚本会创建临时三节点集群，输出 benchmark 结果和每个节点 `INFO stats` 的
-WAL append 批次、`sync_data` 次数及本机耗时差值。
-指标口径及不包含的存储路径见[兼容性与故障模型](docs/compatibility-and-failure-model.md)。
+本文所有数字都出自这个工具，条件如上，笔记本上跑的，换机器别迷信
+绝对值。
 
-Docker Compose 启动三个容器后，宿主机可分别通过 `127.0.0.1:6379`、
-`6380`、`6381` 连接各节点；任一入口都可在其他节点故障后继续使用：
+## 构建
 
-```bash
-docker compose up --build --detach
-redis-cli -p 6380 SET docker-smoke replicated
-redis-cli -p 6381 GET docker-smoke
-docker compose down
-```
-
-单节点基线（Apple Silicon，release，8 客户端 × pipeline 16）：
-PING 103 万 ops/s；线性一致 GET 43.5 万 ops/s（p99 428µs）。
-
-三节点集群（同负载）：线性一致 GET 1.77 万 ops/s（p99 13ms）、
-多数派提交 SET 2,352 ops/s——写入经 group commit 与 pipeline 并发提交
-（相比初版 461 ops/s 提升 5 倍），剩余瓶颈为每批一次的三节点 fsync 往返。
-
-CI 已配置 Linux/macOS/Windows 三平台构建矩阵并上传构建制品。
-
-与 Redis 6.2 的同机对比（同工具同负载，诚实口径）见 plans/12：
-PING 1.44M ops/s（Redis 3.15M 的 46%）；三节点强一致 SET 2,355 ops/s
-对比 Redis 单机 AOF-always 559K ops/s——这是"每笔写入三节点多数派 fsync"
-的可解释代价，两者保证不同层级（Redis 副本为异步复制，failover 有丢失
-窗口）。测试与发布：SET 全选项兼容矩阵、EXPIRE/PEXPIRE 协议边界测试、三处存储
-格式的版本拒绝门禁与迁移策略文档（docs/storage-format-migration.md）、
-CHANGELOG、依赖 SPDX 许可证白名单门禁。
-
-计划 13 的批量写入口、RESP pipeline 批处理和 pwrite 压测模式已实现。
-2026-10-14 定位并修复了合批器响应划分 bug（多连接合并 chunk 的响应未按
-提交者切分——此前多连接 RESP 压测数字含错误帧，已作废并有回归测试）。
-修复后负载噪声环境净测：三节点 SET 8c×128 = 12,897 ops/s（零错误），
-高于 bug 前如实记录的 7,549 基线；单节点 8c×128 = 22,275 ops/s。静默
-环境多轮中位数复测进行中，完成后更新此处（plans/13/16 留档全过程）。
-另一实测结论：线性一致 GET 逐条 quorum barrier，读密集 pipeline 需要读
-簇并行化/租约读优化（plans/16 步骤 6 立项）。
-
-第二阶段扩展已交付（plans/14-15）：Bitmap（SETBIT/GETBIT/BITCOUNT/
-BITPOS/BITOP，String 位寻址）、Bloom Filter（BF.RESERVE/ADD/EXISTS/
-INFO，确定性双重 FNV-1a hash——无盐跨副本一致）、Stream 非阻塞骨干
-（XADD/XLEN/XRANGE/XDEL/XTRIM，自动 ID 派生自复制逻辑时钟——同日志
-重放同 ID 序列）、Lua 脚本（EVAL，leader 执行/结果复制模型：redis.call
-收集为确定性操作进单事务，mlua 沙箱 64MiB 内存上限 + 指令中断钩子 +
-5s 预算 + io/os 移除，副本永不执行脚本）。
-
-性能对等实测（plans/16，同机、对齐 cache-cat 的内部协议测量口径）：
-单节点 raft-direct 32c×512 = **142,316 writes/s**，同机 cache-cat
-pwrite 实测 154,000（差距 8%）；三节点 raft-direct ~30,000 ops/s
-（多数派 fsync + 2× 复制的强一致代价）。剩余方向：增量快照（解耦
-快照 IO 与写吞吐）、脚本缓存（EVALSHA 完整实现）、消费者组。
-
-客户端连接和 Raft 节点间链路均支持 TLS：同时指定 `--tls-cert-file` 和
-`--tls-key-file` 即可启用客户端 TLS listener；额外指定
-`--tls-ca-file --tls-auth-clients` 可要求客户端证书并执行 mTLS 校验。
-集群节点间再指定 `--tls-replication`，Raft RPC 和分块快照会使用独立的双向 TLS
-握手。未指定该参数时，Raft 链路保持明文，便于开发环境和协议测试。
+Rust 1.88（edition 2024）。`--locked` 构建即可复现；Linux/macOS/Windows
+三平台矩阵，Docker 镜像见 `Dockerfile` 与 `docker-compose.yml`。
 
 ## 许可证
 
-Apache-2.0。
+Apache-2.0

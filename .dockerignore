@@ -1,8 +1,6 @@
 target/
 .git/
 data/
-docs/
-plans/
 *.md
 .github/
 *.aof

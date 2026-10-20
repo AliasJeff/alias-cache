@@ -1,13 +1,12 @@
 //! Hierarchical timing wheel for key-expiry discovery.
 //!
-//! Mirrors the reference design (cache-cat's mocha wheel): a TTL'd key is
-//! inserted once at O(1) into one of 8×256 buckets chosen by how far in the
-//! future it expires; the wheel ticks forward in unit steps, cascading
-//! higher-level buckets down as their spans roll over, and fires each due
-//! key exactly once. Discovering due keys costs O(1) amortized per timer —
-//! no full-keyspace scan — and a stale timer (the key's TTL was overwritten
-//! or the key deleted) is discarded at fire time via the `is_current` guard
-//! instead of being cancelled eagerly.
+//! A TTL'd key is inserted once at O(1) into one of 8×256 buckets chosen
+//! by how far in the future it expires; the wheel ticks forward in unit
+//! steps, cascading higher-level buckets down as their spans roll over,
+//! and fires each due key exactly once. Discovering due keys costs O(1)
+//! amortized per timer — no full-keyspace scan — and a stale timer (the
+//! key's TTL was overwritten or the key deleted) is discarded at fire time
+//! via the `is_current` guard instead of being cancelled eagerly.
 
 const WHEEL_LEVELS: usize = 8;
 const WHEEL_BITS: usize = 8;

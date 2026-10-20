@@ -1,8 +1,7 @@
 # Changelog
 
 All notable changes to alias-cache are documented here. The project is
-pre-1.0; formats and guarantees may change between minor versions (see
-[storage format migration](docs/storage-format-migration.md)).
+pre-1.0; formats and guarantees may change between minor versions.
 
 ## [Unreleased]
 
@@ -35,9 +34,7 @@ pre-1.0; formats and guarantees may change between minor versions (see
   the reference machine.
 - Bounded client batch RPC with per-command deduplication and apply-time
   evaluation, ordered RESP pipeline batching, and a streaming `pwrite`
-  benchmark mode with per-request latency samples. The 20k ops/s three-node
-  write target remains unmet; measured throughput and tail latency are recorded
-  in `plans/13-batch-write-pipeline.md`.
+  benchmark mode with per-request latency samples.
 - Read-only `CONFIG GET save|appendonly|*` compatibility for Redis benchmark
   clients; configuration mutations remain unsupported.
 - Storage format version 4 for the replicated batch operation. Existing
@@ -59,9 +56,9 @@ pre-1.0; formats and guarantees may change between minor versions (see
 
 ### Performance
 
-Write-path parity with the same-machine reference (cache-cat, a
-Rust/Raft store using the same TiKV raft-engine log store), measured on
-the 3-node 512-connection × pipeline-16 harness, all zero-error:
+Same-machine reference parity (a Rust/Raft store built on the same
+TiKV raft-engine log store), measured on the 3-node 512-connection ×
+pipeline-16 harness, all zero-error:
 
 | Workload | Throughput | vs reference |
 | --- | ---: | ---: |

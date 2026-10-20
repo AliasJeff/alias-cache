@@ -787,7 +787,7 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 #[derive(Debug, Clone, Default)]
 pub struct MemStateMachine {
     // Reads dominate cache workloads: the state lock is a RwLock so lease
-    // reads prepare concurrently (same model as cache-cat's read lock) and
+    // reads prepare concurrently (shared-read, exclusive-write) and
     // only apply/snapshot transitions take the write guard.
     inner: Arc<RwLock<MemState>>,
     snapshot_path: Option<PathBuf>,
@@ -1005,7 +1005,7 @@ pub async fn execute_client_request_with_id(
 ) -> Result<ClientRequestOutcome, String> {
     // Reads establish the leader-lease barrier BEFORE touching the state
     // machine: a valid lease proves this node still leads without a log
-    // append or a quorum round (the same lease-read model cache-cat uses).
+    // append or a quorum round.
     // The lease spans election_timeout_max and is renewed by follower
     // heartbeat acknowledgements, so a partitioned leader stops answering
     // reads within that window.

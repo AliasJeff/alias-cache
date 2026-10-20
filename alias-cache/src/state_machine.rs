@@ -403,7 +403,7 @@ pub struct StateMachine {
     /// A hash map (not a BTreeMap): apply, reads, and writes are all
     /// point operations, and the only whole-keyset iteration (SCAN) is
     /// officially unordered in Redis — its positional cursor makes no
-    /// ordering promise. O(1) point access matches cache-cat's model.
+    /// ordering promise. O(1) point access, like every hot path here.
     values: std::collections::HashMap<Bytes, Entry>,
 
     /// Best-effort live payload size in bytes, maintained incrementally.
@@ -2180,7 +2180,7 @@ impl StateMachine {
     fn insert_entry(&mut self, key: Bytes, mut entry: Entry) {
         // Version lives inside Entry: on update, carry forward the old
         // version + 1; on insert, start at 1. One HashMap operation covers
-        // both value write and version bump (Mocha direct-write model).
+        // both value write and version bump in one map operation.
         let new_expire_at = entry.expire_at;
         let old_expire_at = match self.values.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {

@@ -1,4 +1,4 @@
-//! Lua scripting (plans/15): leader executes the script once, `redis.call`
+//! Lua scripting: leader executes the script once, `redis.call`
 //! writes are collected as deterministic requests, and the whole sequence
 //! commits as one raft transaction. Replicas replay operations, never
 //! scripts, so script nondeterminism (math.random, os.time) cannot split
