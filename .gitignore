@@ -10,3 +10,4 @@
 *.aof
 *.rdb
 __pycache__/
+.zcodeignore
