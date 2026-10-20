@@ -3,7 +3,7 @@
 All notable changes to alias-cache are documented here. The project is
 pre-1.0; formats and guarantees may change between minor versions.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-20
 
 ### Added
 
