@@ -1,0 +1,1014 @@
+<!doctype html>
+<!--
+  alias-cache project site. Static single file — no build step.
+  Deployed to GitHub Pages by .github/workflows/pages.yml (source: website/).
+  Bilingual (EN/中文) via the data-i18n dictionary at the bottom of the file.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a1120">
+<title>alias-cache — nothing you got an OK for is ever lost</title>
+<meta name="description" content="A Redis-compatible key-value store where every write is committed by a Raft majority before the client sees OK. Linearizable reads at ~372k GETs/s, automatic failover, standard Redis clients.">
+<link rel="canonical" href="https://aliasjeff.github.io/alias-cache/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="alias-cache — nothing you got an OK for is ever lost">
+<meta property="og:description" content="A Redis-compatible key-value store where every write is committed by a Raft majority before it is acknowledged. ~400k ops/s on a 3-node cluster, linearizable reads, standard Redis clients.">
+<meta property="og:url" content="https://aliasjeff.github.io/alias-cache/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1120'/%3E%3Crect x='7' y='7' width='18' height='5' rx='2' fill='%23ffb224'/%3E%3Crect x='7' y='15' width='13' height='5' rx='2' fill='%233ddc97'/%3E%3Crect x='7' y='23' width='8' height='3' rx='1.5' fill='%233ddc97' opacity='.65'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0a1120;
+  --bg-alt:#0d1526;
+  --raised:#121d33;
+  --raised-2:#182540;
+  --line:rgba(126,150,191,.17);
+  --line-strong:rgba(126,150,191,.32);
+  --ink:#edf2fa;
+  --body:#b3bfd2;
+  --muted:#8394ad;
+  --amber:#ffb224;
+  --amber-soft:rgba(255,178,36,.12);
+  --amber-line:rgba(255,178,36,.5);
+  --green:#3ddc97;
+  --green-soft:rgba(61,220,151,.12);
+  --green-line:rgba(61,220,151,.55);
+  --font-display:"Bricolage Grotesque","Noto Sans SC",sans-serif;
+  --font-body:"IBM Plex Sans","Noto Sans SC",system-ui,sans-serif;
+  --font-mono:"IBM Plex Mono","Noto Sans SC",ui-monospace,monospace;
+  --radius:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg);
+  color:var(--body);
+  font:400 16px/1.65 var(--font-body);
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+::selection{background:rgba(255,178,36,.28);color:var(--ink)}
+a{color:inherit}
+img,svg{display:block}
+code,pre{font-family:var(--font-mono)}
+.wrap{max-width:1120px;margin-inline:auto;padding-inline:clamp(20px,4vw,32px)}
+section{scroll-margin-top:82px}
+
+/* ---------- skip link & focus ---------- */
+.skip{position:absolute;left:-9999px;top:0;background:var(--amber);color:#1a1205;padding:10px 16px;border-radius:0 0 10px 0;font-weight:600;z-index:100}
+.skip:focus{left:0}
+:focus-visible{outline:2px solid var(--amber);outline-offset:3px;border-radius:4px}
+
+/* ---------- reveal-on-scroll (JS-enhanced; visible without JS) ---------- */
+.js .reveal{opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
+.js .reveal.in{opacity:1;transform:none}
+
+/* ---------- nav ---------- */
+.nav{
+  position:sticky;top:0;z-index:50;
+  background:rgba(10,17,32,.82);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+}
+.nav-inner{display:flex;align-items:center;gap:22px;height:64px}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);font:600 17px/1 var(--font-display);letter-spacing:-.01em}
+.nav-links{display:flex;gap:4px;margin-left:auto}
+.nav-links a{
+  text-decoration:none;color:var(--body);font-size:14px;font-weight:500;
+  padding:8px 12px;border-radius:8px;
+}
+.nav-links a:hover{color:var(--ink);background:var(--raised)}
+.lang{display:flex;gap:2px;border:1px solid var(--line-strong);border-radius:9px;padding:3px;background:var(--raised)}
+.lang button{font:600 12px/1 var(--font-mono);color:var(--muted);background:none;border:0;border-radius:6px;padding:7px 10px;cursor:pointer}
+.lang button:hover{color:var(--ink)}
+.lang button.active{color:#231703;background:var(--amber)}
+.nav-gh{
+  display:flex;align-items:center;gap:8px;
+  text-decoration:none;color:var(--ink);font-size:14px;font-weight:600;
+  background:var(--raised);border:1px solid var(--line-strong);
+  padding:8px 14px;border-radius:9px;white-space:nowrap;
+}
+.nav-gh:hover{border-color:var(--amber-line);color:var(--amber)}
+@media (max-width:900px){.nav-links{display:none}.lang{margin-left:auto}}
+
+/* ---------- hero ---------- */
+.hero{
+  position:relative;overflow:hidden;
+  padding:clamp(56px,9vw,104px) 0 clamp(48px,7vw,80px);
+}
+.hero::before{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:
+    radial-gradient(900px 480px at 78% -12%,rgba(255,178,36,.09),transparent 62%),
+    radial-gradient(700px 460px at 4% 108%,rgba(61,130,220,.07),transparent 60%);
+}
+.hero-grid{
+  position:relative;display:grid;grid-template-columns:1.05fr .95fr;
+  gap:clamp(36px,5vw,64px);align-items:center;
+}
+.badge-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:22px}
+.pill{
+  font:500 12px/1.4 var(--font-mono);color:var(--muted);
+  border:1px solid var(--line);border-radius:999px;padding:6px 12px;
+  background:rgba(18,29,51,.55);
+}
+.pill.hot{color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)}
+h1{
+  font:700 clamp(38px,5.2vw,62px)/1.06 var(--font-display);
+  color:var(--ink);letter-spacing:-.025em;
+  margin-bottom:20px;
+}
+h1 .ok{color:var(--green);font-family:var(--font-mono);font-weight:600;font-size:.82em}
+.hero-sub{font-size:clamp(16px,1.6vw,18px);max-width:34em;margin-bottom:30px}
+.hero-sub strong{color:var(--ink);font-weight:600}
+.cta-row{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:8px}
+.btn{
+  display:inline-flex;align-items:center;gap:8px;
+  font:600 15px/1 var(--font-body);text-decoration:none;
+  padding:14px 22px;border-radius:11px;
+}
+.btn-primary{background:var(--amber);color:#231703}
+.btn-primary:hover{background:#ffc14d}
+.btn-ghost{border:1px solid var(--line-strong);color:var(--ink)}
+.btn-ghost:hover{border-color:var(--amber-line);color:var(--amber)}
+
+/* stats strip */
+.stats{
+  position:relative;margin-top:clamp(44px,6vw,64px);
+  display:grid;grid-template-columns:repeat(4,1fr);
+  border:1px solid var(--line);border-radius:var(--radius);
+  background:rgba(18,29,51,.5);overflow:hidden;
+}
+.stat{padding:22px 24px;border-left:1px solid var(--line)}
+.stat:first-child{border-left:0}
+.stat-num{font:600 clamp(26px,3vw,36px)/1.1 var(--font-display);color:var(--ink);letter-spacing:-.02em}
+.stat-num .unit{font:500 .5em/1 var(--font-mono);color:var(--muted);margin-left:4px}
+.stat-label{font-size:13px;color:var(--muted);margin-top:6px}
+@media (max-width:900px){
+  .hero-grid{grid-template-columns:1fr}
+  .stats{grid-template-columns:1fr 1fr}
+  .stat:nth-child(3){border-left:0}
+  .stat:nth-child(n+3){border-top:1px solid var(--line)}
+}
+@media (max-width:480px){.stats{grid-template-columns:1fr}.stat{border-left:0;border-top:1px solid var(--line)}.stat:first-child{border-top:0}}
+
+/* ---------- quorum panel (the signature) ---------- */
+.quorum{
+  background:var(--raised);border:1px solid var(--line-strong);
+  border-radius:16px;padding:18px;
+  box-shadow:0 24px 60px -28px rgba(0,0,0,.65);
+}
+.q-head{display:flex;align-items:center;gap:9px;font:500 12px/1.5 var(--font-mono);color:var(--muted);padding:2px 4px 14px}
+.q-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2.2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.3}}
+.q-client{
+  display:flex;align-items:center;gap:8px;
+  font:500 13px/1.4 var(--font-mono);color:var(--ink);
+  background:var(--raised-2);border:1px solid var(--line-strong);
+  border-radius:10px;padding:11px 14px;
+}
+.q-client .prompt{color:var(--amber)}
+.q-client .cmd{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.q-ack{
+  margin-left:auto;color:var(--green);font-weight:600;flex-shrink:0;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.q-ack .meta{color:var(--muted);font-weight:400;font-size:11px}
+.q-link{width:1px;height:16px;background:var(--line-strong);margin-inline:auto}
+.q-nodes{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.q-node{
+  border:1px solid var(--line);border-radius:10px;
+  background:var(--raised-2);padding:10px;
+}
+.q-node.is-leader{border-color:var(--amber-line)}
+.q-node header{font:500 11px/1 var(--font-mono);color:var(--muted);margin-bottom:9px;letter-spacing:.04em}
+.q-node.is-leader header{color:var(--amber)}
+.q-entry{
+  font:500 11px/1 var(--font-mono);text-align:center;
+  border-radius:7px;padding:8px 4px;
+  color:var(--green);background:var(--green-soft);border:1px solid var(--green-line);
+}
+.q-status{position:relative;height:36px;margin-top:12px;font:500 12px/36px var(--font-mono);text-align:center}
+.q-status span{position:absolute;inset:0;border-radius:8px}
+.q-status .repl{color:var(--amber);opacity:0}
+.q-status .done{color:var(--green)}
+.q-caption{font:400 12.5px/1.6 var(--font-body);color:var(--muted);text-align:center;margin-top:12px}
+
+/* quorum animation: base styles are the final COMMITTED state, so with
+   animations disabled (reduced motion) the panel simply reads as committed. */
+@keyframes qe-leader{
+  0%{opacity:0;transform:scale(.85);color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+  5%,46%{opacity:1;transform:scale(1);color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+  52%,90%{opacity:1;transform:scale(1);color:var(--green);background:var(--green-soft);border-color:var(--green-line)}
+  96%,100%{opacity:0;transform:scale(.9);color:var(--green);background:var(--green-soft);border-color:var(--green-line)}
+}
+@keyframes qe-f1{
+  0%,14%{opacity:0;transform:scale(.85);color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+  20%,46%{opacity:1;transform:scale(1);color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+  52%,90%{opacity:1;transform:scale(1);color:var(--green);background:var(--green-soft);border-color:var(--green-line)}
+  96%,100%{opacity:0;transform:scale(.9);color:var(--green);background:var(--green-soft);border-color:var(--green-line)}
+}
+@keyframes qe-f2{
+  0%,26%{opacity:0;transform:scale(.85);color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+  32%,46%{opacity:1;transform:scale(1);color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+  52%,90%{opacity:1;transform:scale(1);color:var(--green);background:var(--green-soft);border-color:var(--green-line)}
+  96%,100%{opacity:0;transform:scale(.9);color:var(--green);background:var(--green-soft);border-color:var(--green-line)}
+}
+@keyframes q-status-repl{0%{opacity:0}8%,46%{opacity:1}52%,100%{opacity:0}}
+@keyframes q-status-done{0%,52%{opacity:0}58%,88%{opacity:1}94%,100%{opacity:0}}
+@keyframes q-ack-in{
+  0%,54%{opacity:0;transform:translateY(3px)}
+  60%,90%{opacity:1;transform:none}
+  96%,100%{opacity:0}
+}
+.qe-leader{animation:qe-leader 7s infinite}
+.qe-f1{animation:qe-f1 7s infinite}
+.qe-f2{animation:qe-f2 7s infinite}
+.q-status .repl{animation:q-status-repl 7s infinite}
+.q-status .done{animation:q-status-done 7s infinite}
+.q-ack{animation:q-ack-in 7s infinite}
+
+/* ---------- sections ---------- */
+.section{padding:clamp(64px,9vw,104px) 0}
+.section.alt{background:var(--bg-alt);border-block:1px solid var(--line)}
+.eyebrow{font:600 12px/1 var(--font-mono);letter-spacing:.2em;text-transform:uppercase;color:var(--amber);margin-bottom:14px}
+h2{
+  font:700 clamp(28px,3.6vw,42px)/1.12 var(--font-display);
+  color:var(--ink);letter-spacing:-.02em;margin-bottom:14px;
+}
+.lede{max-width:44em;font-size:16.5px}
+
+/* why: contrast cards */
+.contrast{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:36px}
+.contrast-card{border:1px solid var(--line);border-radius:var(--radius);padding:26px;background:var(--raised)}
+.contrast-card.fix{border-color:var(--green-line);background:linear-gradient(180deg,rgba(61,220,151,.06),var(--raised))}
+.contrast-card h3{font:600 19px/1.35 var(--font-display);color:var(--ink);margin-bottom:10px;display:flex;gap:10px;align-items:baseline}
+.contrast-card .mark{font:600 14px var(--font-mono)}
+.contrast-card.hole .mark{color:#ff7a7a}
+.contrast-card.fix .mark{color:var(--green)}
+.contrast-card p{font-size:15px}
+@media (max-width:820px){.contrast{grid-template-columns:1fr}}
+
+/* benchmark bars */
+.bench{margin-top:36px;border-top:1px solid var(--line)}
+.bench-group{display:grid;grid-template-columns:220px 1fr;gap:18px;align-items:center;padding:16px 0;border-bottom:1px solid var(--line)}
+.bench-label{font:500 15px/1.45 var(--font-body);color:var(--ink)}
+.bench-bars{display:grid;gap:8px}
+.bench-row{display:grid;grid-template-columns:92px 1fr 96px;gap:12px;align-items:center}
+.bench-sys{font:500 12px/1.3 var(--font-mono);color:var(--muted);text-align:right}
+.bench-row.us .bench-sys{color:var(--amber)}
+.bench-track{background:var(--raised);border:1px solid var(--line);border-radius:7px;height:26px;overflow:hidden}
+.bench-bar{
+  height:100%;border-radius:6px 0 0 6px;
+  background:linear-gradient(90deg,rgba(255,178,36,.5),var(--amber));
+  width:var(--w);
+}
+.bench-bar.redis{background:linear-gradient(90deg,rgba(126,150,191,.35),rgba(126,150,191,.8))}
+.js .bench .bench-bar{width:0;transition:width 1.1s cubic-bezier(.22,.61,.36,1)}
+.js .bench.in .bench-bar{width:var(--w)}
+.bench-val{font:600 13px/1 var(--font-mono);color:var(--ink);white-space:nowrap}
+.bench-env{margin-top:22px}
+.env-col{border:1px solid var(--line);border-radius:var(--radius);background:var(--raised);padding:16px 18px}
+.env-col h4{font:600 12px/1 var(--font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--amber);margin-bottom:8px}
+.env-col p{font-size:13px;color:var(--body)}
+@media (max-width:760px){
+  .bench-group{grid-template-columns:1fr;gap:10px;padding:14px 0}
+  .bench-row{grid-template-columns:78px 1fr 84px;gap:8px}
+  .bench-sys{font-size:11px}
+}
+
+/* features grid */
+.grid-features{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:40px}
+.feature{
+  border:1px solid var(--line);border-radius:var(--radius);
+  background:var(--raised);padding:24px;
+  transition:transform .25s ease,border-color .25s ease;
+}
+.feature:hover{transform:translateY(-3px);border-color:var(--line-strong)}
+.feature-icon{
+  width:42px;height:42px;border-radius:11px;
+  background:var(--amber-soft);border:1px solid var(--amber-line);
+  display:grid;place-items:center;font-size:20px;margin-bottom:16px;
+}
+.feature h3{font:600 17px/1.4 var(--font-display);color:var(--ink);margin-bottom:8px}
+.feature p{font-size:14px}
+.feature code{font-size:12.5px;color:var(--amber)}
+@media (max-width:980px){.grid-features{grid-template-columns:1fr 1fr}}
+@media (max-width:640px){.grid-features{grid-template-columns:1fr}}
+
+/* write path steps */
+.steps{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-top:40px}
+.step{
+  position:relative;border:1px solid var(--line);border-radius:var(--radius);
+  background:var(--raised);padding:22px 18px;
+}
+.step-n{
+  font:600 13px/1 var(--font-mono);color:var(--amber);
+  display:inline-block;margin-bottom:12px;
+  border:1px solid var(--amber-line);border-radius:7px;padding:5px 9px;
+  background:var(--amber-soft);
+}
+.step h3{font:600 15.5px/1.35 var(--font-display);color:var(--ink);margin-bottom:8px}
+.step p{font-size:13.5px}
+.step code{font-size:12px;color:var(--amber)}
+@media (min-width:1024px){
+  .step:not(:last-child)::after{
+    content:"→";position:absolute;right:-15px;top:24px;
+    color:var(--muted);font:600 14px var(--font-mono);z-index:1;
+  }
+}
+@media (max-width:1023px){.steps{grid-template-columns:1fr 1fr}}
+@media (max-width:560px){.steps{grid-template-columns:1fr}}
+
+/* quick start */
+.qs-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:40px}
+.qs-block.wide{grid-column:1/-1}
+.code{
+  border:1px solid var(--line);border-radius:var(--radius);
+  background:#0b1322;overflow:hidden;
+}
+.code-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 16px;border-bottom:1px solid var(--line);
+  background:var(--raised);
+}
+.code-title{font:600 12px/1 var(--font-mono);color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
+.code-copy{
+  font:500 12px/1 var(--font-mono);color:var(--muted);
+  background:none;border:1px solid var(--line-strong);border-radius:7px;
+  padding:6px 11px;cursor:pointer;
+}
+.code-copy:hover{color:var(--amber);border-color:var(--amber-line)}
+.code-copy.copied{color:var(--green);border-color:var(--green-line)}
+.code pre{padding:16px;overflow-x:auto;font-size:13px;line-height:1.7;color:#d7e0ee}
+.code .cmt{color:var(--muted)}
+.code .str{color:var(--green)}
+.qs-note{font-size:13.5px;color:var(--muted);margin-top:12px}
+.qs-note code{color:var(--body);font-size:12.5px}
+.qs-note a{color:var(--amber)}
+@media (max-width:820px){.qs-grid{grid-template-columns:1fr}}
+
+/* footer */
+footer{border-top:1px solid var(--line);padding:48px 0 40px;background:var(--bg-alt)}
+.foot-grid{display:flex;justify-content:space-between;gap:32px;flex-wrap:wrap}
+.foot-brand{max-width:340px}
+.foot-brand .brand{margin-bottom:12px}
+.foot-brand p{font-size:14px;color:var(--muted)}
+.foot-links{display:flex;gap:40px}
+.foot-links h4{font:600 12px/1 var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+.foot-links ul{list-style:none;display:grid;gap:9px}
+.foot-links a{color:var(--body);text-decoration:none;font-size:14px}
+.foot-links a:hover{color:var(--amber)}
+.foot-base{
+  display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;
+  margin-top:40px;padding-top:22px;border-top:1px solid var(--line);
+  font-size:13px;color:var(--muted);
+}
+.foot-base a{color:var(--muted)}
+.foot-base a:hover{color:var(--amber)}
+@media (max-width:720px){.foot-grid{flex-direction:column}}
+
+/* ---------- reduced motion: show final states, stop all motion ---------- */
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .js .reveal{opacity:1;transform:none}
+  .js .bench .bench-bar{width:var(--w)}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top" aria-label="alias-cache home">
+      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#121d33"/><rect x="7" y="7" width="18" height="5" rx="2" fill="#ffb224"/><rect x="7" y="15" width="13" height="5" rx="2" fill="#3ddc97"/><rect x="7" y="23" width="8" height="3" rx="1.5" fill="#3ddc97" opacity=".65"/></svg>
+      alias-cache
+    </a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#why" data-i18n="nav.why">Why</a>
+      <a href="#performance" data-i18n="nav.perf">Performance</a>
+      <a href="#features" data-i18n="nav.features">Features</a>
+      <a href="#write-path" data-i18n="nav.writepath">Write path</a>
+      <a href="#quick-start" data-i18n="nav.quickstart">Quick start</a>
+    </nav>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-lang-btn="en">EN</button>
+      <button type="button" data-lang-btn="zh">中文</button>
+    </div>
+    <a class="nav-gh" href="https://github.com/AliasJeff/alias-cache" target="_blank" rel="noopener">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      GitHub
+    </a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ============================== HERO ============================== -->
+  <section class="hero" id="top">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <div class="badge-row">
+            <span class="pill hot" data-i18n="hero.badge">⚡ Every write committed by a Raft majority</span>
+            <span class="pill">RESP2 · RESP3</span>
+            <span class="pill">Apache-2.0</span>
+            <span class="pill">Rust</span>
+          </div>
+          <h1 data-i18n="hero.h1">Nothing you got an <span class="ok">OK</span> for is ever&nbsp;lost.</h1>
+          <p class="hero-sub" data-i18n="hero.sub">
+            <strong>alias-cache</strong> is a Redis-compatible key-value store where your data
+            doesn't disappear. Every write is replicated to a Raft majority before the client gets
+            its <code>OK</code>, so a crashed leader or a network partition can't quietly drop data
+            you were told was written. It speaks RESP2 and RESP3, so the Redis clients you already
+            use connect without changes.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="https://github.com/AliasJeff/alias-cache" target="_blank" rel="noopener"><span data-i18n="hero.cta1">View on GitHub</span>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 3v2H4v8h8v-2h2v4H2V3h4zm5-3h5v5h-2V3.41L8.41 9 7 7.59 12.59 2H11V0z"/></svg>
+            </a>
+            <a class="btn btn-ghost" href="#quick-start" data-i18n="hero.cta2">Quick start ↓</a>
+          </div>
+        </div>
+
+        <!-- Signature: the quorum-commit loop. Writes turn green (committed)
+             on a majority before the client's OK lights up. -->
+        <div class="quorum" role="img" aria-label="Animation: a SET command is appended on the leader, replicated to two followers, committed by majority, and only then acknowledged to the client.">
+          <div class="q-head"><span class="q-dot"></span><span data-i18n="q.head">cluster · n=3 · writes commit on a majority</span></div>
+          <div class="q-client">
+            <span class="prompt">$</span>
+            <span class="cmd">SET cart:42 "item-7"</span>
+            <span class="q-ack">OK <span class="meta" data-i18n="q.ackmeta">committed 2/3</span></span>
+          </div>
+          <div class="q-link"></div>
+          <div class="q-nodes">
+            <div class="q-node is-leader">
+              <header>node-1 · leader</header>
+              <div class="q-entry qe-leader">log 128</div>
+            </div>
+            <div class="q-node">
+              <header>node-2</header>
+              <div class="q-entry qe-f1">log 128</div>
+            </div>
+            <div class="q-node">
+              <header>node-3</header>
+              <div class="q-entry qe-f2">log 128</div>
+            </div>
+          </div>
+          <div class="q-status">
+            <span class="repl" data-i18n="q.status.repl">replicating entry 128 to followers…</span>
+            <span class="done" data-i18n="q.status.done">✓ committed on 2/3, ack sent to client</span>
+          </div>
+          <p class="q-caption" data-i18n="q.caption">Append → replicate → commit on a majority → ack. Every write takes this path.</p>
+        </div>
+      </div>
+
+      <div class="stats" aria-label="Key numbers">
+        <div class="stat">
+          <div class="stat-num"><span data-count="739194">739,194</span><span class="unit">ops/s</span></div>
+          <div class="stat-label" data-i18n="stat1.label">95% reads / 5% writes, 3-node cluster</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num"><span data-count="372000">372,000</span><span class="unit">GETs/s</span></div>
+          <div class="stat-label" data-i18n="stat2.label">linearizable reads</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num">&lt;1<span class="unit">s</span></div>
+          <div class="stat-label" data-i18n="stat3.label">automatic leader failover</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num">0</div>
+          <div class="stat-label" data-i18n="stat4.label">acknowledged writes lost</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== WHY ============================== -->
+  <section class="section" id="why">
+    <div class="wrap">
+      <div class="reveal">
+        <p class="eyebrow" data-i18n="why.eyebrow">Why alias-cache</p>
+        <h2 data-i18n="why.h2">Why not just run Redis with replicas?</h2>
+        <p class="lede" data-i18n="why.lede">
+          Because Redis replication is asynchronous: the leader answers the client before the
+          replicas have the write. If the leader dies in that window, the failover promotes a
+          replica that never saw writes the client was already told succeeded.
+        </p>
+      </div>
+      <div class="contrast">
+        <div class="contrast-card hole reveal">
+          <h3 data-i18n="why.card1.title"><span class="mark">✗</span> Redis with async replicas</h3>
+          <p data-i18n="why.card1.body">
+            The leader sends <code>OK</code> first and replicates after. When it dies in between,
+            the new leader doesn't have the write, and the data the client was told about is gone.
+          </p>
+        </div>
+        <div class="contrast-card fix reveal">
+          <h3 data-i18n="why.card2.title"><span class="mark">✓</span> alias-cache with Raft</h3>
+          <p data-i18n="why.card2.body">
+            The write is committed on a majority first; the <code>OK</code> goes out second. A
+            failover promotes a replica that already holds every acknowledged write, so nothing
+            comes back missing.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== PERFORMANCE ============================== -->
+  <section class="section alt" id="performance">
+    <div class="wrap">
+      <div class="reveal">
+        <p class="eyebrow" data-i18n="perf.eyebrow">Performance</p>
+        <h2 data-i18n="perf.h2">Three nodes sustain 739,194 ops/s with majority replication on</h2>
+        <p class="lede" data-i18n="perf.lede">
+          All alias-cache numbers come from the benchmark tool in this repo: 512 connections,
+          400k keys, and zero errors in every run. Numbers for the other five systems are reused
+          from a published YCSB benchmark; the card under the chart says where they come from.
+        </p>
+      </div>
+
+      <div class="bench reveal" aria-label="Throughput by workload, alias-cache compared with published numbers for Redis, ZooKeeper, etcd, TiKV and Consul">
+        <div class="bench-group">
+          <div class="bench-label" data-i18n="perf.g1">50% reads / 50% writes</div>
+          <div class="bench-bars">
+            <div class="bench-row us"><span class="bench-sys">alias-cache</span><div class="bench-track"><div class="bench-bar" style="--w:58%"></div></div><span class="bench-val">429,120</span></div>
+            <div class="bench-row"><span class="bench-sys">Redis</span><div class="bench-track"><div class="bench-bar redis" style="--w:44%"></div></div><span class="bench-val">324,002</span></div>
+            <div class="bench-row"><span class="bench-sys">ZooKeeper</span><div class="bench-track"><div class="bench-bar redis" style="--w:6%"></div></div><span class="bench-val">47,073</span></div>
+            <div class="bench-row"><span class="bench-sys">etcd</span><div class="bench-track"><div class="bench-bar redis" style="--w:4%"></div></div><span class="bench-val">31,262</span></div>
+            <div class="bench-row"><span class="bench-sys">TiKV</span><div class="bench-track"><div class="bench-bar redis" style="--w:3%"></div></div><span class="bench-val">23,239</span></div>
+            <div class="bench-row"><span class="bench-sys">Consul</span><div class="bench-track"><div class="bench-bar redis" style="--w:2%"></div></div><span class="bench-val">15,527</span></div>
+          </div>
+        </div>
+        <div class="bench-group">
+          <div class="bench-label" data-i18n="perf.g2">95% reads / 5% writes</div>
+          <div class="bench-bars">
+            <div class="bench-row us"><span class="bench-sys">alias-cache</span><div class="bench-track"><div class="bench-bar" style="--w:100%"></div></div><span class="bench-val">739,194</span></div>
+            <div class="bench-row"><span class="bench-sys">Redis</span><div class="bench-track"><div class="bench-bar redis" style="--w:47%"></div></div><span class="bench-val">347,560</span></div>
+            <div class="bench-row"><span class="bench-sys">ZooKeeper</span><div class="bench-track"><div class="bench-bar redis" style="--w:15%"></div></div><span class="bench-val">114,542</span></div>
+            <div class="bench-row"><span class="bench-sys">etcd</span><div class="bench-track"><div class="bench-bar redis" style="--w:24%"></div></div><span class="bench-val">178,900</span></div>
+            <div class="bench-row"><span class="bench-sys">TiKV</span><div class="bench-track"><div class="bench-bar redis" style="--w:16%"></div></div><span class="bench-val">116,930</span></div>
+            <div class="bench-row"><span class="bench-sys">Consul</span><div class="bench-track"><div class="bench-bar redis" style="--w:15%"></div></div><span class="bench-val">107,458</span></div>
+          </div>
+        </div>
+        <div class="bench-group">
+          <div class="bench-label" data-i18n="perf.g3">5% reads / 95% writes</div>
+          <div class="bench-bars">
+            <div class="bench-row us"><span class="bench-sys">alias-cache</span><div class="bench-track"><div class="bench-bar" style="--w:43%"></div></div><span class="bench-val">319,639</span></div>
+            <div class="bench-row"><span class="bench-sys">Redis</span><div class="bench-track"><div class="bench-bar redis" style="--w:44%"></div></div><span class="bench-val">323,488</span></div>
+            <div class="bench-row"><span class="bench-sys">ZooKeeper</span><div class="bench-track"><div class="bench-bar redis" style="--w:4%"></div></div><span class="bench-val">30,625</span></div>
+            <div class="bench-row"><span class="bench-sys">etcd</span><div class="bench-track"><div class="bench-bar redis" style="--w:2%"></div></div><span class="bench-val">15,686</span></div>
+            <div class="bench-row"><span class="bench-sys">TiKV</span><div class="bench-track"><div class="bench-bar redis" style="--w:2%"></div></div><span class="bench-val">12,576</span></div>
+            <div class="bench-row"><span class="bench-sys">Consul</span><div class="bench-track"><div class="bench-bar redis" style="--w:1%"></div></div><span class="bench-val">7,933</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-env reveal">
+        <div class="env-col">
+          <h4 data-i18n="env.title">Test environment</h4>
+          <p data-i18n="env.body">Reused from the published YCSB run: AMD 9950X3D, 64&nbsp;GB DDR5, Kingston SNV2S2000G NVMe, EXT4/Linux, 512 threads, 3 nodes, snapshots off during the run, 100-byte values. Redis ran in Sentinel mode.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== FEATURES ============================== -->
+  <section class="section" id="features">
+    <div class="wrap">
+      <div class="reveal">
+        <p class="eyebrow" data-i18n="feat.eyebrow">Features</p>
+        <h2 data-i18n="feat.h2">What you get</h2>
+        <p class="lede" data-i18n="feat.lede">The data types and commands most Redis applications use, backed by majority replication.</p>
+      </div>
+      <div class="grid-features">
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">🛡️</div>
+          <h3 data-i18n="feat1.title">Durability that survives failover</h3>
+          <p data-i18n="feat1.body">Every acknowledged write is on a Raft quorum. Leader death, network partitions, node restarts: nothing acknowledged is lost.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">📖</div>
+          <h3 data-i18n="feat2.title">Linearizable reads at scale</h3>
+          <p data-i18n="feat2.body">Lease-based reads serve straight from the leader's state machine at ~372k GETs/s, falling back to ReadIndex with fail-closed semantics under partitions.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">🔌</div>
+          <h3 data-i18n="feat3.title">Works with standard Redis clients</h3>
+          <p data-i18n="feat3.body">Full <code>RESP2</code> / <code>RESP3</code>: pipelines, inline commands, <code>HELLO</code> negotiation. Standard clients connect without modification.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">🧱</div>
+          <h3 data-i18n="feat4.title">Rich data types</h3>
+          <p data-i18n="feat4.body">Strings with the full <code>SET</code> option matrix, Hash, List, Set, Sorted Set, Bitmap including <code>BITOP</code>, Streams, and Bloom filters with deterministic cross-replica hashing.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">🔒</div>
+          <h3 data-i18n="feat5.title">Transactions without races</h3>
+          <p data-i18n="feat5.body"><code>MULTI</code>/<code>EXEC</code> with <code>WATCH</code>: the CAS check and the writes commit in the same log entry — no check-then-write window on any replica.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">📜</div>
+          <h3 data-i18n="feat6.title">Sandboxed Lua scripting</h3>
+          <p data-i18n="feat6.body"><code>EVAL</code> runs on the leader with a memory cap and an instruction budget, and only the deterministic result is replicated.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">⏱️</div>
+          <h3 data-i18n="feat7.title">Timing-wheel TTL</h3>
+          <p data-i18n="feat7.body">A hierarchical timing wheel tracks every TTL'd key with <code>O(1)</code> amortized discovery; mass expiration is reclaimed in one log entry, not one per key.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">⚡</div>
+          <h3 data-i18n="feat8.title">Fast crash recovery</h3>
+          <p data-i18n="feat8.body">Incremental snapshots — a durable base plus delta segments — bring a restarted node back in seconds, not minutes.</p>
+        </div>
+        <div class="feature reveal">
+          <div class="feature-icon" aria-hidden="true">🧰</div>
+          <h3 data-i18n="feat9.title">Security &amp; operations</h3>
+          <p data-i18n="feat9.body">Password auth, client TLS, mTLS for replication traffic, max-memory and max-connection limits, five-section <code>INFO</code>, Sentinel-style discovery, and idempotent retries via client request IDs.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== WRITE PATH ============================== -->
+  <section class="section alt" id="write-path">
+    <div class="wrap">
+      <div class="reveal">
+        <p class="eyebrow" data-i18n="wp.eyebrow">The write path</p>
+        <h2 data-i18n="wp.h2">How it stays fast</h2>
+        <p class="lede" data-i18n="wp.lede">The implementation details behind the numbers above — what the leader does with every write, stage by stage.</p>
+      </div>
+      <div class="steps">
+        <div class="step reveal">
+          <span class="step-n">1</span>
+          <h3 data-i18n="wp1.title">Pipelining</h3>
+          <p data-i18n="wp1.body">Commands arrive in pipelines, so a connection keeps many requests in flight instead of waiting on each reply.</p>
+        </div>
+        <div class="step reveal">
+          <span class="step-n">2</span>
+          <h3 data-i18n="wp2.title">Group commit</h3>
+          <p data-i18n="wp2.body">The leader merges writes from many connections into one batched commit. When traffic goes quiet, the batch flushes early so reads aren't stuck behind it.</p>
+        </div>
+        <div class="step reveal">
+          <span class="step-n">3</span>
+          <h3 data-i18n="wp3.title">raft-engine WAL</h3>
+          <p data-i18n="wp3.body">The write-ahead log is TiKV's <code>raft-engine</code> with group-commit fsync. Throughput doesn't decay as the log grows.</p>
+        </div>
+        <div class="step reveal">
+          <span class="step-n">4</span>
+          <h3 data-i18n="wp4.title">Pipelined replication</h3>
+          <p data-i18n="wp4.body">Each follower link is one persistent connection with a bounded number of appends in flight and in-order replies, not one round trip at a time.</p>
+        </div>
+        <div class="step reveal">
+          <span class="step-n">5</span>
+          <h3 data-i18n="wp5.title">Commit, then ack</h3>
+          <p data-i18n="wp5.body">Once a majority has the entry, the client gets its <code>OK</code>. Incremental snapshots bring a restarted node back in seconds.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== QUICK START ============================== -->
+  <section class="section" id="quick-start">
+    <div class="wrap">
+      <div class="reveal">
+        <h2 data-i18n="qs.h2">Quick start</h2>
+      </div>
+      <div class="qs-grid">
+        <div class="code reveal">
+          <div class="code-head">
+            <span class="code-title" data-i18n="qs.t1">1 · Single node</span>
+            <button class="code-copy" type="button" data-copy="#code-single">Copy</button>
+          </div>
+<pre id="code-single"><code>cargo build --release
+./target/release/alias-cache-cli --node-id 1
+
+<span class="cmt" data-i18n="qs.single.cmt"># any Redis client works — RESP2 and RESP3</span>
+redis-cli -p 6379 SET hello <span class="str">world</span>
+redis-cli -p 6379 GET hello</code></pre>
+        </div>
+        <div class="code reveal">
+          <div class="code-head">
+            <span class="code-title" data-i18n="qs.t2">2 · Docker, 3-node cluster</span>
+            <button class="code-copy" type="button" data-copy="#code-docker">Copy</button>
+          </div>
+<pre id="code-docker"><code>docker compose up --build --detach</code></pre>
+          <p class="qs-note" style="padding:14px 16px" data-i18n="qs.note1">
+            Or wire three nodes by hand for automatic failover — the exact commands are in the
+            <a href="https://github.com/AliasJeff/alias-cache#quick-start" target="_blank" rel="noopener">README</a>.
+          </p>
+        </div>
+        <div class="code wide reveal">
+          <div class="code-head">
+            <span class="code-title" data-i18n="qs.t3">Verify it yourself</span>
+            <button class="code-copy" type="button" data-copy="#code-verify">Copy</button>
+          </div>
+<pre id="code-verify"><code>cargo test --workspace --locked      <span class="cmt" data-i18n="qs.verify.cmt1"># 181 tests, incl. OpenRaft's storage contract suite</span>
+python3 scripts/smoke_cluster.py     <span class="cmt" data-i18n="qs.verify.cmt2"># real 3-node failover: kill the leader, watch recovery</span></code></pre>
+          <p class="qs-note" style="padding:14px 16px" data-i18n="qs.binaries">
+            Prefer binaries? Prebuilt <code>linux-amd64</code> / <code>linux-arm64</code> / <code>darwin-arm64</code> / <code>darwin-x64</code>
+            builds are on the <a href="https://github.com/AliasJeff/alias-cache/releases" target="_blank" rel="noopener">Releases</a> page.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============================== FOOTER ============================== -->
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="#top">
+          <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#121d33"/><rect x="7" y="7" width="18" height="5" rx="2" fill="#ffb224"/><rect x="7" y="15" width="13" height="5" rx="2" fill="#3ddc97"/><rect x="7" y="23" width="8" height="3" rx="1.5" fill="#3ddc97" opacity=".65"/></svg>
+          alias-cache
+        </a>
+        <p data-i18n="foot.blurb">A Redis-compatible key-value store where your data doesn't disappear.</p>
+      </div>
+      <div class="foot-links">
+        <div>
+          <h4 data-i18n="foot.proj">Project</h4>
+          <ul>
+            <li><a href="https://github.com/AliasJeff/alias-cache" target="_blank" rel="noopener">GitHub</a></li>
+            <li><a href="https://github.com/AliasJeff/alias-cache/blob/main/README.md" target="_blank" rel="noopener">README</a></li>
+            <li><a href="https://github.com/AliasJeff/alias-cache/releases" target="_blank" rel="noopener">Releases</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4 data-i18n="foot.page">On this page</h4>
+          <ul>
+            <li><a href="#performance" data-i18n="foot.perf">Performance</a></li>
+            <li><a href="#features" data-i18n="foot.feat">Features</a></li>
+            <li><a href="#quick-start" data-i18n="foot.qs">Quick start</a></li>
+            <li><a href="#top" data-i18n="foot.top">Back to top ↑</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="foot-base">
+      <span>© 2026 alias-cache · Apache-2.0</span>
+      <span data-i18n="foot.base2">Built on OpenRaft and TiKV raft-engine.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+document.documentElement.classList.add('js');
+
+// ---------- i18n ----------
+const I18N = {
+en: {
+  "meta.title": `alias-cache — nothing you got an OK for is ever lost`,
+  "nav.why": `Why`,
+  "nav.perf": `Performance`,
+  "nav.features": `Features`,
+  "nav.writepath": `Write path`,
+  "nav.quickstart": `Quick start`,
+  "hero.badge": `⚡ Every write committed by a Raft majority`,
+  "hero.h1": `Nothing you got an <span class="ok">OK</span> for is ever&nbsp;lost.`,
+  "hero.sub": `<strong>alias-cache</strong> is a Redis-compatible key-value store where your data doesn't disappear. Every write is replicated to a Raft majority before the client gets its <code>OK</code>, so a crashed leader or a network partition can't quietly drop data you were told was written. It speaks RESP2 and RESP3, so the Redis clients you already use connect without changes.`,
+  "hero.cta1": `View on GitHub`,
+  "hero.cta2": `Quick start ↓`,
+  "q.head": `cluster · n=3 · writes commit on a majority`,
+  "q.ackmeta": `committed 2/3`,
+  "q.status.repl": `replicating entry 128 to followers…`,
+  "q.status.done": `✓ committed on 2/3, ack sent to client`,
+  "q.caption": `Append → replicate → commit on a majority → ack. Every write takes this path.`,
+  "stat1.label": `95% reads / 5% writes, 3-node cluster`,
+  "stat2.label": `linearizable reads`,
+  "stat3.label": `automatic leader failover`,
+  "stat4.label": `acknowledged writes lost`,
+  "why.eyebrow": `Why alias-cache`,
+  "why.h2": `Why not just run Redis with replicas?`,
+  "why.lede": `Because Redis replication is asynchronous: the leader answers the client before the replicas have the write. If the leader dies in that window, the failover promotes a replica that never saw writes the client was already told succeeded.`,
+  "why.card1.title": `<span class="mark">✗</span> Redis with async replicas`,
+  "why.card1.body": `The leader sends <code>OK</code> first and replicates after. When it dies in between, the new leader doesn't have the write, and the data the client was told about is gone.`,
+  "why.card2.title": `<span class="mark">✓</span> alias-cache with Raft`,
+  "why.card2.body": `The write is committed on a majority first; the <code>OK</code> goes out second. A failover promotes a replica that already holds every acknowledged write, so nothing comes back missing.`,
+  "perf.eyebrow": `Performance`,
+  "perf.h2": `Three nodes sustain 739,194 ops/s with majority replication on`,
+  "perf.lede": `All alias-cache numbers come from the benchmark tool in this repo: 512 connections, 400k keys, and zero errors in every run. Numbers for the other five systems are reused from a published YCSB benchmark; the card under the chart says where they come from.`,
+  "perf.g1": `50% reads / 50% writes`,
+  "perf.g2": `95% reads / 5% writes`,
+  "perf.g3": `5% reads / 95% writes`,
+  "env.title": `Test environment`,
+  "env.body": `Reused from the published YCSB run: AMD 9950X3D, 64 GB DDR5, Kingston SNV2S2000G NVMe, EXT4/Linux, 512 threads, 3 nodes, snapshots off during the run, 100-byte values. Redis ran in Sentinel mode.`,
+  "feat.eyebrow": `Features`,
+  "feat.h2": `What you get`,
+  "feat.lede": `The data types and commands most Redis applications use, backed by majority replication.`,
+  "feat1.title": `Durability that survives failover`,
+  "feat1.body": `Every acknowledged write is on a Raft quorum. Leader death, network partitions, node restarts: nothing acknowledged is lost.`,
+  "feat2.title": `Linearizable reads at scale`,
+  "feat2.body": `Lease-based reads serve straight from the leader's state machine at ~372k GETs/s, falling back to ReadIndex with fail-closed semantics under partitions.`,
+  "feat3.title": `Works with standard Redis clients`,
+  "feat3.body": `Full <code>RESP2</code> / <code>RESP3</code>: pipelines, inline commands, <code>HELLO</code> negotiation. Standard clients connect without modification.`,
+  "feat4.title": `Rich data types`,
+  "feat4.body": `Strings with the full <code>SET</code> option matrix, Hash, List, Set, Sorted Set, Bitmap including <code>BITOP</code>, Streams, and Bloom filters with deterministic cross-replica hashing.`,
+  "feat5.title": `Transactions without races`,
+  "feat5.body": `<code>MULTI</code>/<code>EXEC</code> with <code>WATCH</code>: the CAS check and the writes commit in the same log entry — no check-then-write window on any replica.`,
+  "feat6.title": `Sandboxed Lua scripting`,
+  "feat6.body": `<code>EVAL</code> runs on the leader with a memory cap and an instruction budget, and only the deterministic result is replicated.`,
+  "feat7.title": `Timing-wheel TTL`,
+  "feat7.body": `A hierarchical timing wheel tracks every TTL'd key with <code>O(1)</code> amortized discovery; mass expiration is reclaimed in one log entry, not one per key.`,
+  "feat8.title": `Fast crash recovery`,
+  "feat8.body": `Incremental snapshots — a durable base plus delta segments — bring a restarted node back in seconds, not minutes.`,
+  "feat9.title": `Security &amp; operations`,
+  "feat9.body": `Password auth, client TLS, mTLS for replication traffic, max-memory and max-connection limits, five-section <code>INFO</code>, Sentinel-style discovery, and idempotent retries via client request IDs.`,
+  "wp.eyebrow": `The write path`,
+  "wp.h2": `How it stays fast`,
+  "wp.lede": `The implementation details behind the numbers above — what the leader does with every write, stage by stage.`,
+  "wp1.title": `Pipelining`,
+  "wp1.body": `Commands arrive in pipelines, so a connection keeps many requests in flight instead of waiting on each reply.`,
+  "wp2.title": `Group commit`,
+  "wp2.body": `The leader merges writes from many connections into one batched commit. When traffic goes quiet, the batch flushes early so reads aren't stuck behind it.`,
+  "wp3.title": `raft-engine WAL`,
+  "wp3.body": `The write-ahead log is TiKV's <code>raft-engine</code> with group-commit fsync. Throughput doesn't decay as the log grows.`,
+  "wp4.title": `Pipelined replication`,
+  "wp4.body": `Each follower link is one persistent connection with a bounded number of appends in flight and in-order replies, not one round trip at a time.`,
+  "wp5.title": `Commit, then ack`,
+  "wp5.body": `Once a majority has the entry, the client gets its <code>OK</code>. Incremental snapshots bring a restarted node back in seconds.`,
+  "qs.h2": `Quick start`,
+  "qs.t1": `1 · Single node`,
+  "qs.t2": `2 · Docker, 3-node cluster`,
+  "qs.t3": `Verify it yourself`,
+  "qs.single.cmt": `# any Redis client works — RESP2 and RESP3`,
+  "qs.note1": `Or wire three nodes by hand for automatic failover — the exact commands are in the <a href="https://github.com/AliasJeff/alias-cache#quick-start" target="_blank" rel="noopener">README</a>.`,
+  "qs.verify.cmt1": `# 181 tests, incl. OpenRaft's storage contract suite`,
+  "qs.verify.cmt2": `# real 3-node failover: kill the leader, watch recovery`,
+  "qs.binaries": `Prefer binaries? Prebuilt <code>linux-amd64</code> / <code>linux-arm64</code> / <code>darwin-arm64</code> / <code>darwin-x64</code> builds are on the <a href="https://github.com/AliasJeff/alias-cache/releases" target="_blank" rel="noopener">Releases</a> page.`,
+  "foot.blurb": `A Redis-compatible key-value store where your data doesn't disappear.`,
+  "foot.proj": `Project`,
+  "foot.page": `On this page`,
+  "foot.perf": `Performance`,
+  "foot.feat": `Features`,
+  "foot.qs": `Quick start`,
+  "foot.top": `Back to top ↑`,
+  "foot.base2": `Built on OpenRaft and TiKV raft-engine.`
+},
+zh: {
+  "meta.title": `alias-cache —— 收到过 OK 的写入，永远不会丢`,
+  "nav.why": `为什么`,
+  "nav.perf": `性能`,
+  "nav.features": `特性`,
+  "nav.writepath": `写入路径`,
+  "nav.quickstart": `快速开始`,
+  "hero.badge": `⚡ 每笔写入都经 Raft 多数派提交`,
+  "hero.h1": `收到过 <span class="ok">OK</span> 的写入，永远不会丢。`,
+  "hero.sub": `<strong>alias-cache</strong> 是一个 Redis 兼容的键值存储，你的数据不会凭空消失。每笔写入都会先复制到 Raft 多数派，客户端才会收到 <code>OK</code>——leader 崩溃也好、网络分区也好，都带不走你已经确认过的数据。它同时支持 RESP2 和 RESP3，现有的 Redis 客户端无需改动即可接入。`,
+  "hero.cta1": `在 GitHub 查看`,
+  "hero.cta2": `快速开始 ↓`,
+  "q.head": `集群 · n=3 · 写入经多数派提交才算数`,
+  "q.ackmeta": `已提交 2/3`,
+  "q.status.repl": `正在把 entry 128 复制到 follower…`,
+  "q.status.done": `✓ 已在 2/3 节点提交，ack 已返回客户端`,
+  "q.caption": `追加 → 复制 → 多数派提交 → ack。每笔写入都走这条路。`,
+  "stat1.label": `95% 读 / 5% 写，3 节点集群`,
+  "stat2.label": `线性化读`,
+  "stat3.label": `leader 自动故障转移`,
+  "stat4.label": `已确认写入的丢失数`,
+  "why.eyebrow": `为什么是 alias-cache`,
+  "why.h2": `为什么不直接用 Redis 加副本？`,
+  "why.lede": `因为 Redis 的复制是异步的：leader 在副本拿到写入之前就答复了客户端。如果 leader 在这个窗口里挂掉，接管的副本根本没见过那些客户端已经确认成功的写入。`,
+  "why.card1.title": `<span class="mark">✗</span> Redis 异步副本`,
+  "why.card1.body": `leader 先回 <code>OK</code>，之后再补复制。一旦它在这个间隙挂掉，新 leader 上没有这笔写入，客户端以为已经成功的数据就此消失。`,
+  "why.card2.title": `<span class="mark">✓</span> alias-cache + Raft`,
+  "why.card2.body": `写入先在多数派上提交，然后才回 <code>OK</code>。故障转移上台的副本已经持有全部已确认的写入，不会有任何缺失。`,
+  "perf.eyebrow": `性能`,
+  "perf.h2": `三节点集群，多数派复制全开，739,194 ops/s`,
+  "perf.lede": `alias-cache 的全部数字来自本仓库自带的 benchmark 工具：512 连接、400k 键，全程零错误。另外五个系统的数字复用自一份公开的 YCSB 基准，出处见图表下方的说明。`,
+  "perf.g1": `50% 读 / 50% 写`,
+  "perf.g2": `95% 读 / 5% 写`,
+  "perf.g3": `5% 读 / 95% 写`,
+  "env.title": `测试环境`,
+  "env.body": `复用自公开的 YCSB 测试：AMD 9950X3D · 64G DDR5 · Kingston SNV2S2000G NVMe · EXT4/Linux · YCSB 512 线程 · 3 节点 · 跑分期间不触发快照 · 100 字节 value。Redis 为哨兵模式。`,
+  "feat.eyebrow": `特性`,
+  "feat.h2": `你能得到什么`,
+  "feat.lede": `大多数 Redis 应用真正会用到的数据类型和命令，外加多数派复制。`,
+  "feat1.title": `经得起故障转移的持久性`,
+  "feat1.body": `每笔已确认的写入都在 Raft 多数派上。leader 宕机、网络分区、节点重启：已确认的数据一律不丢。`,
+  "feat2.title": `大规模线性化读`,
+  "feat2.body": `基于租约的读直接从 leader 状态机返回，约 37.2 万 GETs/s；分区时退回 ReadIndex，fail-closed。`,
+  "feat3.title": `标准 Redis 客户端直接连`,
+  "feat3.body": `完整 <code>RESP2</code> / <code>RESP3</code>：pipeline、inline 命令、<code>HELLO</code> 协商。标准客户端无需任何修改。`,
+  "feat4.title": `丰富的数据类型`,
+  "feat4.body": `完整 <code>SET</code> 选项矩阵的 String、Hash、List、Set、Sorted Set、含 <code>BITOP</code> 的 Bitmap、Stream，以及跨副本哈希一致的 Bloom filter。`,
+  "feat5.title": `没有竞态的事务`,
+  "feat5.body": `<code>MULTI</code>/<code>EXEC</code> 加 <code>WATCH</code>：CAS 检查和写入在同一条日志里提交，任何副本上都不存在 check-then-write 窗口。`,
+  "feat6.title": `沙箱化的 Lua`,
+  "feat6.body": `<code>EVAL</code> 在 leader 上执行，带内存上限和指令预算，只复制确定性的结果。`,
+  "feat7.title": `时间轮 TTL`,
+  "feat7.body": `层级时间轮以 <code>O(1)</code> 均摊代价跟踪每个带 TTL 的键；批量过期只花一条日志，而不是每个键一条。`,
+  "feat8.title": `秒级崩溃恢复`,
+  "feat8.body": `增量快照（持久 base + delta 段）让重启的节点几秒内回来，而不是几分钟。`,
+  "feat9.title": `安全与运维`,
+  "feat9.body": `密码认证、客户端 TLS、复制链路 mTLS、内存与连接上限、五段式 <code>INFO</code>、哨兵式发现，以及基于客户端请求 ID 的幂等重试。`,
+  "wp.eyebrow": `写入路径`,
+  "wp.h2": `它为什么一直快`,
+  "wp.lede": `上面这些数字背后的实现细节：leader 处理每笔写入要经过的每一个阶段。`,
+  "wp1.title": `流水线`,
+  "wp1.body": `命令以 pipeline 到达，一条连接同时保持大量在途请求，而不是等一条回一条。`,
+  "wp2.title": `组提交`,
+  "wp2.body": `leader 把多条连接的写入合并成一次批量提交；流量变疏时批量提前刷出，读不会被压在后面。`,
+  "wp3.title": `raft-engine WAL`,
+  "wp3.body": `预写日志采用 TiKV 的 <code>raft-engine</code>，组提交 fsync，日志越长吞吐也不衰减。`,
+  "wp4.title": `流水线化复制`,
+  "wp4.body": `每条 follower 链路是一条持久连接，在途 append 数量有上限、按序回包，而不是一次一个往返。`,
+  "wp5.title": `先提交，后 ack`,
+  "wp5.body": `多数派拿到这条日志之后，客户端才收到 <code>OK</code>。增量快照让重启的节点几秒内恢复。`,
+  "qs.h2": `快速开始`,
+  "qs.t1": `1 · 单节点`,
+  "qs.t2": `2 · Docker，3 节点集群`,
+  "qs.t3": `自己验证`,
+  "qs.single.cmt": `# 任何 Redis 客户端都行 —— RESP2 和 RESP3`,
+  "qs.note1": `也可以手动起三个节点体验自动故障转移——确切命令在 <a href="https://github.com/AliasJeff/alias-cache#quick-start" target="_blank" rel="noopener">README</a> 里。`,
+  "qs.verify.cmt1": `# 181 个测试，含 OpenRaft 的存储契约套件`,
+  "qs.verify.cmt2": `# 真实 3 节点故障转移：杀掉 leader，看它恢复`,
+  "qs.binaries": `不想编译？linux-amd64 / linux-arm64 / darwin-arm64 / darwin-x64 预编译包在 <a href="https://github.com/AliasJeff/alias-cache/releases" target="_blank" rel="noopener">Releases</a> 页。`,
+  "foot.blurb": `一个 Redis 兼容的键值存储，你的数据不会消失。`,
+  "foot.proj": `项目`,
+  "foot.page": `本页`,
+  "foot.perf": `性能`,
+  "foot.feat": `特性`,
+  "foot.qs": `快速开始`,
+  "foot.top": `回到顶部 ↑`,
+  "foot.base2": `基于 OpenRaft 与 TiKV raft-engine 构建。`
+}};
+
+function setLang(lang){
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  document.title = I18N[lang]['meta.title'];
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const v = I18N[lang][el.dataset.i18n];
+    if (v !== undefined) el.innerHTML = v;
+  });
+  document.querySelectorAll('.lang button').forEach(b =>
+    b.classList.toggle('active', b.dataset.langBtn === lang));
+  try { localStorage.setItem('ac-lang', lang); } catch {}
+}
+
+const langParam = new URLSearchParams(location.search).get('lang');
+let initLang = langParam;
+if (!initLang) { try { initLang = localStorage.getItem('ac-lang'); } catch {} }
+if (!initLang) initLang = (navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+setLang(I18N[initLang] ? initLang : 'en');
+document.querySelectorAll('.lang button').forEach(b =>
+  b.addEventListener('click', () => setLang(b.dataset.langBtn)));
+
+// ---------- count-up for the hero stats ----------
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const countIO = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    countIO.unobserve(e.target);
+    const el = e.target, target = +el.dataset.count;
+    if (reduceMotion) continue;
+    const t0 = performance.now(), dur = 1400;
+    const tick = t => {
+      const p = Math.min(1, (t - t0) / dur), eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = Math.round(target * eased).toLocaleString('en-US');
+      if (p < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+}, {threshold: .5});
+document.querySelectorAll('[data-count]').forEach(el => countIO.observe(el));
+
+// ---------- scroll reveal ----------
+if (reduceMotion) {
+  document.querySelectorAll('.reveal').forEach(el => el.classList.add('in'));
+} else {
+  const revealIO = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (e.isIntersecting) { e.target.classList.add('in'); revealIO.unobserve(e.target); }
+    }
+  }, {threshold: .12});
+  document.querySelectorAll('.reveal').forEach(el => revealIO.observe(el));
+}
+
+// ---------- copy buttons ----------
+document.querySelectorAll('.code-copy').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const pre = document.querySelector(btn.dataset.copy);
+    try {
+      await navigator.clipboard.writeText(pre.innerText);
+      btn.textContent = 'Copied ✓';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1600);
+    } catch {
+      btn.textContent = 'Select & copy';
+    }
+  });
+});
+</script>
+</body>
+</html>
