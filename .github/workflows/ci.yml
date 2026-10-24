@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      # A test once hung on CI for 55m with no output; fail it instead
+      # of burning billable minutes. Local suite: ~11s.
+      - run: timeout 35m cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Dependency license check
+        run: ./scripts/check-licenses.sh
+      - name: Build CLI for cluster smoke test
+        run: cargo build --release --locked -p alias-cache-cli
+      - name: Run cluster failover and restart smoke test
+        run: python3 scripts/smoke_cluster.py --binary target/release/alias-cache-cli
+
+  container:
+    # The bare-metal failover drill already runs in `check`; here we only
+    # validate what is unique to the container path: the image builds and
+    # the composed topology accepts traffic.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose topology
+        run: docker compose config
+      - name: Build the node image
+        run: docker compose build
+      - name: Round-trip a write through the composed cluster
+        run: |
+          docker compose up --detach
+          python3 - <<'PY'
+          import socket, time
+
+          def wait_ready(port, deadline=60.0):
+              end = time.time() + deadline
+              while time.time() < end:
+                  try:
+                      s = socket.create_connection(("127.0.0.1", port), timeout=2)
+                      s.sendall(b"*1\r\n$4\r\nPING\r\n")
+                      ready = s.recv(64).startswith(b"+")
+                      s.close()
+                      if ready:
+                          return
+                  except OSError:
+                      pass
+                  time.sleep(0.5)
+              raise SystemExit(f"port {port} never became ready")
+
+          # Write through a follower: exercises forwarding across the
+          # container network, not just the local listener.
+          wait_ready(6380)
+          s = socket.create_connection(("127.0.0.1", 6380), timeout=5)
+          s.sendall(b"*3\r\n$3\r\nSET\r\n$8\r\nci:probe\r\n$2\r\nOK\r\n"
+                    b"*2\r\n$3\r\nGET\r\n$8\r\nci:probe\r\n")
+          reply = b""
+          while b"$2\r\nOK" not in reply:
+              chunk = s.recv(256)
+              if not chunk:
+                  raise SystemExit(f"connection closed before reply: {reply!r}")
+              reply += chunk
+          s.close()
+          print("compose round trip: SET/GET OK")
+          PY
+          docker compose down -v
+
+  build:
+    # Release builds must compile on every supported platform; tests already
+    # run in the check job, so builds only gate compilation and packaging.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p alias-cache-cli --target ${{ matrix.target }}
+      - name: Package release artifact
+        shell: bash
+        run: |
+          dir="alias-cache-${{ matrix.target }}"
+          mkdir "$dir"
+          exe=""
+          case "${{ matrix.target }}" in
+            *windows*) exe=".exe" ;;
+          esac
+          cp "target/${{ matrix.target }}/release/alias-cache-cli$exe" "$dir/"
+          [ -f LICENSE ] && cp LICENSE "$dir/"
+          [ -f README.md ] && cp README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alias-cache-${{ matrix.target }}
+          path: alias-cache-*.tar.gz
