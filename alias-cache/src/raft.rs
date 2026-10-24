@@ -154,6 +154,14 @@ pub enum NetworkResponse {
 pub const NETWORK_MAX_FRAME: usize = 64 * 1024 * 1024;
 pub const CLIENT_BATCH_MAX_ITEMS: usize = 1_024;
 
+/// Idle ceiling for one streaming replication read/write. Deliberately
+/// generous: a pipelined follower may legitimately take longer than openraft's
+/// RPC budget (soft_ttl, 3/4 of the heartbeat interval) to answer a batch
+/// under load, and a per-response timeout at that budget killed replication
+/// streams in a loop on slow runners. Liveness is still bounded — a dead
+/// follower fails the writer on TCP backpressure and the reader here.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How many AppendEntries RPCs one replication stream may have in flight.
 /// Four covers ~4 round trips of flight; the sequential fallback this
 /// replaces allowed exactly one.
@@ -2607,7 +2615,7 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                     "raft network link {source} -> {target} is blocked"
                 ))));
             }
-            let soft_ttl = option.soft_ttl();
+            let idle_timeout = STREAM_IDLE_TIMEOUT;
             let stream = connect(&address, &option, tls_connector).await?;
             let (reader, mut writer) = tokio::io::split(stream);
 
@@ -2645,7 +2653,7 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                         writer.write_all(&payload).await?;
                         writer.flush().await
                     };
-                    if timeout(soft_ttl, write).await.is_err() {
+                    if timeout(idle_timeout, write).await.is_err() {
                         break;
                     }
                     if range_tx.send((prev, last)).await.is_err() {
@@ -2656,9 +2664,10 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                 // once every outstanding response has been consumed.
             });
 
+            let stream_option = RPCOption::new(STREAM_IDLE_TIMEOUT);
             let output = futures_util::stream::unfold(
-                (reader, range_rx, false, soft_ttl, option),
-                |(mut reader, mut range_rx, stopped, soft_ttl, option)| async move {
+                (reader, range_rx, false, stream_option),
+                |(mut reader, mut range_rx, stopped, stream_option)| async move {
                     if stopped {
                         return None;
                     }
@@ -2667,19 +2676,19 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                     // closed empty queue means the writer is done.
                     let (prev, last) = range_rx.recv().await?;
                     let started = std::time::Instant::now();
-                    let response = match read_network_response(&mut reader, &option).await {
+                    let response = match read_network_response(&mut reader, &stream_option).await {
                         Ok(response) => response,
                         Err(_) => {
                             LEADER_APPEND_RPC_METRICS.record(
                                 started.elapsed().as_micros() as u64,
-                                soft_ttl.as_micros() as u64,
+                                stream_option.soft_ttl().as_micros() as u64,
                             );
                             return None;
                         }
                     };
                     LEADER_APPEND_RPC_METRICS.record(
                         started.elapsed().as_micros() as u64,
-                        soft_ttl.as_micros() as u64,
+                        stream_option.soft_ttl().as_micros() as u64,
                     );
                     let NetworkResponse::Append(append) = response else {
                         return None;
@@ -2694,11 +2703,11 @@ impl RaftNetworkV2<TypeConfig> for TcpNetwork {
                                 _ => true,
                             };
                             let item = Ok(resp.into_stream_result(prev, last));
-                            Some((item, (reader, range_rx, stop, soft_ttl, option)))
+                            Some((item, (reader, range_rx, stop, stream_option)))
                         }
                         Err(error) => {
                             let item = Err(rpc_response_error(error));
-                            Some((item, (reader, range_rx, true, soft_ttl, option)))
+                            Some((item, (reader, range_rx, true, stream_option)))
                         }
                     }
                 },
