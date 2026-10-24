@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # SPDX identifiers allowed in the dependency graph.
-ALLOWED='^(MIT|Apache-2\.0|Apache-2\.0 WITH LLVM-exception|LLVM-exception|BSD-3-Clause|ISC|Unicode-3\.0|Zlib|CDLA-Permissive-2\.0|MIT-0|CC0-1\.0|Unlicense|LGPL-2\.1-or-later|BSL-1\.0|MPL-2\.0)$'
+ALLOWED='^(MIT|Apache-2\.0|Apache-2\.0 WITH LLVM-exception|LLVM-exception|BSD-3-Clause|BSD-2-Clause|ISC|Unicode-3\.0|Zlib|CDLA-Permissive-2\.0|MIT-0|CC0-1\.0|Unlicense|LGPL-2\.1-or-later|BSL-1\.0|MPL-2\.0)$'
 
 cargo metadata --format-version 1 --locked > /tmp/alias-cache-metadata.json
 
