@@ -10,9 +10,9 @@ And it's fast. Not "fast for a consistent database". Fast:
 
 | Workload | Throughput |
 | --- | ---: |
-| 95% reads / 5% writes | ~400,000 ops/s |
-| 50% reads / 50% writes | ~172,000 ops/s |
-| 5% reads / 95% writes | ~184,000 ops/s |
+| 95% reads / 5% writes | 739,194 ops/s |
+| 50% reads / 50% writes | 429,120 ops/s |
+| 5% reads / 95% writes | 319,639 ops/s |
 | Pure writes | ~207,000 ops/s |
 | Pure reads (linearizable GET) | ~372,000 ops/s |
 
