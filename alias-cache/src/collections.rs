@@ -152,6 +152,46 @@ impl ArraySet {
         &self.entries[slot]
     }
 
+    /// Deterministically sample `count` members (None = one) WITHOUT
+    /// mutating: a virtual replay of the swap_remove sequence the apply
+    /// side will perform. O(pops), no structural work — the prepare-side
+    /// preview of SPOP uses this so the leader pays nothing per member.
+    pub fn sample_deterministic(
+        &self,
+        key: &[u8],
+        write_time: u64,
+        count: Option<u64>,
+    ) -> Vec<Bytes> {
+        debug_assert!(count.is_some() || !self.is_empty());
+        let mut rng = DeterministicRng::new(key, write_time);
+        let pops = match count {
+            None => self.len().min(1),
+            Some(count) => (count as usize).min(self.len()),
+        };
+        // slot → member currently occupying it in the virtual sequence.
+        let mut overrides: HashMap<usize, Bytes> = HashMap::with_capacity(pops);
+        let mut alive = self.len();
+        let mut sampled = Vec::with_capacity(pops);
+        for _ in 0..pops {
+            let slot = rng.next_index(alive);
+            let member = match overrides.remove(&slot) {
+                Some(member) => member,
+                None => self.entries[slot].clone(),
+            };
+            alive -= 1;
+            let last = alive;
+            if slot != last {
+                let moved = match overrides.remove(&last) {
+                    Some(member) => member,
+                    None => self.entries[last].clone(),
+                };
+                overrides.insert(slot, moved);
+            }
+            sampled.push(member);
+        }
+        sampled
+    }
+
     pub fn into_entries(self) -> Vec<Bytes> {
         self.entries
     }
@@ -526,6 +566,43 @@ mod tests {
         let mut expected: Vec<Bytes> = (0..100).map(member).collect();
         expected.sort();
         assert_eq!(sorted, expected);
+    }
+
+    /// The virtual sample must equal what actually gets popped, member for
+    /// member, for every count form — this is the contract the SPOP
+    /// prepare-side preview relies on.
+    #[test]
+    fn sample_deterministic_matches_real_pops() {
+        let build = |size: u64| {
+            let mut set = ArraySet::new();
+            for id in 0..size {
+                set.insert(member(id));
+            }
+            set
+        };
+        for (size, count) in [
+            (7_u64, None),
+            (7, Some(1)),
+            (7, Some(3)),
+            (7, Some(7)),
+            (7, Some(20)),
+            (100, Some(37)),
+            (1, None),
+        ] {
+            for seed in [0_u64, 1, 42, 1_000_000] {
+                let sampled = build(size).sample_deterministic(b"key", seed, count);
+                let mut live = build(size);
+                let mut rng = DeterministicRng::new(b"key", seed);
+                let pops = match count {
+                    None => live.len().min(1),
+                    Some(count) => (count as usize).min(live.len()),
+                };
+                let popped: Vec<Bytes> = (0..pops)
+                    .map(|_| live.swap_remove_at(rng.next_index(live.len())))
+                    .collect();
+                assert_eq!(sampled, popped, "size {size} count {count:?} seed {seed}");
+            }
+        }
     }
 
     /// Frozen wire contract: bincode renders seq and set (and map and

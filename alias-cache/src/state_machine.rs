@@ -1174,39 +1174,66 @@ impl StateMachine {
                 // the member array is identical on every replica, so the
                 // sampled indices — and therefore the popped members — are
                 // too.
-                let Some(existing) = self
-                    .values
-                    .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                //
+                // Unlike the other set writes (clone-on-write + full
+                // entry_size recount), SPOP mutates in place with
+                // incremental bookkeeping: the whole point of the array
+                // layout is O(1) per pop, and the clone would put O(n)
+                // back on every SPOP.
+                let live = matches!(self.values.get(&key), Some(entry) if !self.is_expired(entry));
+                if !live {
                     return ApplyResult::Response(match count {
                         Some(_) => Frame::Array(Vec::new()),
                         None => Frame::Null,
                     });
-                };
-                let Value::Set(mut set) = existing.value else {
+                }
+                if count == Some(0) {
+                    return ApplyResult::Response(Frame::Array(Vec::new()));
+                }
+                if !matches!(
+                    self.values.get(&key).map(|entry| &entry.value),
+                    Some(Value::Set(_))
+                ) {
                     return ApplyResult::Response(wrong_type_frame());
-                };
-                if count == Some(0) || set.is_empty() {
-                    return ApplyResult::Response(match count {
-                        Some(_) => Frame::Array(Vec::new()),
-                        None => Frame::Null,
-                    });
                 }
-                let response = pop_deterministic(&mut set, &key, write_time, count);
-                if set.is_empty() {
+                let mut popped: Vec<Bytes> = Vec::new();
+                let mut drained = false;
+                {
+                    let entry = self.values.get_mut(&key).expect("verified above");
+                    let Value::Set(set) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    let mut rng = DeterministicRng::new(&key, write_time);
+                    let pops = match count {
+                        None => set.len().min(1),
+                        Some(count) => (count as usize).min(set.len()),
+                    };
+                    for _ in 0..pops {
+                        let member = set.swap_remove_at(rng.next_index(set.len()));
+                        popped.push(member);
+                    }
+                    if set.is_empty() {
+                        // remove_entry charges what remains (just the key
+                        // bytes); the member bytes are gone from the vec.
+                        drained = true;
+                    } else {
+                        entry.version = entry.version.wrapping_add(1);
+                        let drained_bytes =
+                            popped.iter().map(|member| member.len() as u64).sum::<u64>();
+                        self.memory_bytes = self.memory_bytes.saturating_sub(drained_bytes);
+                        // expire_at is unchanged, so the expiry timer stays
+                        // armed and the wheel is left alone.
+                    }
+                }
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::Set(set),
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
+                let response = match count {
+                    None => popped
+                        .first()
+                        .map_or(Frame::Null, |member| Frame::BulkString(member.clone())),
+                    Some(_) => Frame::Array(popped.into_iter().map(Frame::BulkString).collect()),
+                };
                 ApplyResult::Response(response)
             }
             Operation::SortedSetAdd { key, entries } => {
@@ -4094,11 +4121,16 @@ impl StateMachine {
         }
         // The seed is stamped here, on the leader, and rides inside the
         // replicated operation; apply recomputes the same pops against
-        // applying state. The preview below pops a clone so the optimistic
-        // frame matches whenever nothing interleaves before the commit.
+        // applying state. The preview samples virtually (no clone, no
+        // mutation): O(pops), so the leader pays nothing per member.
         let write_time = self.logical_time;
-        let mut preview = set.clone();
-        let response = pop_deterministic(&mut preview, &key, write_time, count);
+        let sampled = set.sample_deterministic(&key, write_time, count);
+        let response = match count {
+            None => sampled
+                .first()
+                .map_or(Frame::Null, |member| Frame::BulkString(member.clone())),
+            Some(_) => Frame::Array(sampled.into_iter().map(Frame::BulkString).collect()),
+        };
         Ok((
             Some(Operation::SetPop {
                 key,
@@ -4408,32 +4440,6 @@ fn empty_pop_reply(count: Option<u64>) -> Frame {
     match count {
         Some(_) => Frame::Array(Vec::new()),
         None => Frame::Null,
-    }
-}
-
-/// Pop `count` members (None = exactly one) from a non-empty set using the
-/// replicated (key, write_time) seed. Shared by prepare (faithful preview
-/// on a clone) and apply (authoritative mutation), so both sides sample
-/// identically. The caller guarantees the set is non-empty when count is
-/// None; a Some(0) count returns an empty array.
-fn pop_deterministic(
-    set: &mut ArraySet,
-    key: &Bytes,
-    write_time: u64,
-    count: Option<u64>,
-) -> Frame {
-    debug_assert!(count.is_some() || !set.is_empty());
-    let mut rng = DeterministicRng::new(key, write_time);
-    match count {
-        None => Frame::BulkString(set.swap_remove_at(rng.next_index(set.len()))),
-        Some(count) => {
-            let pops = (count as usize).min(set.len());
-            Frame::Array(
-                (0..pops)
-                    .map(|_| Frame::BulkString(set.swap_remove_at(rng.next_index(set.len()))))
-                    .collect(),
-            )
-        }
     }
 }
 
@@ -7082,6 +7088,11 @@ mod tests {
                 .1,
             Frame::Array(pop_two.clone().into_iter().map(Frame::BulkString).collect())
         );
+        // In-place bookkeeping must stay exact: the incremental memory
+        // delta has to equal a full recount.
+        let mut recomputed = third.clone();
+        recomputed.recompute_memory();
+        assert_eq!(third.memory_usage(), recomputed.memory_usage());
         let remaining = replay.into_entries();
         assert_eq!(remaining.len(), 2);
 
