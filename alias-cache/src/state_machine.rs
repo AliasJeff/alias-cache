@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use crate::collections::{ArrayHash, ArraySet};
+use crate::collections::{ArrayHash, ArraySet, DeterministicRng};
 use crate::error::{Error, Result};
 use crate::protocol::{Frame, Request};
 
@@ -105,6 +105,7 @@ const WRITES: &[&[u8]] = &[
     b"LTRIM",
     b"SADD",
     b"SREM",
+    b"SPOP",
     b"ZADD",
     b"ZINCRBY",
     b"ZREM",
@@ -299,6 +300,16 @@ pub enum Operation {
         /// transaction (replying Null) when any key's live version differs.
         watch_expectations: Vec<(Bytes, Option<u64>)>,
     },
+    /// SPOP: deterministic-random removal. The seed (the leader's logical
+    /// clock at prepare) rides inside the operation, so every replica
+    /// resolves the same members from the identical member array at O(1)
+    /// per pop. Kept last: bincode encodes variants by index, and the
+    /// established order of the older variants must never shift.
+    SetPop {
+        key: Bytes,
+        count: Option<u64>,
+        write_time: u64,
+    },
     ClientBatch {
         request_id: ClientRequestId,
         request: Request,
@@ -320,6 +331,7 @@ impl Operation {
             | Self::Expire { write_time, .. }
             | Self::ExpireSeconds { write_time, .. }
             | Self::ExpireSweep { write_time }
+            | Self::SetPop { write_time, .. }
             | Self::Persist { write_time, .. } => *write_time,
             Self::Set { .. }
             | Self::MultiSet { .. }
@@ -388,6 +400,7 @@ impl Operation {
             | Self::Persist { .. }
             | Self::AdvanceTime { .. }
             | Self::ExpireSweep { .. }
+            | Self::SetPop { .. }
             | Self::Transaction { .. } => &[],
         }
     }
@@ -445,7 +458,9 @@ pub struct StateMachine {
 fn incoming_bytes(operation: &Operation) -> u64 {
     match operation {
         Operation::Client { operation, .. } => incoming_bytes(operation),
-        Operation::ClientBatch { .. } | Operation::ExpireSweep { .. } => 0,
+        Operation::ClientBatch { .. }
+        | Operation::ExpireSweep { .. }
+        | Operation::SetPop { .. } => 0,
         Operation::Transaction { operations, .. } => operations.iter().map(incoming_bytes).sum(),
         Operation::Set { key, value } | Operation::SetWithExpiration { key, value, .. } => {
             (key.len() + value.len()) as u64
@@ -601,7 +616,8 @@ impl StateMachine {
             | Operation::Expire { write_time, .. }
             | Operation::ExpireSeconds { write_time, .. }
             | Operation::Persist { write_time, .. }
-            | Operation::ExpireSweep { write_time } => Some(*write_time),
+            | Operation::ExpireSweep { write_time }
+            | Operation::SetPop { write_time, .. } => Some(*write_time),
             Operation::Set { .. }
             | Operation::MultiSet { .. }
             | Operation::Append { .. }
@@ -1146,6 +1162,52 @@ impl StateMachine {
                     );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
+            }
+            Operation::SetPop {
+                key,
+                count,
+                write_time,
+            } => {
+                // Same replay discipline as ListPop: the response is
+                // recomputed against applying state, so a pipeline of SPOPs
+                // sees each pop shrink the set. The seed is replicated, and
+                // the member array is identical on every replica, so the
+                // sampled indices — and therefore the popped members — are
+                // too.
+                let Some(existing) = self
+                    .values
+                    .get(&key)
+                    .filter(|entry| !self.is_expired(entry))
+                    .cloned()
+                else {
+                    return ApplyResult::Response(match count {
+                        Some(_) => Frame::Array(Vec::new()),
+                        None => Frame::Null,
+                    });
+                };
+                let Value::Set(mut set) = existing.value else {
+                    return ApplyResult::Response(wrong_type_frame());
+                };
+                if count == Some(0) || set.is_empty() {
+                    return ApplyResult::Response(match count {
+                        Some(_) => Frame::Array(Vec::new()),
+                        None => Frame::Null,
+                    });
+                }
+                let response = pop_deterministic(&mut set, &key, write_time, count);
+                if set.is_empty() {
+                    let _ = self.remove_entry(&key);
+                } else {
+                    self.insert_entry(
+                        key,
+                        Entry {
+                            value: Value::Set(set),
+                            expire_at: existing.expire_at,
+                            version: 0,
+                        },
+                    );
+                }
+                ApplyResult::Response(response)
             }
             Operation::SortedSetAdd { key, entries } => {
                 let existing = self
@@ -1980,6 +2042,15 @@ impl StateMachine {
         }
         if command.eq_ignore_ascii_case(b"SREM") {
             return self.execute_set_remove(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SPOP") {
+            return self.execute_set_pop(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"SRANDMEMBER") {
+            return self.execute_set_random_member(arguments);
+        }
+        if command.eq_ignore_ascii_case(b"HRANDFIELD") {
+            return self.execute_hash_random_field(arguments);
         }
         if command.eq_ignore_ascii_case(b"SMEMBERS") {
             return self.execute_set_members(arguments);
@@ -4004,6 +4075,172 @@ impl StateMachine {
         Ok((None, set_frame(result.into_entries())))
     }
 
+    fn execute_set_pop(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
+        if arguments.len() < 2 || arguments.len() > 3 {
+            return Err(Error::protocol(
+                "wrong number of arguments for 'SPOP'".to_string(),
+            ));
+        }
+        let key = arguments[1].clone();
+        let count = match arguments.get(2) {
+            None => None,
+            Some(value) => Some(parse_non_negative_u64(value, "SPOP")?),
+        };
+        let Some(set) = self.set_for_key(&key)? else {
+            return Ok((None, empty_pop_reply(count)));
+        };
+        if count == Some(0) || set.is_empty() {
+            return Ok((None, empty_pop_reply(count)));
+        }
+        // The seed is stamped here, on the leader, and rides inside the
+        // replicated operation; apply recomputes the same pops against
+        // applying state. The preview below pops a clone so the optimistic
+        // frame matches whenever nothing interleaves before the commit.
+        let write_time = self.logical_time;
+        let mut preview = set.clone();
+        let response = pop_deterministic(&mut preview, &key, write_time, count);
+        Ok((
+            Some(Operation::SetPop {
+                key,
+                count,
+                write_time,
+            }),
+            response,
+        ))
+    }
+
+    fn execute_set_random_member(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        if arguments.len() < 2 || arguments.len() > 3 {
+            return Err(Error::protocol(
+                "wrong number of arguments for 'SRANDMEMBER'".to_string(),
+            ));
+        }
+        let key = &arguments[1];
+        let set = self.set_for_key(key)?;
+        let Some(count_bytes) = arguments.get(2) else {
+            // No count: one member, nil on a missing key. Never mutates,
+            // so this stays a pure read served off the leader's state.
+            return Ok((
+                None,
+                match set {
+                    Some(set) if !set.is_empty() => {
+                        let mut rng = read_sampler(key, self.logical_time);
+                        Frame::BulkString(set.at(rng.next_index(set.len())).clone())
+                    }
+                    _ => Frame::Null,
+                },
+            ));
+        };
+        let count = parse_signed_i64(count_bytes, "SRANDMEMBER")?;
+        let Some(set) = set else {
+            return Ok((None, Frame::Array(Vec::new())));
+        };
+        let mut rng = read_sampler(key, self.logical_time);
+        let response = if count > 0 {
+            // Distinct members: partial Fisher-Yates over the member list,
+            // same complexity class as Redis (O(N) for the count forms).
+            let mut members: Vec<Bytes> = set.iter().cloned().collect();
+            let take = (count as usize).min(members.len());
+            for slot in 0..take {
+                let pick = slot + rng.next_index(members.len() - slot);
+                members.swap(slot, pick);
+            }
+            members.truncate(take);
+            Frame::Array(members.into_iter().map(Frame::BulkString).collect())
+        } else if count < 0 {
+            // With repetition: |count| independent draws.
+            Frame::Array(
+                (0..(-count) as usize)
+                    .map(|_| Frame::BulkString(set.at(rng.next_index(set.len())).clone()))
+                    .collect(),
+            )
+        } else {
+            Frame::Array(Vec::new())
+        };
+        Ok((None, response))
+    }
+
+    fn execute_hash_random_field(
+        &self,
+        arguments: Vec<Bytes>,
+    ) -> Result<(Option<Operation>, Frame)> {
+        if arguments.len() < 2 || arguments.len() > 4 {
+            return Err(Error::protocol(
+                "wrong number of arguments for 'HRANDFIELD'".to_string(),
+            ));
+        }
+        let key = &arguments[1];
+        let with_values = match arguments.get(3) {
+            None => false,
+            Some(flag) => {
+                if !flag.eq_ignore_ascii_case(b"WITHVALUES") {
+                    return Err(Error::protocol(
+                        "ERR syntax error, WITHVALUES is the only HRANDFIELD option".to_string(),
+                    ));
+                }
+                true
+            }
+        };
+        if with_values && arguments.len() < 3 {
+            return Err(Error::protocol(
+                "ERR WITHVALUES requires a count argument".to_string(),
+            ));
+        }
+        let hash = self.hash_for_key(key)?;
+        let Some(count_bytes) = arguments.get(2) else {
+            return Ok((
+                None,
+                match hash {
+                    Some(hash) if !hash.is_empty() => {
+                        let mut rng = read_sampler(key, self.logical_time);
+                        Frame::BulkString(hash.at(rng.next_index(hash.len())).0.clone())
+                    }
+                    _ => Frame::Null,
+                },
+            ));
+        };
+        let count = parse_signed_i64(count_bytes, "HRANDFIELD")?;
+        let Some(hash) = hash else {
+            return Ok((None, Frame::Array(Vec::new())));
+        };
+        let mut rng = read_sampler(key, self.logical_time);
+        let fields: Vec<Bytes> = if count > 0 {
+            let mut fields: Vec<Bytes> = hash.iter().map(|(field, _)| field.clone()).collect();
+            let take = (count as usize).min(fields.len());
+            for slot in 0..take {
+                let pick = slot + rng.next_index(fields.len() - slot);
+                fields.swap(slot, pick);
+            }
+            fields.truncate(take);
+            fields
+        } else if count < 0 {
+            (0..(-count) as usize)
+                .map(|_| hash.at(rng.next_index(hash.len())).0.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let response = if with_values {
+            // Flat field/value array, like Redis.
+            let mut flat = Vec::with_capacity(fields.len() * 2);
+            for field in fields {
+                let value = hash
+                    .get(&field)
+                    .cloned()
+                    .map_or(Frame::Null, Frame::BulkString);
+                flat.push(Frame::BulkString(field));
+                flat.push(value);
+            }
+            Frame::Array(flat)
+        } else {
+            Frame::Array(fields.into_iter().map(Frame::BulkString).collect())
+        };
+        Ok((None, response))
+    }
+
     fn sorted_set_for_key(&self, key: &Bytes) -> Result<Option<&BTreeMap<Bytes, i64>>> {
         let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
             return Ok(None);
@@ -4164,6 +4401,51 @@ fn string_value_to_frame(value: Option<&Value>) -> Result<Frame> {
 
 fn set_frame(members: Vec<Bytes>) -> Frame {
     Frame::Set(members.into_iter().map(Frame::BulkString).collect())
+}
+
+/// The no-op SPOP reply: nil without a count, an empty array with one.
+fn empty_pop_reply(count: Option<u64>) -> Frame {
+    match count {
+        Some(_) => Frame::Array(Vec::new()),
+        None => Frame::Null,
+    }
+}
+
+/// Pop `count` members (None = exactly one) from a non-empty set using the
+/// replicated (key, write_time) seed. Shared by prepare (faithful preview
+/// on a clone) and apply (authoritative mutation), so both sides sample
+/// identically. The caller guarantees the set is non-empty when count is
+/// None; a Some(0) count returns an empty array.
+fn pop_deterministic(
+    set: &mut ArraySet,
+    key: &Bytes,
+    write_time: u64,
+    count: Option<u64>,
+) -> Frame {
+    debug_assert!(count.is_some() || !set.is_empty());
+    let mut rng = DeterministicRng::new(key, write_time);
+    match count {
+        None => Frame::BulkString(set.swap_remove_at(rng.next_index(set.len()))),
+        Some(count) => {
+            let pops = (count as usize).min(set.len());
+            Frame::Array(
+                (0..pops)
+                    .map(|_| Frame::BulkString(set.swap_remove_at(rng.next_index(set.len()))))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Entropy for read-only sampling commands (SRANDMEMBER, HRANDFIELD).
+/// Their replies are never replicated, so any stream is correct; mixing a
+/// global counter just keeps consecutive calls independent.
+static SAMPLER_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x517c_3d4e_19f2_8ab1);
+
+fn read_sampler(key: &Bytes, logical_time: u64) -> DeterministicRng {
+    let nonce = SAMPLER_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DeterministicRng::new(key, logical_time ^ nonce.rotate_left(17))
 }
 
 fn parse_bit_offset(value: &Bytes) -> Result<u64> {
@@ -6742,6 +7024,276 @@ mod tests {
                 .unwrap()
                 .1,
             Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn spop_is_deterministic_across_replicas_and_matches_the_seed() {
+        use crate::collections::{ArraySet, DeterministicRng};
+
+        let build = || {
+            let mut state = StateMachine::default();
+            state
+                .execute_request(command(&[b"SADD", b"s", b"a", b"b", b"c", b"d", b"e"]))
+                .unwrap();
+            state
+        };
+        let mut first = build();
+        let mut second = build();
+
+        // Both replicas resolve identical pops from the identical member
+        // array plus the replicated (key, write_time) seed.
+        for command_parts in [
+            &[b"SPOP".as_slice(), b"s".as_slice()][..],
+            &[b"SPOP".as_slice(), b"s".as_slice(), b"2".as_slice()][..],
+        ] {
+            let (left_operation, left) = first.execute_request(command(command_parts)).unwrap();
+            let (right_operation, right) = second.execute_request(command(command_parts)).unwrap();
+            assert_eq!(left, right);
+            assert_eq!(left_operation, right_operation);
+        }
+        assert_eq!(
+            first.execute_request(command(&[b"SCARD", b"s"])).unwrap().1,
+            Frame::Integer(2)
+        );
+
+        // The choice is the documented seed applied to the live array. Each
+        // SPOP reseeds from (key, write_time); nothing advanced the logical
+        // clock here, so both commands draw with time 0.
+        let mut replay = ArraySet::new();
+        for member in [b"a", b"b", b"c", b"d", b"e"] {
+            replay.insert(Bytes::copy_from_slice(member));
+        }
+        let mut rng = DeterministicRng::new(b"s", 0);
+        let one = replay.swap_remove_at(rng.next_index(replay.len()));
+        let mut rng = DeterministicRng::new(b"s", 0);
+        let pop_two: Vec<Bytes> = (0..2)
+            .map(|_| replay.swap_remove_at(rng.next_index(replay.len())))
+            .collect();
+        let mut third = build();
+        assert_eq!(
+            third.execute_request(command(&[b"SPOP", b"s"])).unwrap().1,
+            Frame::BulkString(one)
+        );
+        assert_eq!(
+            third
+                .execute_request(command(&[b"SPOP", b"s", b"2"]))
+                .unwrap()
+                .1,
+            Frame::Array(pop_two.clone().into_iter().map(Frame::BulkString).collect())
+        );
+        let remaining = replay.into_entries();
+        assert_eq!(remaining.len(), 2);
+
+        // SPOP beyond the set size drains it and deletes the key.
+        assert_eq!(
+            third
+                .execute_request(command(&[b"SPOP", b"s", b"99"]))
+                .unwrap()
+                .1,
+            Frame::Array(remaining.into_iter().map(Frame::BulkString).collect())
+        );
+        assert_eq!(
+            third
+                .execute_request(command(&[b"EXISTS", b"s"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn spop_handles_missing_keys_zero_counts_and_wrong_types() {
+        let mut state = StateMachine::default();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SPOP", b"missing"]))
+                .unwrap()
+                .1,
+            Frame::Null
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SPOP", b"missing", b"3"]))
+                .unwrap()
+                .1,
+            Frame::Array(Vec::new())
+        );
+        state
+            .execute_request(command(&[b"SADD", b"s", b"only"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SPOP", b"s", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Array(Vec::new())
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"SCARD", b"s"])).unwrap().1,
+            Frame::Integer(1)
+        );
+        state
+            .execute_request(command(&[b"SET", b"str", b"v"]))
+            .unwrap();
+        let error = state
+            .execute_request(command(&[b"SPOP", b"str"]))
+            .unwrap_err();
+        assert!(error.to_string().contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn srandmember_samples_without_mutating() {
+        let mut state = StateMachine::default();
+        for member in ["a", "b", "c", "d"] {
+            state
+                .execute_request(command(&[b"SADD", b"s", member.as_bytes()]))
+                .unwrap();
+        }
+        let Frame::BulkString(member) = state
+            .execute_request(command(&[b"SRANDMEMBER", b"s"]))
+            .unwrap()
+            .1
+        else {
+            panic!("SRANDMEMBER without count must return one member");
+        };
+        assert!(matches!(member.as_ref(), b"a" | b"b" | b"c" | b"d"));
+        assert_eq!(
+            state.execute_request(command(&[b"SCARD", b"s"])).unwrap().1,
+            Frame::Integer(4),
+            "SRANDMEMBER must not mutate"
+        );
+
+        let (_, distinct) = state
+            .execute_request(command(&[b"SRANDMEMBER", b"s", b"3"]))
+            .unwrap();
+        let Frame::Array(distinct) = distinct else {
+            panic!("count form must reply with an array");
+        };
+        assert_eq!(distinct.len(), 3);
+        let mut seen = std::collections::HashSet::new();
+        for frame in distinct {
+            let Frame::BulkString(member) = frame else {
+                panic!("members must be bulk strings");
+            };
+            assert!(matches!(member.as_ref(), b"a" | b"b" | b"c" | b"d"));
+            assert!(seen.insert(member), "positive count must be distinct");
+        }
+
+        let Frame::Array(with_repeats) = state
+            .execute_request(command(&[b"SRANDMEMBER", b"s", b"-7"]))
+            .unwrap()
+            .1
+        else {
+            panic!("negative count must reply with an array");
+        };
+        assert_eq!(with_repeats.len(), 7);
+
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SRANDMEMBER", b"s", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Array(Vec::new())
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SRANDMEMBER", b"missing"]))
+                .unwrap()
+                .1,
+            Frame::Null
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"SRANDMEMBER", b"missing", b"3"]))
+                .unwrap()
+                .1,
+            Frame::Array(Vec::new())
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"SCARD", b"s"])).unwrap().1,
+            Frame::Integer(4)
+        );
+    }
+
+    #[test]
+    fn hrandfield_covers_count_forms_and_withvalues() {
+        let mut state = StateMachine::default();
+        state
+            .execute_request(command(&[
+                b"HSET", b"h", b"f1", b"v1", b"f2", b"v2", b"f3", b"v3",
+            ]))
+            .unwrap();
+        let Frame::BulkString(field) = state
+            .execute_request(command(&[b"HRANDFIELD", b"h"]))
+            .unwrap()
+            .1
+        else {
+            panic!("HRANDFIELD without count must return one field");
+        };
+        assert!(matches!(field.as_ref(), b"f1" | b"f2" | b"f3"));
+
+        let Frame::Array(distinct) = state
+            .execute_request(command(&[b"HRANDFIELD", b"h", b"2"]))
+            .unwrap()
+            .1
+        else {
+            panic!("count form must reply with an array");
+        };
+        assert_eq!(distinct.len(), 2);
+
+        let Frame::Array(with_values) = state
+            .execute_request(command(&[b"HRANDFIELD", b"h", b"-5", b"WITHVALUES"]))
+            .unwrap()
+            .1
+        else {
+            panic!("WITHVALUES must reply with an array");
+        };
+        assert_eq!(with_values.len(), 10, "flat field/value pairs");
+        for pair in with_values.chunks_exact(2) {
+            let (Frame::BulkString(field), Frame::BulkString(value)) = (&pair[0], &pair[1]) else {
+                panic!("WITHVALUES pairs must be bulk strings");
+            };
+            let expected = match field.as_ref() {
+                b"f1" => b"v1",
+                b"f2" => b"v2",
+                b"f3" => b"v3",
+                _ => panic!("unknown field {field:?}"),
+            };
+            assert_eq!(value.as_ref(), expected);
+        }
+
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HRANDFIELD", b"h", b"0"]))
+                .unwrap()
+                .1,
+            Frame::Array(Vec::new())
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HRANDFIELD", b"missing"]))
+                .unwrap()
+                .1,
+            Frame::Null
+        );
+        assert_eq!(
+            state
+                .execute_request(command(&[b"HRANDFIELD", b"missing", b"3"]))
+                .unwrap()
+                .1,
+            Frame::Array(Vec::new())
+        );
+        assert!(
+            state
+                .execute_request(command(&[b"HRANDFIELD", b"h", b"WITHVALUES"]))
+                .is_err(),
+            "WITHVALUES without a count is a syntax error"
+        );
+        assert_eq!(
+            state.execute_request(command(&[b"HLEN", b"h"])).unwrap().1,
+            Frame::Integer(3),
+            "HRANDFIELD must not mutate"
         );
     }
 
