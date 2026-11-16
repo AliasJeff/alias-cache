@@ -65,7 +65,7 @@ docker compose up --build --detach
 - **Durability that survives failover** — every acknowledged write is on a Raft quorum. Leader death, network partitions, node restarts: nothing acknowledged is lost.
 - **Linearizable reads at scale** — lease-based reads serve straight from the leader's state machine at ~372,000 GETs/s, falling back to ReadIndex with fail-closed semantics under partitions.
 - **Full RESP2/RESP3 protocol** — pipelines, inline commands, `HELLO` negotiation. Standard Redis clients connect without modification.
-- **Rich data types** — Strings with the full SET option matrix, Hash, List, Set, Sorted Set, Bitmap (including BITOP), Streams, and Bloom filters with deterministic cross-replica hashing.
+- **Rich data types** — Strings with the full SET option matrix, Hash, List, Set, Sorted Set, Bitmap (including BITOP), Streams, and Bloom filters with deterministic cross-replica hashing. Sets and hashes are insertion-ordered arrays with an O(1) side index: SPOP/SRANDMEMBER/HRANDFIELD sample at O(1), and the sampling seed rides in the Raft entry, so every replica pops the same members without replicating the choice.
 - **Transactions without races** — MULTI/EXEC with WATCH optimistic locking; the CAS check and the writes commit in the same log entry, so there is no check-then-write window on any replica.
 - **Lua scripting** — EVAL runs on the leader with a sandboxed interpreter (memory cap, instruction budget), and only the deterministic result is replicated.
 - **TTL done right** — a hierarchical timing wheel tracks every TTL'd key with O(1) amortized discovery; mass expiration is reclaimed in one log entry, and WAL fsync stays flat at ~0.3ms even as the log grows to gigabytes.
@@ -84,7 +84,7 @@ docker compose up --build --detach
 ## Verify it yourself
 
 ```bash
-cargo test --workspace --locked      # 181 tests, including OpenRaft's full storage contract suite
+cargo test --workspace --locked      # 210 tests, including OpenRaft's full storage contract suite
 python3 scripts/smoke_cluster.py     # real 3-node failover: kill the leader, watch recovery
 
 cargo build --release
