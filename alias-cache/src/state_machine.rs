@@ -7142,6 +7142,67 @@ mod tests {
         assert!(error.to_string().contains("WRONGTYPE"));
     }
 
+    /// The failure mode that motivated the array-backed layout: a node that
+    /// recovers from a snapshot must make the same deterministic sampling
+    /// decisions as a node that replayed the whole log. If the serialized
+    /// form forgot the member order (or the restore reordered it), the two
+    /// replicas' arrays would diverge and SPOP would pop different members.
+    #[test]
+    fn snapshot_recovery_preserves_deterministic_sampling() {
+        let mut live = StateMachine::default();
+        live.advance_logical_time(10_000);
+        for id in 0..40 {
+            live.execute_request(command(&[b"SADD", b"s", format!("m{id}").as_bytes()]))
+                .unwrap();
+        }
+        live.execute_request(command(&[b"SPOP", b"s", b"3"]))
+            .unwrap();
+        live.execute_request(command(&[b"SADD", b"s", b"forty-one"]))
+            .unwrap();
+
+        // Restore through the same serde path a snapshot recovery takes.
+        let encoded = bincode::serialize(&live).unwrap();
+        let mut restored: StateMachine = bincode::deserialize(&encoded).unwrap();
+        restored.recompute_memory();
+        restored.rebuild_expiry_wheel();
+        let mut twin = live.clone();
+        assert_eq!(restored, twin);
+
+        let continuation = |state: &mut StateMachine| -> Vec<Frame> {
+            let mut frames = Vec::new();
+            let script: [&[&[u8]]; 5] = [
+                &[b"SPOP", b"s", b"7"],
+                &[b"SADD", b"s", b"forty-two"],
+                &[b"SPOP", b"s"],
+                &[b"SMEMBERS", b"s"],
+                &[b"SPOP", b"s", b"99"],
+            ];
+            for parts in script {
+                let parts: Vec<Bytes> = parts
+                    .iter()
+                    .map(|part| Bytes::copy_from_slice(part))
+                    .collect();
+                frames.push(state.execute_request(Request::Command(parts)).unwrap().1);
+            }
+            frames
+        };
+        let from_restored = continuation(&mut restored);
+        let from_replayed = continuation(&mut twin);
+        assert_eq!(
+            from_restored, from_replayed,
+            "snapshot recovery must not change any sampling decision"
+        );
+        assert_eq!(restored, twin);
+        // The set is drained by the final SPOP 99; both agree the key is gone.
+        assert_eq!(
+            restored
+                .execute_request(command(&[b"EXISTS", b"s"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+    }
+
     #[test]
     fn srandmember_samples_without_mutating() {
         let mut state = StateMachine::default();

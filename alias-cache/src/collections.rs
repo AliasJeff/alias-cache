@@ -177,6 +177,11 @@ impl Serialize for ArraySet {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Only the vec crosses the wire: it is the canonical state every
         // replica agrees on; the index is rebuilt after deserialization.
+        // The encoding is deliberately byte-identical to what a
+        // BTreeSet<Bytes> produced (bincode renders seq and set the same),
+        // so snapshots written before the array-backed layout keep loading
+        // and old binaries keep reading new ones. Locked by
+        // `wire_format_matches_tree_backed_encoding`.
         self.entries.serialize(serializer)
     }
 }
@@ -283,6 +288,8 @@ impl ArrayHash {
 
 impl Serialize for ArrayHash {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Same frozen-encoding contract as ArraySet: byte-identical to the
+        // BTreeMap<Bytes, Bytes> layout it replaced.
         self.entries.serialize(serializer)
     }
 }
@@ -519,5 +526,31 @@ mod tests {
         let mut expected: Vec<Bytes> = (0..100).map(member).collect();
         expected.sort();
         assert_eq!(sorted, expected);
+    }
+
+    /// Frozen wire contract: bincode renders seq and set (and map and
+    /// seq-of-pairs) identically, so the array encoding is byte-for-byte
+    /// what the tree-backed layout wrote. Snapshots from before the swap
+    /// keep loading, and binaries from before the swap keep reading new
+    /// snapshots — rolling upgrades in both directions.
+    #[test]
+    fn wire_format_matches_tree_backed_encoding() {
+        let set = ArraySet::from_entries(vec![member(1), member(2), member(3)]);
+        let tree: std::collections::BTreeSet<Bytes> =
+            [member(1), member(2), member(3)].into_iter().collect();
+        assert_eq!(
+            bincode::serialize(&set).unwrap(),
+            bincode::serialize(&tree).unwrap(),
+            "ArraySet must encode identically to BTreeSet"
+        );
+
+        let hash = ArrayHash::from_entries(vec![pair(1), pair(2)]);
+        let map: std::collections::BTreeMap<Bytes, Bytes> =
+            [pair(1), pair(2)].into_iter().collect();
+        assert_eq!(
+            bincode::serialize(&hash).unwrap(),
+            bincode::serialize(&map).unwrap(),
+            "ArrayHash must encode identically to BTreeMap"
+        );
     }
 }

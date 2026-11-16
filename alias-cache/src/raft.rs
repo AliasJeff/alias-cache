@@ -8514,4 +8514,77 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// A real v4 snapshot payload (tree-backed sets/hashes, written by the
+    /// v0.2.0-era build) must load into current state unchanged: the array
+    /// collections serialize byte-identically to the tree layout, so no
+    /// version bump or conversion exists to get wrong.
+    #[test]
+    fn v4_snapshot_fixture_loads_into_current_state() {
+        let data = include_bytes!("../tests/fixtures/snapshot-payload-v4.bin");
+        let (mut state, pending_operations) =
+            decode_raft_snapshot(data).expect("v4 snapshot payload decodes");
+        assert!(pending_operations.is_empty());
+
+        assert_eq!(
+            state
+                .execute_request(request(&[b"GET", b"plain"]))
+                .unwrap()
+                .1,
+            Frame::BulkString(Bytes::from("string-value"))
+        );
+        let (_, members) = state
+            .execute_request(request(&[b"SMEMBERS", b"set-key"]))
+            .unwrap();
+        let Frame::Set(members) = members else {
+            panic!("SMEMBERS must reply with a set");
+        };
+        let mut names: Vec<&[u8]> = members
+            .iter()
+            .map(|frame| match frame {
+                Frame::BulkString(bytes) => bytes.as_ref(),
+                _ => panic!("members must be bulk strings"),
+            })
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()]
+        );
+
+        // The rebuilt index must serve SPOP immediately on restored state.
+        let (_, popped) = state
+            .execute_request(request(&[b"SPOP", b"set-key", b"1"]))
+            .unwrap();
+        assert!(matches!(popped, Frame::Array(ref items) if items.len() == 1));
+        assert_eq!(
+            state
+                .execute_request(request(&[b"SCARD", b"set-key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(2)
+        );
+
+        let (_, value) = state
+            .execute_request(request(&[b"HGET", b"hash-key", b"field-one"]))
+            .unwrap();
+        assert_eq!(value, Frame::BulkString(Bytes::from("value-one")));
+        // TTL pins both the restored expire_at and logical_time:
+        // 4_000_000_000 - 3_999_970_000 = 30_000 ms = 30 s.
+        assert_eq!(
+            state
+                .execute_request(request(&[b"TTL", b"ttl-key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(30)
+        );
+        // The idempotency cache restored with its entry.
+        assert_eq!(
+            state
+                .execute_request(request(&[b"EXISTS", b"dedup-key"]))
+                .unwrap()
+                .1,
+            Frame::Integer(1)
+        );
+    }
 }
