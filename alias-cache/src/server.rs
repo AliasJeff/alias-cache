@@ -1496,12 +1496,12 @@ mod tests {
         assert_eq!(
             follower_frames.next_frame(&mut follower_conn).await,
             Frame::Array(vec![
-                Frame::bulk_string("a"),
-                Frame::bulk_string("one"),
                 Frame::bulk_string("b"),
                 Frame::bulk_string("two"),
+                Frame::bulk_string("a"),
+                Frame::bulk_string("one"),
             ]),
-            "HGETALL returns fields in deterministic byte order"
+            "HGETALL returns fields in replicated insertion order"
         );
         assert_eq!(
             follower_frames.next_frame(&mut follower_conn).await,
@@ -1511,7 +1511,7 @@ mod tests {
         assert_eq!(
             follower_frames.next_frame(&mut follower_conn).await,
             Frame::Array(vec![Frame::bulk_string("x"), Frame::bulk_string("y"),]),
-            "SMEMBERS returns members in byte order"
+            "SMEMBERS returns members in replicated insertion order"
         );
         assert_eq!(
             follower_frames.next_frame(&mut follower_conn).await,

@@ -17,11 +17,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// FNV-1a. std's SipHash uses per-process random seeds: fine for the
 /// in-memory index, useless for anything seeded from replicated state.
 fn stable_hash(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
-        })
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 /// Seed-derived random stream for replicated randomness (SPOP and friends).
@@ -342,9 +340,9 @@ mod tests {
         let mut set = ArraySet::new();
         let mut model = std::collections::HashSet::new();
         let mut rng = TestRng(0xdead_beef);
-        for _step in 0..5_000 {
+        for _ in 0..5_000 {
             let id = rng.next() % 64;
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 assert_eq!(set.remove(&member(id)), model.remove(&member(id)));
             } else {
                 assert_eq!(set.insert(member(id)), model.insert(member(id)));
@@ -353,7 +351,7 @@ mod tests {
             assert_eq!(set.contains(&member(id)), model.contains(&member(id)));
             assert_set_invariants(&set);
             let members: std::collections::HashSet<_> = set.iter().cloned().collect();
-            assert_eq!(members, model, "divergence at step {_step}");
+            assert_eq!(members, model, "members diverge from the model");
         }
     }
 
@@ -412,10 +410,13 @@ mod tests {
         let mut hash = ArrayHash::new();
         let mut model = std::collections::HashMap::new();
         let mut rng = TestRng(0xfeed_face);
-        for step in 0..5_000 {
+        for _ in 0..5_000 {
             let id = rng.next() % 64;
-            if rng.next() % 4 == 0 {
-                assert_eq!(hash.remove(&member(id)), model.remove(&member(id)).is_some());
+            if rng.next().is_multiple_of(4) {
+                assert_eq!(
+                    hash.remove(&member(id)),
+                    model.remove(&member(id)).is_some()
+                );
             } else {
                 let inserted = !model.contains_key(&member(id));
                 assert_eq!(hash.insert(member(id), Bytes::from("v")), inserted);
@@ -472,7 +473,10 @@ mod tests {
                 other += 1;
             }
         }
-        assert!(other > 50, "adjacent write_times must decorrelate, got {other}/100");
+        assert!(
+            other > 50,
+            "adjacent write_times must decorrelate, got {other}/100"
+        );
     }
 
     #[test]

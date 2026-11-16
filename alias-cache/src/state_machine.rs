@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
+use crate::collections::{ArrayHash, ArraySet};
 use crate::error::{Error, Result};
 use crate::protocol::{Frame, Request};
 
@@ -128,9 +129,9 @@ pub enum Value {
         hash_count: u8,
         inserted: u64,
     },
-    Hash(BTreeMap<Bytes, Bytes>),
+    Hash(Box<ArrayHash>),
     List(VecDeque<Bytes>),
-    Set(BTreeSet<Bytes>),
+    Set(Box<ArraySet>),
     SortedSet(BTreeMap<Bytes, i64>),
 }
 
@@ -759,13 +760,13 @@ impl StateMachine {
                     .cloned();
                 let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
                 let mut hash = match existing.map(|entry| entry.value) {
-                    None => BTreeMap::new(),
+                    None => Box::new(ArrayHash::new()),
                     Some(Value::Hash(hash)) => hash,
                     Some(_) => return ApplyResult::Response(wrong_type_frame()),
                 };
                 let mut added = 0_i64;
                 for (field, value) in fields {
-                    if hash.insert(field, value).is_none() {
+                    if hash.insert(field, value) {
                         added += 1;
                     }
                 }
@@ -797,7 +798,7 @@ impl StateMachine {
                 };
                 let mut removed = 0_i64;
                 for field in fields {
-                    if hash.remove(&field).is_some() {
+                    if hash.remove(&field) {
                         removed += 1;
                     }
                 }
@@ -823,11 +824,11 @@ impl StateMachine {
                     .cloned();
                 let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
                 let mut hash = match existing.map(|entry| entry.value) {
-                    None => BTreeMap::new(),
+                    None => Box::new(ArrayHash::new()),
                     Some(Value::Hash(hash)) => hash,
                     Some(_) => return ApplyResult::Response(wrong_type_frame()),
                 };
-                if hash.contains_key(&field) {
+                if hash.contains_field(&field) {
                     return ApplyResult::Response(Frame::Integer(0));
                 }
                 hash.insert(field, value);
@@ -854,7 +855,7 @@ impl StateMachine {
                     .cloned();
                 let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
                 let mut hash = match existing.map(|entry| entry.value) {
-                    None => BTreeMap::new(),
+                    None => Box::new(ArrayHash::new()),
                     Some(Value::Hash(hash)) => hash,
                     Some(_) => return ApplyResult::Response(wrong_type_frame()),
                 };
@@ -1098,7 +1099,7 @@ impl StateMachine {
                     .cloned();
                 let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
                 let mut set = match existing.map(|entry| entry.value) {
-                    None => BTreeSet::new(),
+                    None => Box::new(ArraySet::new()),
                     Some(Value::Set(set)) => set,
                     Some(_) => return ApplyResult::Response(wrong_type_frame()),
                 };
@@ -3319,7 +3320,7 @@ impl StateMachine {
                     if value_type != "hash" {
                         return Err(Error::protocol(WRONG_TYPE.to_string()));
                     }
-                    hash.keys().cloned().collect()
+                    hash.iter().map(|(field, _)| field.clone()).collect()
                 }
                 Value::Set(set) => {
                     if value_type != "set" {
@@ -3505,7 +3506,8 @@ impl StateMachine {
         let mut seen = BTreeSet::new();
         let mut added = 0_i64;
         for pair in arguments[2..].chunks_exact(2) {
-            if seen.insert(pair[0].clone()) && !hash.is_some_and(|hash| hash.contains_key(&pair[0]))
+            if seen.insert(pair[0].clone())
+                && !hash.is_some_and(|hash| hash.contains_field(&pair[0]))
             {
                 added += 1;
             }
@@ -3545,7 +3547,7 @@ impl StateMachine {
         let Value::Hash(hash) = &existing.value else {
             return Err(wrong_type_error());
         };
-        if hash.contains_key(&arguments[2]) {
+        if hash.contains_field(&arguments[2]) {
             return Ok((None, Frame::Integer(0)));
         }
         Ok((
@@ -3574,7 +3576,7 @@ impl StateMachine {
         let fields = unique_keys(&arguments[2..]);
         let removed = fields
             .iter()
-            .filter(|field| hash.contains_key(*field))
+            .filter(|field| hash.contains_field(field))
             .count();
         if removed == 0 {
             return Ok((None, Frame::Integer(0)));
@@ -3585,7 +3587,7 @@ impl StateMachine {
         ))
     }
 
-    fn hash_for_key(&self, key: &Bytes) -> Result<Option<&BTreeMap<Bytes, Bytes>>> {
+    fn hash_for_key(&self, key: &Bytes) -> Result<Option<&ArrayHash>> {
         let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
             return Ok(None);
         };
@@ -3641,7 +3643,12 @@ impl StateMachine {
         expect_arity("HKEYS", &arguments, 2)?;
         let values = self
             .hash_for_key(&arguments[1])?
-            .map(|hash| hash.keys().cloned().map(Frame::BulkString).collect())
+            .map(|hash| {
+                hash.iter()
+                    .map(|(field, _)| field.clone())
+                    .map(Frame::BulkString)
+                    .collect()
+            })
             .unwrap_or_default();
         Ok((None, Frame::Array(values)))
     }
@@ -3650,14 +3657,19 @@ impl StateMachine {
         expect_arity("HVALS", &arguments, 2)?;
         let values = self
             .hash_for_key(&arguments[1])?
-            .map(|hash| hash.values().cloned().map(Frame::BulkString).collect())
+            .map(|hash| {
+                hash.iter()
+                    .map(|(_, value)| value.clone())
+                    .map(Frame::BulkString)
+                    .collect()
+            })
             .unwrap_or_default();
         Ok((None, Frame::Array(values)))
     }
 
     fn execute_hash_len(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_arity("HLEN", &arguments, 2)?;
-        let length = self.hash_for_key(&arguments[1])?.map_or(0, BTreeMap::len);
+        let length = self.hash_for_key(&arguments[1])?.map_or(0, ArrayHash::len);
         Ok((None, Frame::Integer(length as i64)))
     }
 
@@ -3665,7 +3677,7 @@ impl StateMachine {
         expect_arity("HEXISTS", &arguments, 3)?;
         let exists = self
             .hash_for_key(&arguments[1])?
-            .is_some_and(|hash| hash.contains_key(&arguments[2]));
+            .is_some_and(|hash| hash.contains_field(&arguments[2]));
         Ok((None, Frame::Integer(i64::from(exists))))
     }
 
@@ -3872,7 +3884,7 @@ impl StateMachine {
         ))
     }
 
-    fn set_for_key(&self, key: &Bytes) -> Result<Option<&BTreeSet<Bytes>>> {
+    fn set_for_key(&self, key: &Bytes) -> Result<Option<&ArraySet>> {
         let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
             return Ok(None);
         };
@@ -3890,7 +3902,7 @@ impl StateMachine {
         let added = arguments[2..]
             .iter()
             .filter(|member| seen.insert((*member).clone()))
-            .filter(|member| existing.is_none_or(|set| !set.contains(*member)))
+            .filter(|member| existing.is_none_or(|set| !set.contains(member)))
             .count() as i64;
         Ok((
             Some(Operation::SetAdd {
@@ -3911,7 +3923,7 @@ impl StateMachine {
         let members = arguments[2..]
             .iter()
             .filter(|member| seen.insert((*member).clone()))
-            .filter(|member| set.contains(*member))
+            .filter(|member| set.contains(member))
             .cloned()
             .collect::<Vec<_>>();
         if members.is_empty() {
@@ -3945,22 +3957,22 @@ impl StateMachine {
         expect_arity("SCARD", &arguments, 2)?;
         Ok((
             None,
-            Frame::Integer(self.set_for_key(&arguments[1])?.map_or(0, BTreeSet::len) as i64),
+            Frame::Integer(self.set_for_key(&arguments[1])?.map_or(0, ArraySet::len) as i64),
         ))
     }
 
     fn execute_set_difference(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("SDIFF", &arguments, 2)?;
-        let mut result = self
+        let mut members: Vec<Bytes> = self
             .set_for_key(&arguments[1])?
-            .cloned()
+            .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
         for key in &arguments[2..] {
             if let Some(set) = self.set_for_key(key)? {
-                result.retain(|member| !set.contains(member));
+                members.retain(|member| !set.contains(member));
             }
         }
-        Ok((None, set_frame(result)))
+        Ok((None, set_frame(members)))
     }
 
     fn execute_set_intersection(
@@ -3968,28 +3980,28 @@ impl StateMachine {
         arguments: Vec<Bytes>,
     ) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("SINTER", &arguments, 2)?;
-        let mut result = self
+        let mut members: Vec<Bytes> = self
             .set_for_key(&arguments[1])?
-            .cloned()
+            .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
         for key in &arguments[2..] {
             match self.set_for_key(key)? {
-                Some(set) => result.retain(|member| set.contains(member)),
-                None => result.clear(),
+                Some(set) => members.retain(|member| set.contains(member)),
+                None => members.clear(),
             }
         }
-        Ok((None, set_frame(result)))
+        Ok((None, set_frame(members)))
     }
 
     fn execute_set_union(&self, arguments: Vec<Bytes>) -> Result<(Option<Operation>, Frame)> {
         expect_min_arity("SUNION", &arguments, 2)?;
-        let mut result = BTreeSet::new();
+        let mut result = ArraySet::new();
         for key in &arguments[1..] {
             if let Some(set) = self.set_for_key(key)? {
                 result.extend(set.iter().cloned());
             }
         }
-        Ok((None, set_frame(result)))
+        Ok((None, set_frame(result.into_entries())))
     }
 
     fn sorted_set_for_key(&self, key: &Bytes) -> Result<Option<&BTreeMap<Bytes, i64>>> {
@@ -4150,8 +4162,8 @@ fn string_value_to_frame(value: Option<&Value>) -> Result<Frame> {
     }
 }
 
-fn set_frame(set: BTreeSet<Bytes>) -> Frame {
-    Frame::Set(set.into_iter().map(Frame::BulkString).collect())
+fn set_frame(members: Vec<Bytes>) -> Frame {
+    Frame::Set(members.into_iter().map(Frame::BulkString).collect())
 }
 
 fn parse_bit_offset(value: &Bytes) -> Result<u64> {
@@ -6062,7 +6074,7 @@ mod tests {
             "expired keys must not be scanned"
         );
 
-        // HSCAN walks fields in byte order and terminates.
+        // HSCAN walks fields in insertion order and terminates.
         state
             .execute_request(command(&[b"HSET", b"h", b"z", b"1", b"a", b"2"]))
             .unwrap();
@@ -6074,7 +6086,7 @@ mod tests {
         );
         assert_eq!(
             fields,
-            vec![Frame::bulk_string("a"), Frame::bulk_string("z")]
+            vec![Frame::bulk_string("z"), Frame::bulk_string("a")]
         );
 
         // ZSCAN returns member/score pairs and counts members in the cursor.
@@ -6424,19 +6436,19 @@ mod tests {
                 .unwrap()
                 .1,
             Frame::Map(vec![
-                (Frame::bulk_string("a"), Frame::bulk_string("one")),
-                (Frame::bulk_string("b"), Frame::bulk_string("updated"))
+                (Frame::bulk_string("b"), Frame::bulk_string("updated")),
+                (Frame::bulk_string("a"), Frame::bulk_string("one"))
             ])
         );
         assert_eq!(
             state.execute_request(command(&[b"HKEYS", b"h"])).unwrap().1,
-            Frame::Array(vec![Frame::bulk_string("a"), Frame::bulk_string("b")])
+            Frame::Array(vec![Frame::bulk_string("b"), Frame::bulk_string("a")])
         );
         assert_eq!(
             state.execute_request(command(&[b"HVALS", b"h"])).unwrap().1,
             Frame::Array(vec![
-                Frame::bulk_string("one"),
-                Frame::bulk_string("updated")
+                Frame::bulk_string("updated"),
+                Frame::bulk_string("one")
             ])
         );
         assert_eq!(
@@ -6687,7 +6699,7 @@ mod tests {
     }
 
     #[test]
-    fn set_commands_are_deduplicated_and_sorted_deterministically() {
+    fn set_commands_are_deduplicated_and_keep_insertion_order() {
         let mut state = StateMachine::default();
         assert_eq!(
             state
@@ -6701,7 +6713,7 @@ mod tests {
                 .execute_request(command(&[b"SMEMBERS", b"one"]))
                 .unwrap()
                 .1,
-            Frame::Set(vec![Frame::bulk_string("a"), Frame::bulk_string("b")])
+            Frame::Set(vec![Frame::bulk_string("b"), Frame::bulk_string("a")])
         );
         assert_eq!(
             state
