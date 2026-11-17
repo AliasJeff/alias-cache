@@ -769,66 +769,107 @@ impl StateMachine {
                 fields,
                 return_simple,
             } => {
+                // In place like the set writes: memory moves by the field
+                // delta, not a whole-hash recount.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut hash = match existing.map(|entry| entry.value) {
-                    None => Box::new(ArrayHash::new()),
-                    Some(Value::Hash(hash)) => hash,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                let mut added = 0_i64;
-                for (field, value) in fields {
-                    if hash.insert(field, value) {
-                        added += 1;
+                    .filter(|entry| !self.is_expired(entry));
+                match existing {
+                    None => {
+                        let mut hash = Box::new(ArrayHash::new());
+                        let mut added = 0_i64;
+                        for (field, value) in fields {
+                            if hash.insert(field, value) {
+                                added += 1;
+                            }
+                        }
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::Hash(hash),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        hash_reply(return_simple, added)
                     }
-                }
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::Hash(hash),
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                if return_simple {
-                    ApplyResult::Response(Frame::simple_string("OK"))
-                } else {
-                    ApplyResult::Response(Frame::Integer(added))
+                    Some(entry) if !matches!(entry.value, Value::Hash(_)) => {
+                        ApplyResult::Response(wrong_type_frame())
+                    }
+                    Some(_) => {
+                        let mut added = 0_i64;
+                        let mut delta_bytes: i64 = 0;
+                        {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::Hash(hash) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            for (field, value) in fields {
+                                let field_len = field.len() as i64;
+                                let incoming = field_len + value.len() as i64;
+                                let old_value_len =
+                                    hash.get(&field).map_or(0, |old| old.len() as i64);
+                                if hash.insert(field, value) {
+                                    added += 1;
+                                    delta_bytes += incoming;
+                                } else {
+                                    // Overwrite: only the value bytes moved.
+                                    delta_bytes += incoming - field_len - old_value_len;
+                                }
+                            }
+                            // insert_entry bumped the version on every
+                            // overwrite; keep WATCH seeing no-op HSETs.
+                            entry.version = entry.version.wrapping_add(1);
+                        }
+                        self.memory_bytes = self.memory_bytes.saturating_add_signed(delta_bytes);
+                        hash_reply(return_simple, added)
+                    }
                 }
             }
             Operation::HashDelete { key, fields } => {
-                let Some(existing) = self
+                let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                    .filter(|entry| !self.is_expired(entry));
+                let is_hash = existing.is_some_and(|entry| matches!(entry.value, Value::Hash(_)));
+                let Some(_) = existing else {
                     return ApplyResult::Response(Frame::Integer(0));
                 };
-                let Value::Hash(mut hash) = existing.value else {
+                if !is_hash {
                     return ApplyResult::Response(wrong_type_frame());
-                };
+                }
                 let mut removed = 0_i64;
-                for field in fields {
-                    if hash.remove(&field) {
-                        removed += 1;
+                let mut removed_bytes = 0_u64;
+                let mut drained = false;
+                {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::Hash(hash) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    for field in &fields {
+                        if let Some(old) = hash.get(field) {
+                            removed_bytes += (field.len() + old.len()) as u64;
+                            hash.remove(field);
+                            removed += 1;
+                        }
+                    }
+                    if hash.is_empty() {
+                        drained = true;
+                    } else {
+                        // Matches the old path: the surviving entry always
+                        // re-inserted, so the version moves even when
+                        // nothing matched.
+                        entry.version = entry.version.wrapping_add(1);
                     }
                 }
-                if hash.is_empty() {
+                // Removed field bytes leave the counter here; on drain,
+                // remove_entry charges only the empty entry's key bytes.
+                if removed > 0 {
+                    self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
+                }
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::Hash(hash),
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
@@ -836,27 +877,42 @@ impl StateMachine {
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut hash = match existing.map(|entry| entry.value) {
-                    None => Box::new(ArrayHash::new()),
-                    Some(Value::Hash(hash)) => hash,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                if hash.contains_field(&field) {
-                    return ApplyResult::Response(Frame::Integer(0));
+                    .filter(|entry| !self.is_expired(entry));
+                match existing {
+                    None => {
+                        let mut hash = Box::new(ArrayHash::new());
+                        hash.insert(field, value);
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::Hash(hash),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        ApplyResult::Response(Frame::Integer(1))
+                    }
+                    Some(entry) if !matches!(entry.value, Value::Hash(_)) => {
+                        ApplyResult::Response(wrong_type_frame())
+                    }
+                    Some(_) => {
+                        {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::Hash(hash) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            if hash.contains_field(&field) {
+                                // Old path: no re-insert, version unchanged.
+                                return ApplyResult::Response(Frame::Integer(0));
+                            }
+                            let incoming = (field.len() + value.len()) as u64;
+                            hash.insert(field, value);
+                            entry.version = entry.version.wrapping_add(1);
+                            self.memory_bytes = self.memory_bytes.saturating_add(incoming);
+                        }
+                        ApplyResult::Response(Frame::Integer(1))
+                    }
                 }
-                hash.insert(field, value);
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::Hash(hash),
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                ApplyResult::Response(Frame::Integer(1))
             }
             Operation::HashIncrement {
                 key,
@@ -864,42 +920,80 @@ impl StateMachine {
                 increment,
             } => {
                 const NOT_INTEGER: &str = "ERR hash value is not an integer";
+                // In place like the other hash writes: only the replaced
+                // value's byte delta moves the memory counter.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut hash = match existing.map(|entry| entry.value) {
-                    None => Box::new(ArrayHash::new()),
-                    Some(Value::Hash(hash)) => hash,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                let current = match hash.get(&field) {
-                    None => 0,
-                    Some(bytes) => {
-                        match std::str::from_utf8(bytes)
-                            .map_err(|_| NOT_INTEGER)
-                            .and_then(|text| text.parse::<i64>().map_err(|_| NOT_INTEGER))
-                        {
-                            Ok(value) => value,
-                            Err(message) => return ApplyResult::Response(Frame::error(message)),
-                        }
+                    .filter(|entry| !self.is_expired(entry));
+                match existing {
+                    None => {
+                        let mut hash = Box::new(ArrayHash::new());
+                        let Some(total) = 0_i64.checked_add(increment) else {
+                            return ApplyResult::Response(Frame::error(NOT_INTEGER));
+                        };
+                        hash.insert(field, Bytes::from(total.to_string()));
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::Hash(hash),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        ApplyResult::Response(Frame::Integer(total))
                     }
-                };
-                let Some(total) = current.checked_add(increment) else {
-                    return ApplyResult::Response(Frame::error(NOT_INTEGER));
-                };
-                hash.insert(field, Bytes::from(total.to_string()));
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::Hash(hash),
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                ApplyResult::Response(Frame::Integer(total))
+                    Some(entry) if !matches!(entry.value, Value::Hash(_)) => {
+                        ApplyResult::Response(wrong_type_frame())
+                    }
+                    Some(_) => {
+                        let current = {
+                            let entry = self.values.get(&key).expect("verified live above");
+                            let Value::Hash(hash) = &entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            match hash.get(&field) {
+                                None => 0,
+                                Some(bytes) => {
+                                    match std::str::from_utf8(bytes)
+                                        .map_err(|_| NOT_INTEGER)
+                                        .and_then(|text| {
+                                            text.parse::<i64>().map_err(|_| NOT_INTEGER)
+                                        }) {
+                                        Ok(value) => value,
+                                        Err(message) => {
+                                            return ApplyResult::Response(Frame::error(message));
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let Some(total) = current.checked_add(increment) else {
+                            return ApplyResult::Response(Frame::error(NOT_INTEGER));
+                        };
+                        let new_value = Bytes::from(total.to_string());
+                        let new_len = new_value.len() as i64;
+                        let field_len = field.len() as i64;
+                        let delta = {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::Hash(hash) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            let old_len = hash.get(&field).map_or(0, |old| old.len() as i64);
+                            let delta = if hash.insert(field, new_value) {
+                                field_len + new_len
+                            } else {
+                                new_len - old_len
+                            };
+                            // The old path always re-inserted the entry:
+                            // bump the version on every successful INCRBY.
+                            entry.version = entry.version.wrapping_add(1);
+                            delta
+                        };
+                        self.memory_bytes = self.memory_bytes.saturating_add_signed(delta);
+                        ApplyResult::Response(Frame::Integer(total))
+                    }
+                }
             }
             Operation::SortedSetIncrement {
                 key,
@@ -1108,58 +1202,102 @@ impl StateMachine {
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::SetAdd { key, members } => {
+                // In place like SetPop: bulk SADD stays O(added) instead of
+                // cloning and re-counting the whole set per command, which
+                // made growing a large set quadratic.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut set = match existing.map(|entry| entry.value) {
-                    None => Box::new(ArraySet::new()),
-                    Some(Value::Set(set)) => set,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                let added = members
-                    .into_iter()
-                    .filter(|member| set.insert(member.clone()))
-                    .count() as i64;
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::Set(set),
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                ApplyResult::Response(Frame::Integer(added))
+                    .filter(|entry| !self.is_expired(entry));
+                let is_set = existing.is_some_and(|entry| matches!(entry.value, Value::Set(_)));
+                match existing {
+                    None => {
+                        let mut set = Box::new(ArraySet::new());
+                        let mut added = 0_i64;
+                        for member in members {
+                            if set.insert(member) {
+                                added += 1;
+                            }
+                        }
+                        // insert_entry charges the whole new entry; nothing
+                        // to adjust afterwards.
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::Set(set),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        ApplyResult::Response(Frame::Integer(added))
+                    }
+                    Some(_) if !is_set => ApplyResult::Response(wrong_type_frame()),
+                    Some(_) => {
+                        let mut added = 0_i64;
+                        let mut added_bytes = 0_u64;
+                        {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::Set(set) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            for member in members {
+                                let size = member.len() as u64;
+                                if set.insert(member) {
+                                    added += 1;
+                                    added_bytes += size;
+                                }
+                            }
+                            // insert_entry bumped the version on every
+                            // overwrite, even a no-op SADD; WATCH depends
+                            // on that, so keep the behavior.
+                            entry.version = entry.version.wrapping_add(1);
+                        }
+                        self.memory_bytes = self.memory_bytes.saturating_add(added_bytes);
+                        ApplyResult::Response(Frame::Integer(added))
+                    }
+                }
             }
             Operation::SetRemove { key, members } => {
-                let Some(existing) = self
+                let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                    .filter(|entry| !self.is_expired(entry));
+                let is_set = existing.is_some_and(|entry| matches!(entry.value, Value::Set(_)));
+                let Some(_) = existing else {
                     return ApplyResult::Response(Frame::Integer(0));
                 };
-                let Value::Set(mut set) = existing.value else {
+                if !is_set {
                     return ApplyResult::Response(wrong_type_frame());
-                };
-                let removed = members
-                    .into_iter()
-                    .filter(|member| set.remove(member))
-                    .count() as i64;
-                if set.is_empty() {
+                }
+                let mut removed = 0_i64;
+                let mut removed_bytes = 0_u64;
+                let mut drained = false;
+                {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::Set(set) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    for member in &members {
+                        if set.remove(member) {
+                            removed += 1;
+                            removed_bytes += member.len() as u64;
+                        }
+                    }
+                    if set.is_empty() {
+                        drained = true;
+                    } else if removed > 0 {
+                        // Matches the old path: the version only moves
+                        // when something was actually removed.
+                        entry.version = entry.version.wrapping_add(1);
+                    }
+                }
+                // Member bytes leave the counter here; on drain,
+                // remove_entry charges only the empty entry's key bytes.
+                if removed > 0 {
+                    self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
+                }
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else if removed > 0 {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::Set(set),
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
@@ -1213,18 +1351,18 @@ impl StateMachine {
                         popped.push(member);
                     }
                     if set.is_empty() {
-                        // remove_entry charges what remains (just the key
-                        // bytes); the member bytes are gone from the vec.
                         drained = true;
                     } else {
                         entry.version = entry.version.wrapping_add(1);
-                        let drained_bytes =
-                            popped.iter().map(|member| member.len() as u64).sum::<u64>();
-                        self.memory_bytes = self.memory_bytes.saturating_sub(drained_bytes);
                         // expire_at is unchanged, so the expiry timer stays
                         // armed and the wheel is left alone.
                     }
                 }
+                // Popped member bytes leave the counter here; on drain,
+                // remove_entry afterwards charges only the empty entry's
+                // key bytes.
+                let popped_bytes = popped.iter().map(|member| member.len() as u64).sum::<u64>();
+                self.memory_bytes = self.memory_bytes.saturating_sub(popped_bytes);
                 if drained {
                     let _ = self.remove_entry(&key);
                 }
@@ -4706,6 +4844,15 @@ fn wrong_type_frame() -> Frame {
     Frame::error(WRONG_TYPE)
 }
 
+/// HSET replies with the added-field count; HMSET (return_simple) with OK.
+fn hash_reply(return_simple: bool, added: i64) -> ApplyResult {
+    if return_simple {
+        ApplyResult::Response(Frame::simple_string("OK"))
+    } else {
+        ApplyResult::Response(Frame::Integer(added))
+    }
+}
+
 fn unique_keys(keys: &[Bytes]) -> Vec<Bytes> {
     let mut unique = Vec::with_capacity(keys.len());
     for key in keys {
@@ -7151,6 +7298,63 @@ mod tests {
             .execute_request(command(&[b"SPOP", b"str"]))
             .unwrap_err();
         assert!(error.to_string().contains("WRONGTYPE"));
+    }
+
+    /// Every set/hash write now books memory incrementally in place; after
+    /// each command the running counter must equal a full recount. Covers
+    /// adds, overwrites, no-ops, removals, drains, INCRBY growth/shrink and
+    /// TTL'd keys.
+    #[test]
+    fn set_and_hash_in_place_bookkeeping_matches_recounts() {
+        let mut state = StateMachine::default();
+        let check = |state: &mut StateMachine| {
+            let mut recomputed = state.clone();
+            recomputed.recompute_memory();
+            assert_eq!(
+                state.memory_usage(),
+                recomputed.memory_usage(),
+                "incremental memory drifted"
+            );
+        };
+        let commands: [&[&[u8]]; 16] = [
+            &[b"SADD", b"s", b"alpha", b"beta", b"gamma"],
+            &[b"SADD", b"s", b"alpha", b"delta"],
+            &[b"SADD", b"s", b"alpha"],
+            &[b"SPOP", b"s"],
+            &[b"SPOP", b"s", b"2"],
+            &[b"SADD", b"s", b"epsilon", b"zeta"],
+            &[b"SREM", b"s", b"missing", b"epsilon"],
+            &[b"SADD", b"ttlset", b"x", b"y"],
+            &[b"EXPIRE", b"ttlset", b"1000"],
+            &[b"SADD", b"ttlset", b"z"],
+            &[b"HSET", b"h", b"f1", b"one", b"f2", b"two"],
+            &[b"HSET", b"h", b"f1", b"a-much-longer-value"],
+            &[b"HSET", b"h", b"f1", b"x"],
+            &[b"HSETNX", b"h", b"f1", b"ignored"],
+            &[b"HINCRBY", b"h", b"counter", b"1000000"],
+            &[b"HDEL", b"h", b"f1", b"counter"],
+        ];
+        for parts in commands {
+            state.execute_request(command(parts)).unwrap();
+            check(&mut state);
+        }
+        // Draining removes the entry entirely; memory must land back on the
+        // remaining keys only.
+        state
+            .execute_request(command(&[b"SREM", b"s", b"beta", b"delta", b"zeta"]))
+            .unwrap();
+        check(&mut state);
+        state
+            .execute_request(command(&[b"HDEL", b"h", b"f2"]))
+            .unwrap();
+        check(&mut state);
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXISTS", b"h"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
     }
 
     /// The failure mode that motivated the array-backed layout: a node that
