@@ -9,7 +9,7 @@
 //! sidesteps the classic bug where two nodes restore the same members but
 //! iterate them in different orders.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -326,6 +326,179 @@ impl ArrayHash {
     }
 }
 
+/// A tiny Either so score_order returns one iterator type for both
+/// directions without boxing.
+enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<L, R> Iterator for Either<L, R>
+where
+    L: Iterator<Item = R::Item>,
+    R: Iterator,
+{
+    type Item = L::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Either::Left(left) => left.next(),
+            Either::Right(right) => right.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Either::Left(left) => left.size_hint(),
+            Either::Right(right) => right.size_hint(),
+        }
+    }
+}
+
+/// A finite f64 that orders by value, matching Redis: scores are rejected
+/// at parse/apply unless finite, so total_cmp is a total order here.
+#[derive(Clone, Copy, Debug)]
+pub struct OrderedScore(pub f64);
+
+impl PartialEq for OrderedScore {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for OrderedScore {}
+impl PartialOrd for OrderedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Sorted set with a score-ordered rank index, the layout used by Redis:
+/// a member→score map for point access plus a (score, member) tree for
+/// ordered scans. Writes maintain both in O(log n); ZRANGE walks the tree
+/// directly instead of re-sorting everything per call.
+///
+/// Only the map is serialized — it is the canonical replicated state, and
+/// its encoding is byte-identical to the bare `BTreeMap<Bytes, i64>` this
+/// replaced, so existing snapshots load unchanged. The index is derived
+/// state, rebuilt on load (same contract as ArraySet/ArrayHash).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SortedSet {
+    scores: BTreeMap<Bytes, i64>,
+    index: BTreeSet<(OrderedScore, Bytes)>,
+}
+
+impl SortedSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Rebuild from a member→score-bits map (deserialization path).
+    pub fn from_scores(scores: BTreeMap<Bytes, i64>) -> Self {
+        let index = scores
+            .iter()
+            .map(|(member, score)| (OrderedScore(f64::from_bits(*score as u64)), member.clone()))
+            .collect::<BTreeSet<_>>();
+        Self { scores, index }
+    }
+
+    pub fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scores.is_empty()
+    }
+
+    pub fn contains(&self, member: &Bytes) -> bool {
+        self.scores.contains_key(member)
+    }
+
+    pub fn score(&self, member: &Bytes) -> Option<i64> {
+        self.scores.get(member).copied()
+    }
+
+    /// Member order iteration (ZSCAN keeps the map's byte order).
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, Bytes, i64> {
+        self.scores.iter()
+    }
+
+    /// Upsert one member; reports whether the member is new. O(log n).
+    pub fn insert(&mut self, member: Bytes, score_bits: i64) -> bool {
+        let ordered = OrderedScore(f64::from_bits(score_bits as u64));
+        match self.scores.insert(member.clone(), score_bits) {
+            Some(old_bits) => {
+                let old_ordered = OrderedScore(f64::from_bits(old_bits as u64));
+                if old_ordered != ordered {
+                    self.index.remove(&(old_ordered, member.clone()));
+                    self.index.insert((ordered, member));
+                }
+                false
+            }
+            None => {
+                self.index.insert((ordered, member));
+                true
+            }
+        }
+    }
+
+    /// Remove one member; reports whether it existed. O(log n).
+    pub fn remove(&mut self, member: &Bytes) -> bool {
+        match self.scores.remove(member) {
+            Some(old_bits) => {
+                let ordered = OrderedScore(f64::from_bits(old_bits as u64));
+                self.index.remove(&(ordered, member.clone()));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// (member, score bits) in Redis sorted-set order — score ascending,
+    /// member ascending on ties — or fully reversed. This is the same
+    /// order the per-call sort used to produce.
+    pub fn score_order(&self, reverse: bool) -> impl Iterator<Item = (&Bytes, i64)> {
+        let forward = self
+            .index
+            .iter()
+            .map(|(score, member)| (member, score.0.to_bits() as i64));
+        if reverse {
+            Either::Right(forward.rev())
+        } else {
+            Either::Left(forward)
+        }
+    }
+
+    /// Zero-based rank of a live member in score order (O(rank); the
+    /// reverse rank is len - 1 - rank).
+    pub fn rank(&self, member: &Bytes) -> Option<usize> {
+        let score = self.scores.get(member).copied()?;
+        let ordered = OrderedScore(f64::from_bits(score as u64));
+        Some(self.index.range(..&(ordered, member.clone())).count())
+    }
+}
+
+impl Serialize for SortedSet {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Frozen wire contract: identical bytes to the bare
+        // BTreeMap<Bytes, i64> layout this replaced. Locked by
+        // `wire_format_matches_tree_backed_encoding`.
+        self.scores.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SortedSet {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_scores(BTreeMap::<Bytes, i64>::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
 impl Serialize for ArrayHash {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Same frozen-encoding contract as ArraySet: byte-identical to the
@@ -603,6 +776,81 @@ mod tests {
                 assert_eq!(sampled, popped, "size {size} count {count:?} seed {seed}");
             }
         }
+    }
+
+    #[test]
+    fn sorted_set_index_matches_full_sort_order() {
+        let mut set = SortedSet::new();
+        let scores = [
+            (1.5, "a"),
+            (-2.0, "z"),
+            (1.5, "b"),
+            (0.0, "m"),
+            (f64::MIN_POSITIVE * 4.0, "tiny"),
+            (-0.0, "neg-zero"),
+            (0.0, "pos-zero"),
+            (7.25, "top"),
+        ];
+        for (score, member) in scores {
+            set.insert(Bytes::from(member), score.to_bits() as i64);
+        }
+        let forward: Vec<String> = set
+            .score_order(false)
+            .map(|(member, _)| String::from_utf8_lossy(member).into_owned())
+            .collect();
+        // score ascending (total_cmp puts -0.0 before 0.0), member
+        // ascending within a tie — exactly what the old per-call sort did.
+        assert_eq!(
+            forward,
+            vec!["z", "neg-zero", "m", "pos-zero", "tiny", "a", "b", "top"]
+        );
+        let reverse: Vec<String> = set
+            .score_order(true)
+            .map(|(member, _)| String::from_utf8_lossy(member).into_owned())
+            .collect();
+        let mut expected = forward.clone();
+        expected.reverse();
+        assert_eq!(reverse, expected);
+
+        assert_eq!(set.rank(&Bytes::from("a")), Some(5));
+        assert_eq!(set.rank(&Bytes::from("z")), Some(0));
+        assert_eq!(set.rank(&Bytes::from("top")), Some(7));
+        assert_eq!(set.rank(&Bytes::from("missing")), None);
+
+        // score updates move the member inside the index
+        set.insert(Bytes::from("z"), 100.0_f64.to_bits() as i64);
+        assert_eq!(set.rank(&Bytes::from("z")), Some(7));
+        assert_eq!(
+            set.score_order(false)
+                .next()
+                .map(|(member, _)| member.clone()),
+            Some(Bytes::from("neg-zero"))
+        );
+        // removals keep the index in step
+        assert!(set.remove(&Bytes::from("top")));
+        assert_eq!(set.rank(&Bytes::from("z")), Some(6));
+        assert_eq!(set.len(), 7);
+    }
+
+    #[test]
+    fn sorted_set_wire_format_matches_bare_map() {
+        let mut set = SortedSet::new();
+        set.insert(Bytes::from("member"), 42);
+        set.insert(Bytes::from("another"), (-1.5_f64).to_bits() as i64);
+        let map: std::collections::BTreeMap<Bytes, i64> = [
+            (Bytes::from("another"), (-1.5_f64).to_bits() as i64),
+            (Bytes::from("member"), 42),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            bincode::serialize(&set).unwrap(),
+            bincode::serialize(&map).unwrap(),
+            "SortedSet must encode identically to the bare BTreeMap it replaced"
+        );
+        let restored: SortedSet = bincode::deserialize(&bincode::serialize(&set).unwrap()).unwrap();
+        assert_eq!(restored, set);
+        assert_eq!(restored.rank(&Bytes::from("member")), Some(1));
     }
 
     /// Frozen wire contract: bincode renders seq and set (and map and

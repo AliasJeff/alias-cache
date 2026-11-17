@@ -1,11 +1,10 @@
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use crate::collections::{ArrayHash, ArraySet, DeterministicRng};
+use crate::collections::{ArrayHash, ArraySet, DeterministicRng, SortedSet};
 use crate::error::{Error, Result};
 use crate::protocol::{Frame, Request};
 
@@ -136,7 +135,7 @@ pub enum Value {
     Hash(Box<ArrayHash>),
     List(VecDeque<Bytes>),
     Set(Box<ArraySet>),
-    SortedSet(BTreeMap<Bytes, i64>),
+    SortedSet(Box<SortedSet>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -581,8 +580,8 @@ fn entry_size(key: &Bytes, entry: &Entry) -> u64 {
         Value::List(list) => list.iter().map(|bytes| bytes.len() as u64).sum(),
         Value::Set(set) => set.iter().map(|bytes| bytes.len() as u64).sum(),
         Value::SortedSet(sorted_set) => sorted_set
-            .keys()
-            .map(|member| member.len() as u64 + 8)
+            .iter()
+            .map(|(member, _)| member.len() as u64 + 8)
             .sum(),
     };
     key.len() as u64 + value_size
@@ -1003,31 +1002,48 @@ impl StateMachine {
                 member,
                 increment,
             } => {
+                // In place: a score change moves one entry between index
+                // positions; the member map never changes size.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut sorted_set = match existing.map(|entry| entry.value) {
-                    None => BTreeMap::new(),
-                    Some(Value::SortedSet(sorted_set)) => sorted_set,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                    .filter(|entry| !self.is_expired(entry));
+                let current = match existing {
+                    None => 0,
+                    Some(entry) => match &entry.value {
+                        Value::SortedSet(sorted_set) => sorted_set.score(&member).unwrap_or(0),
+                        _ => return ApplyResult::Response(wrong_type_frame()),
+                    },
                 };
-                let current = sorted_set.get(&member).copied().unwrap_or(0);
                 let total = score_as_f64(current) + score_as_f64(increment);
                 if !total.is_finite() {
                     return ApplyResult::Response(Frame::error(OVERFLOW));
                 }
-                sorted_set.insert(member, total.to_bits() as i64);
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::SortedSet(sorted_set),
-                        expire_at,
-                        version: 0,
-                    },
-                );
+                match existing {
+                    None => {
+                        let mut sorted_set = SortedSet::new();
+                        sorted_set.insert(member, total.to_bits() as i64);
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::SortedSet(Box::new(sorted_set)),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                    }
+                    Some(_) => {
+                        let entry = self.values.get_mut(&key).expect("verified live above");
+                        let Value::SortedSet(sorted_set) = &mut entry.value else {
+                            unreachable!("type verified above");
+                        };
+                        sorted_set.insert(member, total.to_bits() as i64);
+                        // The old path always re-inserted on success.
+                        entry.version = entry.version.wrapping_add(1);
+                        // A score change never moves memory: entry_size
+                        // counts member.len + 8 per member.
+                    }
+                }
                 ApplyResult::Response(score_frame(total))
             }
             Operation::ListPush {
@@ -1035,84 +1051,123 @@ impl StateMachine {
                 elements,
                 left,
             } => {
+                // In place like the set/hash writes: no per-push clone of
+                // the whole list.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut list = match existing.map(|entry| entry.value) {
-                    None => VecDeque::new(),
-                    Some(Value::List(list)) => list,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                if left {
-                    for element in elements {
-                        list.push_front(element);
+                    .filter(|entry| !self.is_expired(entry));
+                let is_list = existing.is_some_and(|entry| matches!(entry.value, Value::List(_)));
+                match existing {
+                    None => {
+                        let mut list = VecDeque::with_capacity(elements.len());
+                        if left {
+                            for element in elements {
+                                list.push_front(element);
+                            }
+                        } else {
+                            list.extend(elements);
+                        }
+                        let length = list.len();
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::List(list),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        ApplyResult::Response(Frame::Integer(length as i64))
                     }
-                } else {
-                    list.extend(elements);
+                    Some(_) if !is_list => ApplyResult::Response(wrong_type_frame()),
+                    Some(_) => {
+                        let pushed_bytes = elements.iter().map(|e| e.len() as u64).sum::<u64>();
+                        let length = {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::List(list) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            if left {
+                                for element in elements {
+                                    list.push_front(element);
+                                }
+                            } else {
+                                list.extend(elements);
+                            }
+                            let length = list.len();
+                            // The old path always re-inserted; keep the
+                            // WATCH version moving on every push.
+                            entry.version = entry.version.wrapping_add(1);
+                            length
+                        };
+                        self.memory_bytes = self.memory_bytes.saturating_add(pushed_bytes);
+                        ApplyResult::Response(Frame::Integer(length as i64))
+                    }
                 }
-                let length = list.len();
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::List(list),
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                ApplyResult::Response(Frame::Integer(length as i64))
             }
             Operation::ListPop { key, count, left } => {
-                let Some(existing) = self
-                    .values
-                    .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                // In place: LPOP/RPOP stays O(popped), not O(list).
+                let live = matches!(self.values.get(&key), Some(entry) if !self.is_expired(entry));
+                if !live {
                     return ApplyResult::Response(match count {
                         Some(_) => Frame::Array(Vec::new()),
                         None => Frame::Null,
                     });
-                };
-                let Value::List(mut list) = existing.value else {
+                }
+                if !matches!(
+                    self.values.get(&key).map(|entry| &entry.value),
+                    Some(Value::List(_))
+                ) {
                     return ApplyResult::Response(wrong_type_frame());
-                };
+                }
                 if count == Some(0) {
                     return ApplyResult::Response(Frame::Array(Vec::new()));
                 }
-                let response = match count {
-                    Some(count) => {
-                        let count = count.min(list.len() as u64) as usize;
-                        let values: Vec<Bytes> = if left {
-                            list.drain(..count).collect()
-                        } else {
-                            let start = list.len().saturating_sub(count);
-                            list.drain(start..).collect()
-                        };
-                        Frame::Array(values.into_iter().map(Frame::BulkString).collect())
+                let popped_bytes;
+                let mut drained = false;
+                let response = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::List(list) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    let response = match count {
+                        Some(count) => {
+                            let count = count.min(list.len() as u64) as usize;
+                            let values: Vec<Bytes> = if left {
+                                list.drain(..count).collect()
+                            } else {
+                                let start = list.len().saturating_sub(count);
+                                let mut popped = list.drain(start..).collect::<Vec<_>>();
+                                // RPOP reports the rightmost member first;
+                                // drain yields left-to-right.
+                                popped.reverse();
+                                popped
+                            };
+                            popped_bytes = values.iter().map(|v| v.len() as u64).sum();
+                            Frame::Array(values.into_iter().map(Frame::BulkString).collect())
+                        }
+                        None => {
+                            let value = if left {
+                                list.pop_front()
+                            } else {
+                                list.pop_back()
+                            };
+                            popped_bytes = value.as_ref().map_or(0, |v| v.len() as u64);
+                            value.map_or(Frame::Null, Frame::BulkString)
+                        }
+                    };
+                    if list.is_empty() {
+                        drained = true;
+                    } else {
+                        // The old path re-inserted on every successful
+                        // pop; keep the WATCH version moving.
+                        entry.version = entry.version.wrapping_add(1);
                     }
-                    None => {
-                        let value = if left {
-                            list.pop_front()
-                        } else {
-                            list.pop_back()
-                        };
-                        value.map_or(Frame::Null, Frame::BulkString)
-                    }
+                    response
                 };
-                if list.is_empty() {
+                self.memory_bytes = self.memory_bytes.saturating_sub(popped_bytes);
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::List(list),
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(response)
             }
@@ -1121,87 +1176,115 @@ impl StateMachine {
                 count,
                 element,
             } => {
-                let Some(existing) = self
-                    .values
-                    .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                let live = matches!(self.values.get(&key), Some(entry) if !self.is_expired(entry));
+                if !live {
                     return ApplyResult::Response(Frame::Integer(0));
-                };
-                let Value::List(mut list) = existing.value else {
+                }
+                if !matches!(
+                    self.values.get(&key).map(|entry| &entry.value),
+                    Some(Value::List(_))
+                ) {
                     return ApplyResult::Response(wrong_type_frame());
+                }
+                let (removed, removed_bytes) = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::List(list) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    let (removed, removed_bytes) = remove_list_elements(list, count, &element);
+                    if list.is_empty() {
+                        // drained: memory handled below via remove_entry
+                    } else if removed > 0 {
+                        // Old path only re-inserted when something was
+                        // actually removed; the version follows.
+                        entry.version = entry.version.wrapping_add(1);
+                    }
+                    (removed, removed_bytes)
                 };
-                let removed = remove_list_elements(&mut list, count, &element);
-                if list.is_empty() {
+                if removed > 0 {
+                    self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
+                }
+                let drained = self.values.get(&key).is_some_and(
+                    |entry| matches!(&entry.value, Value::List(list) if list.is_empty()),
+                );
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else if removed > 0 {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::List(list),
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
             Operation::ListSet { key, index, value } => {
-                let Some(existing) = self
-                    .values
-                    .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                let live = matches!(self.values.get(&key), Some(entry) if !self.is_expired(entry));
+                if !live {
                     return ApplyResult::Response(Frame::error("ERR no such key"));
+                }
+                let length = match self.values.get(&key).map(|entry| &entry.value) {
+                    Some(Value::List(list)) => list.len(),
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                    None => unreachable!("verified live above"),
                 };
-                let Value::List(mut list) = existing.value else {
-                    return ApplyResult::Response(wrong_type_frame());
-                };
-                let Some(index) = normalize_list_index(index, list.len()) else {
+                let Some(index) = normalize_list_index(index, length) else {
                     return ApplyResult::Response(Frame::error("ERR index out of range"));
                 };
-                list[index] = value;
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::List(list),
-                        expire_at: existing.expire_at,
-                        version: 0,
-                    },
-                );
+                let new_len = value.len() as i64;
+                let old_len = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::List(list) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    let old_len = list[index].len() as i64;
+                    list[index] = value;
+                    // Old path always re-inserted.
+                    entry.version = entry.version.wrapping_add(1);
+                    old_len
+                };
+                self.memory_bytes = self.memory_bytes.saturating_add_signed(new_len - old_len);
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::ListTrim { key, start, stop } => {
-                let Some(existing) = self
-                    .values
-                    .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                let live = matches!(self.values.get(&key), Some(entry) if !self.is_expired(entry));
+                if !live {
                     return ApplyResult::Response(Frame::simple_string("OK"));
+                }
+                let length = match self.values.get(&key).map(|entry| &entry.value) {
+                    Some(Value::List(list)) => list.len(),
+                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                    None => unreachable!("verified live above"),
                 };
-                let Value::List(list) = existing.value else {
-                    return ApplyResult::Response(wrong_type_frame());
-                };
-                let Some((start, stop)) = normalize_list_range(start, stop, list.len()) else {
+                let Some((start, stop)) = normalize_list_range(start, stop, length) else {
+                    // The whole list falls outside the window: drop the key.
                     let _ = self.remove_entry(&key);
                     return ApplyResult::Response(Frame::simple_string("OK"));
                 };
-                let retained = list
-                    .into_iter()
-                    .skip(start)
-                    .take(stop - start + 1)
-                    .collect::<VecDeque<_>>();
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::List(retained),
-                        expire_at: existing.expire_at,
-                        version: 0,
-                    },
+                let trimmed_bytes = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::List(list) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    let keep = stop - start + 1;
+                    // Drain the head before the window, then the tail
+                    // after it; the middle stays put.
+                    let mut trimmed_bytes =
+                        list.drain(..start).map(|v| v.len() as u64).sum::<u64>();
+                    let excess = list.len() - keep;
+                    if excess > 0 {
+                        trimmed_bytes += list.drain(keep..).map(|v| v.len() as u64).sum::<u64>();
+                    }
+                    if list.is_empty() {
+                        // memory settled below via remove_entry
+                    } else {
+                        // Old path always re-inserted, even when the trim
+                        // removed nothing; keep the version moving.
+                        entry.version = entry.version.wrapping_add(1);
+                    }
+                    trimmed_bytes
+                };
+                self.memory_bytes = self.memory_bytes.saturating_sub(trimmed_bytes);
+                let drained = self.values.get(&key).is_some_and(
+                    |entry| matches!(&entry.value, Value::List(list) if list.is_empty()),
                 );
+                if drained {
+                    let _ = self.remove_entry(&key);
+                }
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::SetAdd { key, members } => {
@@ -1378,62 +1461,95 @@ impl StateMachine {
                 ApplyResult::Response(response)
             }
             Operation::SortedSetAdd { key, entries } => {
+                // In place: both the member map and the score index move
+                // by O(log n) per member, no whole-set clone.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut sorted_set = match existing.map(|entry| entry.value) {
-                    None => BTreeMap::new(),
-                    Some(Value::SortedSet(sorted_set)) => sorted_set,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                let added = entries
-                    .into_iter()
-                    .filter(|(member, score)| {
-                        let was_missing = !sorted_set.contains_key(member);
-                        sorted_set.insert(member.clone(), *score);
-                        was_missing
-                    })
-                    .count() as i64;
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::SortedSet(sorted_set),
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                ApplyResult::Response(Frame::Integer(added))
+                    .filter(|entry| !self.is_expired(entry));
+                let is_sorted_set =
+                    existing.is_some_and(|entry| matches!(entry.value, Value::SortedSet(_)));
+                match existing {
+                    None => {
+                        let mut sorted_set = SortedSet::new();
+                        let mut added = 0_i64;
+                        for (member, score) in entries {
+                            if sorted_set.insert(member, score) {
+                                added += 1;
+                            }
+                        }
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::SortedSet(Box::new(sorted_set)),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        ApplyResult::Response(Frame::Integer(added))
+                    }
+                    Some(_) if !is_sorted_set => ApplyResult::Response(wrong_type_frame()),
+                    Some(_) => {
+                        let mut added = 0_i64;
+                        let mut added_bytes = 0_u64;
+                        {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::SortedSet(sorted_set) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            for (member, score) in entries {
+                                let size = member.len() as u64 + 8;
+                                if sorted_set.insert(member, score) {
+                                    added += 1;
+                                    added_bytes += size;
+                                }
+                            }
+                            // The old path always re-inserted.
+                            entry.version = entry.version.wrapping_add(1);
+                        }
+                        self.memory_bytes = self.memory_bytes.saturating_add(added_bytes);
+                        ApplyResult::Response(Frame::Integer(added))
+                    }
+                }
             }
             Operation::SortedSetRemove { key, members } => {
-                let Some(existing) = self
-                    .values
-                    .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned()
-                else {
+                let live = matches!(self.values.get(&key), Some(entry) if !self.is_expired(entry));
+                if !live {
                     return ApplyResult::Response(Frame::Integer(0));
-                };
-                let Value::SortedSet(mut sorted_set) = existing.value else {
+                }
+                if !matches!(
+                    self.values.get(&key).map(|entry| &entry.value),
+                    Some(Value::SortedSet(_))
+                ) {
                     return ApplyResult::Response(wrong_type_frame());
+                }
+                let mut removed = 0_i64;
+                let mut removed_bytes = 0_u64;
+                let drained = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::SortedSet(sorted_set) = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    for member in &members {
+                        if sorted_set.remove(member) {
+                            removed += 1;
+                            removed_bytes += member.len() as u64 + 8;
+                        }
+                    }
+                    if sorted_set.is_empty() {
+                        // memory settled below via remove_entry
+                    } else if removed > 0 {
+                        // Old path only re-inserted when something was
+                        // actually removed; the version follows.
+                        entry.version = entry.version.wrapping_add(1);
+                    }
+                    sorted_set.is_empty()
                 };
-                let removed = members
-                    .into_iter()
-                    .filter(|member| sorted_set.remove(member).is_some())
-                    .count() as i64;
-                if sorted_set.is_empty() {
+                if removed > 0 {
+                    self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
+                }
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else if removed > 0 {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::SortedSet(sorted_set),
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
@@ -1473,42 +1589,90 @@ impl StateMachine {
                 ApplyResult::Response(Frame::Integer(total))
             }
             Operation::BitmapSet { key, offset, bit } => {
+                // In place: make_mut mutates the existing Bytes with no
+                // copy whenever this entry uniquely owns it; only growth
+                // reallocates. The emptiness scan runs solely when a set
+                // bit was cleared (the only transition that can empty a
+                // bitmap).
                 let byte_index = (offset / 8) as usize;
                 let bit_mask = 0x80 >> (offset % 8);
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut bytes = match existing.map(|entry| entry.value) {
-                    None => Vec::new(),
-                    Some(Value::String(bytes)) => bytes.to_vec(),
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                if byte_index >= bytes.len() {
-                    bytes.resize(byte_index + 1, 0);
+                    .filter(|entry| !self.is_expired(entry));
+                let is_string =
+                    existing.is_some_and(|entry| matches!(entry.value, Value::String(_)));
+                if existing.is_some() && !is_string {
+                    return ApplyResult::Response(wrong_type_frame());
                 }
-                let previous = bytes[byte_index] & bit_mask != 0;
-                if bit {
-                    bytes[byte_index] |= bit_mask;
-                } else {
-                    bytes[byte_index] &= !bit_mask;
+                match existing {
+                    None => {
+                        let mut bytes = vec![0_u8; byte_index + 1];
+                        let previous = false;
+                        if bit {
+                            bytes[byte_index] |= bit_mask;
+                        }
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::String(Bytes::from(bytes)),
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                        ApplyResult::Response(Frame::Integer(previous as i64))
+                    }
+                    Some(_) => {
+                        let mut grew = 0_i64;
+                        let previous;
+                        let mut maybe_empty = false;
+                        {
+                            let entry = self.values.get_mut(&key).expect("verified live above");
+                            let Value::String(bytes) = &mut entry.value else {
+                                unreachable!("type verified above");
+                            };
+                            if byte_index >= bytes.len() {
+                                // Growth reallocates by necessity.
+                                let mut grown = bytes.to_vec();
+                                grew = (byte_index + 1 - grown.len()) as i64;
+                                grown.resize(byte_index + 1, 0);
+                                *bytes = Bytes::from(grown);
+                            }
+                            // Bit flip in place: try_into_mut avoids the
+                            // copy whenever this entry uniquely owns the
+                            // Bytes; a shared one (a snapshot clone holds a
+                            // reference) copies, which stays correct.
+                            let owned = std::mem::take(bytes);
+                            let mut buffer = match owned.try_into_mut() {
+                                Ok(buffer) => buffer,
+                                Err(shared) => BytesMut::from(&shared[..]),
+                            };
+                            let slice = buffer.as_mut();
+                            previous = slice[byte_index] & bit_mask != 0;
+                            if bit {
+                                slice[byte_index] |= bit_mask;
+                            } else {
+                                slice[byte_index] &= !bit_mask;
+                                maybe_empty = previous;
+                            }
+                            *bytes = buffer.freeze();
+                            // The old path always re-inserted when the
+                            // bitmap survived.
+                            entry.version = entry.version.wrapping_add(1);
+                        }
+                        self.memory_bytes = self.memory_bytes.saturating_add_signed(grew);
+                        if maybe_empty
+                            && matches!(self.values.get(&key), Some(entry) if {
+                                matches!(&entry.value, Value::String(bytes) if bytes.iter().all(|b| *b == 0))
+                            })
+                        {
+                            // Empty bitmap: drop the key, entry-accounted —
+                            // the old raw values.remove leaked the counter.
+                            let _ = self.remove_entry(&key);
+                        }
+                        ApplyResult::Response(Frame::Integer(previous as i64))
+                    }
                 }
-                let was_empty = bytes.iter().all(|byte| *byte == 0);
-                if was_empty {
-                    self.values.remove(&key);
-                } else {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value: Value::String(Bytes::from(bytes)),
-                            expire_at,
-                            version: 0,
-                        },
-                    );
-                }
-                ApplyResult::Response(Frame::Integer(previous as i64))
             }
             Operation::BitmapOp {
                 operation,
@@ -1645,82 +1809,96 @@ impl StateMachine {
                 ApplyResult::Response(Frame::simple_string("OK"))
             }
             Operation::BloomAdd { key, item } => {
+                // In place: the filter bitmap flips bits through
+                // try_into_mut (zero copy when uniquely owned), and a
+                // duplicate add that changes no bits still bumps nothing —
+                // matching the old conditional re-insert.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let had_existing = existing.is_some();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
+                    .filter(|entry| !self.is_expired(entry));
                 let default_bits =
                     bloom_bit_count(DEFAULT_BF_CAPACITY, DEFAULT_BF_ERROR_NUMERATOR).div_ceil(8);
-                let mut filter = match existing.map(|entry| entry.value) {
-                    None => Value::BloomFilter {
-                        bits: Bytes::from(vec![0_u8; default_bits as usize]),
-                        hash_count: bloom_hash_count(DEFAULT_BF_ERROR_NUMERATOR),
-                        inserted: 0,
-                    },
-                    Some(value @ Value::BloomFilter { .. }) => value,
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
-                };
-                let Value::BloomFilter {
-                    bits,
-                    hash_count,
-                    inserted,
-                } = &mut filter
-                else {
-                    unreachable!("matched above");
-                };
-                let m = bits.len() as u64 * 8;
-                let (h1, h2) = bloom_hash(&item, m);
-                let mut bits_mut = BytesMut::from(&bits[..]);
-                let mut changed = false;
-                for index in 0..*hash_count as u64 {
-                    let bit_index = (h1 + index.wrapping_mul(h2)) % m;
-                    let byte = (bit_index / 8) as usize;
-                    let mask = 0x80 >> (bit_index % 8);
-                    if bits_mut[byte] & mask == 0 {
-                        bits_mut[byte] |= mask;
-                        changed = true;
+                let flip_bits = |bits: &mut BytesMut, hash_count: u8, item: &Bytes| -> bool {
+                    let m = bits.len() as u64 * 8;
+                    let (h1, h2) = bloom_hash(item, m);
+                    let mut changed = false;
+                    for index in 0..hash_count as u64 {
+                        let bit_index = (h1 + index.wrapping_mul(h2)) % m;
+                        let byte = (bit_index / 8) as usize;
+                        let mask = 0x80 >> (bit_index % 8);
+                        if bits[byte] & mask == 0 {
+                            bits[byte] |= mask;
+                            changed = true;
+                        }
                     }
-                }
-                if changed {
-                    *inserted += 1;
-                }
-                let value = Value::BloomFilter {
-                    bits: bits_mut.freeze(),
-                    hash_count: *hash_count,
-                    inserted: *inserted,
+                    changed
                 };
-                if changed || !had_existing {
-                    self.insert_entry(
-                        key,
-                        Entry {
-                            value,
-                            expire_at,
-                            version: 0,
-                        },
-                    );
+                match existing {
+                    None => {
+                        let hash_count = bloom_hash_count(DEFAULT_BF_ERROR_NUMERATOR);
+                        let mut bits = BytesMut::from(&vec![0_u8; default_bits as usize][..]);
+                        let _ = flip_bits(&mut bits, hash_count, &item);
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::BloomFilter {
+                                    bits: bits.freeze(),
+                                    hash_count,
+                                    inserted: 1,
+                                },
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                    }
+                    Some(entry) => {
+                        if !matches!(entry.value, Value::BloomFilter { .. }) {
+                            return ApplyResult::Response(wrong_type_frame());
+                        }
+                        let entry = self.values.get_mut(&key).expect("verified live above");
+                        let Value::BloomFilter {
+                            bits,
+                            hash_count,
+                            inserted,
+                        } = &mut entry.value
+                        else {
+                            unreachable!("type verified above");
+                        };
+                        let owned = std::mem::take(bits);
+                        let mut buffer = match owned.try_into_mut() {
+                            Ok(buffer) => buffer,
+                            Err(shared) => BytesMut::from(&shared[..]),
+                        };
+                        let changed = flip_bits(&mut buffer, *hash_count, &item);
+                        *bits = buffer.freeze();
+                        if changed {
+                            *inserted += 1;
+                            // Old path re-inserted only when bits moved or
+                            // the filter was new.
+                            entry.version = entry.version.wrapping_add(1);
+                        }
+                    }
                 }
                 ApplyResult::Response(Frame::Integer(1))
             }
             Operation::StreamAdd { key, id, fields } => {
+                // In place: XADD appends one entry, it must not clone the
+                // whole stream per append.
                 let existing = self
                     .values
                     .get(&key)
-                    .filter(|entry| !self.is_expired(entry))
-                    .cloned();
-                let expire_at = existing.as_ref().and_then(|entry| entry.expire_at);
-                let mut stream = match existing.map(|entry| entry.value) {
-                    None => (BTreeMap::new(), (0_u64, 0_u64)),
-                    Some(Value::Stream { entries, last_id }) => (entries, last_id),
-                    Some(_) => return ApplyResult::Response(wrong_type_frame()),
+                    .filter(|entry| !self.is_expired(entry));
+                let last_id = match existing {
+                    None => (0_u64, 0_u64),
+                    Some(entry) => match &entry.value {
+                        Value::Stream { last_id, .. } => *last_id,
+                        _ => return ApplyResult::Response(wrong_type_frame()),
+                    },
                 };
-                // Auto ID: logical-clock milliseconds with a sequence that
-                // is strictly greater than the last ID within the same ms.
                 let (ms, seq) = match id {
                     Some(explicit) => {
-                        if explicit <= stream.1 {
+                        if explicit <= last_id {
                             return ApplyResult::Response(Frame::error(
                                 "ERR The ID specified in XADD is equal or smaller than the target stream top item",
                             ));
@@ -1728,26 +1906,44 @@ impl StateMachine {
                         explicit
                     }
                     None => {
-                        let ms = self.logical_time.max(stream.1.0);
-                        let seq = if ms == stream.1.0 { stream.1.1 + 1 } else { 0 };
+                        let ms = self.logical_time.max(last_id.0);
+                        let seq = if ms == last_id.0 { last_id.1 + 1 } else { 0 };
                         (ms, seq)
                     }
                 };
-                stream.0.insert((ms, seq), fields.iter().cloned().collect());
-                stream.1 = (ms, seq);
-                let reply = Frame::bulk_string(format!("{ms}-{seq}"));
-                self.insert_entry(
-                    key,
-                    Entry {
-                        value: Value::Stream {
-                            entries: stream.0,
-                            last_id: stream.1,
-                        },
-                        expire_at,
-                        version: 0,
-                    },
-                );
-                ApplyResult::Response(reply)
+                let entry_bytes = 16
+                    + fields
+                        .iter()
+                        .map(|(field, value)| (field.len() + value.len()) as u64)
+                        .sum::<u64>();
+                match existing {
+                    None => {
+                        let mut entries = BTreeMap::new();
+                        entries.insert((ms, seq), fields.into_iter().collect());
+                        self.insert_entry(
+                            key,
+                            Entry {
+                                value: Value::Stream {
+                                    entries,
+                                    last_id: (ms, seq),
+                                },
+                                expire_at: None,
+                                version: 0,
+                            },
+                        );
+                    }
+                    Some(_) => {
+                        let entry = self.values.get_mut(&key).expect("verified live above");
+                        let Value::Stream { entries, last_id } = &mut entry.value else {
+                            unreachable!("type verified above");
+                        };
+                        entries.insert((ms, seq), fields.into_iter().collect());
+                        *last_id = (ms, seq);
+                        entry.version = entry.version.wrapping_add(1);
+                        self.memory_bytes = self.memory_bytes.saturating_add(entry_bytes);
+                    }
+                }
+                ApplyResult::Response(Frame::bulk_string(format!("{ms}-{seq}")))
             }
             Operation::StreamDelete { key, ids } => {
                 let Some(existing) = self
@@ -1758,30 +1954,38 @@ impl StateMachine {
                 else {
                     return ApplyResult::Response(Frame::Integer(0));
                 };
-                let Value::Stream { entries, last_id } = existing.value else {
+                let Value::Stream { .. } = existing.value else {
                     return ApplyResult::Response(wrong_type_frame());
                 };
                 let mut removed = 0_i64;
-                let mut trimmed = entries;
-                for stream_id in ids {
-                    if trimmed.remove(&stream_id).is_some() {
-                        removed += 1;
+                let mut removed_bytes = 0_u64;
+                let drained = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::Stream { entries, .. } = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    for stream_id in ids {
+                        if let Some(fields) = entries.remove(&stream_id) {
+                            removed += 1;
+                            removed_bytes += 16
+                                + fields
+                                    .iter()
+                                    .map(|(field, value)| (field.len() + value.len()) as u64)
+                                    .sum::<u64>();
+                        }
                     }
+                    if removed > 0 {
+                        // The old path rebuilt the entry with version 0;
+                        // bumping instead keeps WATCH versions monotonic.
+                        entry.version = entry.version.wrapping_add(1);
+                    }
+                    entries.is_empty()
+                };
+                if removed > 0 {
+                    self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
                 }
-                if trimmed.is_empty() {
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else {
-                    self.values.insert(
-                        key,
-                        Entry {
-                            value: Value::Stream {
-                                entries: trimmed,
-                                last_id,
-                            },
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
@@ -1794,33 +1998,39 @@ impl StateMachine {
                 else {
                     return ApplyResult::Response(Frame::Integer(0));
                 };
-                let Value::Stream {
-                    mut entries,
-                    last_id,
-                } = existing.value
-                else {
+                let Value::Stream { .. } = existing.value else {
                     return ApplyResult::Response(wrong_type_frame());
                 };
-                let before = entries.len() as i64;
-                if entries.len() as u64 > max_len {
-                    let keep_from = entries.len() - max_len as usize;
-                    let keys_to_drop: Vec<_> = entries.keys().take(keep_from).copied().collect();
-                    for stream_id in keys_to_drop {
-                        entries.remove(&stream_id);
+                let mut removed = 0_i64;
+                let mut removed_bytes = 0_u64;
+                let drained = {
+                    let entry = self.values.get_mut(&key).expect("verified live above");
+                    let Value::Stream { entries, .. } = &mut entry.value else {
+                        unreachable!("type verified above");
+                    };
+                    while entries.len() as u64 > max_len {
+                        let Some((_, fields)) = entries.pop_first() else {
+                            break;
+                        };
+                        removed += 1;
+                        removed_bytes += 16
+                            + fields
+                                .iter()
+                                .map(|(field, value)| (field.len() + value.len()) as u64)
+                                .sum::<u64>();
                     }
+                    if removed > 0 {
+                        // See StreamDelete: bump instead of the old
+                        // version reset.
+                        entry.version = entry.version.wrapping_add(1);
+                    }
+                    entries.is_empty()
+                };
+                if removed > 0 {
+                    self.memory_bytes = self.memory_bytes.saturating_sub(removed_bytes);
                 }
-                let removed = before - entries.len() as i64;
-                if entries.is_empty() {
+                if drained {
                     let _ = self.remove_entry(&key);
-                } else {
-                    self.values.insert(
-                        key,
-                        Entry {
-                            value: Value::Stream { entries, last_id },
-                            expire_at: existing.expire_at,
-                            version: 0,
-                        },
-                    );
                 }
                 ApplyResult::Response(Frame::Integer(removed))
             }
@@ -3209,22 +3419,26 @@ impl StateMachine {
         let reply = match id {
             Some(explicit) => Frame::bulk_string(Self::stream_id_text(explicit)),
             None => {
-                let last_ms = self.stream_last_ms(&key);
+                // Mirror apply exactly: the auto ID is
+                // (max(logical_ms, last_ms), last_seq + 1) within the same
+                // millisecond. The old preview hardcoded seq 1, so the
+                // second auto append in one logical tick diverged.
+                let (last_ms, last_seq) = self.stream_last_id(&key);
                 let ms = self.logical_time.max(last_ms);
-                let seq = if ms == last_ms { 1 } else { 0 };
+                let seq = if ms == last_ms { last_seq + 1 } else { 0 };
                 Frame::bulk_string(format!("{ms}-{seq}"))
             }
         };
         Ok((Some(Operation::StreamAdd { key, id, fields }), reply))
     }
 
-    fn stream_last_ms(&self, key: &Bytes) -> u64 {
+    fn stream_last_id(&self, key: &Bytes) -> (u64, u64) {
         match self.values.get(key) {
             Some(entry) if !self.is_expired(entry) => match &entry.value {
-                Value::Stream { last_id, .. } => last_id.0,
-                _ => 0,
+                Value::Stream { last_id, .. } => *last_id,
+                _ => (0, 0),
             },
-            _ => 0,
+            _ => (0, 0),
         }
     }
 
@@ -3453,8 +3667,7 @@ impl StateMachine {
         // apply where the sum is re-checked for finiteness.
         let current = self
             .sorted_set_for_key(&key)?
-            .and_then(|sorted_set| sorted_set.get(&member))
-            .copied()
+            .and_then(|sorted_set| sorted_set.score(&member))
             .map(score_as_f64)
             .unwrap_or(0.0);
         let total = score_as_f64(current.to_bits() as i64)
@@ -3574,7 +3787,10 @@ impl StateMachine {
                     if value_type != "zset" {
                         return Err(Error::protocol(WRONG_TYPE.to_string()));
                     }
-                    sorted_set.keys().cloned().collect()
+                    sorted_set
+                        .iter()
+                        .map(|(member, _)| member.clone())
+                        .collect()
                 }
                 Value::String(_) | Value::List(_) => {
                     return Err(Error::protocol(WRONG_TYPE.to_string()));
@@ -3598,7 +3814,7 @@ impl StateMachine {
                     .values
                     .get(&key)
                     .and_then(|entry| match &entry.value {
-                        Value::SortedSet(sorted_set) => sorted_set.get(&member).copied(),
+                        Value::SortedSet(sorted_set) => sorted_set.score(&member),
                         _ => None,
                     })
                     .unwrap_or_default();
@@ -4414,7 +4630,7 @@ impl StateMachine {
         Ok((None, response))
     }
 
-    fn sorted_set_for_key(&self, key: &Bytes) -> Result<Option<&BTreeMap<Bytes, i64>>> {
+    fn sorted_set_for_key(&self, key: &Bytes) -> Result<Option<&SortedSet>> {
         let Some(entry) = self.values.get(key).filter(|entry| !self.is_expired(entry)) else {
             return Ok(None);
         };
@@ -4438,7 +4654,7 @@ impl StateMachine {
             let score = parse_score(&pair[0])?;
             let member = pair[1].clone();
             let first = seen.insert(member.clone());
-            if first && !existing.is_some_and(|set| set.contains_key(&member)) {
+            if first && !existing.is_some_and(|set| set.contains(&member)) {
                 added += 1;
             }
             entries.push((member, score));
@@ -4462,7 +4678,7 @@ impl StateMachine {
         let members = arguments[2..]
             .iter()
             .filter(|member| seen.insert((*member).clone()))
-            .filter(|member| sorted_set.contains_key(*member))
+            .filter(|member| sorted_set.contains(member))
             .cloned()
             .collect::<Vec<_>>();
         if members.is_empty() {
@@ -4482,8 +4698,8 @@ impl StateMachine {
         expect_arity("ZSCORE", &arguments, 3)?;
         let score = self
             .sorted_set_for_key(&arguments[1])?
-            .and_then(|set| set.get(&arguments[2]))
-            .map(|score| Frame::bulk_string(format_score(*score)));
+            .and_then(|set| set.score(&arguments[2]))
+            .map(|score| Frame::bulk_string(format_score(score)));
         Ok((None, score.unwrap_or(Frame::Null)))
     }
 
@@ -4496,7 +4712,7 @@ impl StateMachine {
             None,
             Frame::Integer(
                 self.sorted_set_for_key(&arguments[1])?
-                    .map_or(0, BTreeMap::len) as i64,
+                    .map_or(0, SortedSet::len) as i64,
             ),
         ))
     }
@@ -4520,16 +4736,17 @@ impl StateMachine {
         if arguments.len() == 5 && !with_scores {
             return Err(Error::protocol("syntax error"));
         }
-        let values = self
-            .sorted_set_for_key(&arguments[1])?
-            .map(|set| sorted_set_entries(set, reverse))
-            .unwrap_or_default();
-        let Some((start, stop)) = normalize_list_range(start, stop, values.len()) else {
+        let Some(set) = self.sorted_set_for_key(&arguments[1])? else {
+            return Ok((None, Frame::Array(Vec::new())));
+        };
+        let Some((start, stop)) = normalize_list_range(start, stop, set.len()) else {
             return Ok((None, Frame::Array(Vec::new())));
         };
         let mut response = Vec::new();
-        for (member, score) in values.into_iter().skip(start).take(stop - start + 1) {
-            response.push(Frame::bulk_string(member));
+        // Walk the score index straight to the window: O(start + width),
+        // no ordering work for the members outside it.
+        for (member, score) in set.score_order(reverse).skip(start).take(stop - start + 1) {
+            response.push(Frame::BulkString(member.clone()));
             if with_scores {
                 response.push(Frame::bulk_string(format_score(score)));
             }
@@ -4547,10 +4764,12 @@ impl StateMachine {
         let Some(set) = self.sorted_set_for_key(&arguments[1])? else {
             return Ok((None, Frame::Null));
         };
-        let rank = sorted_set_entries(set, reverse)
-            .into_iter()
-            .position(|(member, _)| member == arguments[2])
-            .map(|rank| Frame::Integer(rank as i64))
+        let rank = set
+            .rank(&arguments[2])
+            .map(|rank| {
+                let rank = if reverse { set.len() - 1 - rank } else { rank };
+                Frame::Integer(rank as i64)
+            })
             .unwrap_or(Frame::Null);
         Ok((None, rank))
     }
@@ -4645,29 +4864,6 @@ fn score_frame(score: f64) -> Frame {
 
 fn score_as_f64(score: i64) -> f64 {
     f64::from_bits(u64::from_ne_bytes(score.to_ne_bytes()))
-}
-
-fn sorted_set_entries(set: &BTreeMap<Bytes, i64>, reverse: bool) -> Vec<(Bytes, i64)> {
-    let mut entries = set
-        .iter()
-        .map(|(member, score)| (member.clone(), *score))
-        .collect::<Vec<_>>();
-    entries.sort_by(|(left_member, left_score), (right_member, right_score)| {
-        let left = score_as_f64(*left_score);
-        let right = score_as_f64(*right_score);
-        let ordering = left.total_cmp(&right);
-        let ordering = if ordering == Ordering::Equal {
-            left_member.cmp(right_member)
-        } else {
-            ordering
-        };
-        if reverse {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    });
-    entries
 }
 
 fn wrong_type_error() -> Error {
@@ -4952,19 +5148,24 @@ fn count_list_matches(list: &VecDeque<Bytes>, count: i64, element: &Bytes) -> i6
     }
 }
 
-fn remove_list_elements(list: &mut VecDeque<Bytes>, count: i64, element: &Bytes) -> i64 {
+/// Removes up to |count| occurrences (all when count == 0; from the tail
+/// when negative) and reports the removed count together with the removed
+/// byte total, so the caller books memory incrementally.
+fn remove_list_elements(list: &mut VecDeque<Bytes>, count: i64, element: &Bytes) -> (i64, u64) {
     let mut remaining = if count == 0 {
         usize::MAX
     } else {
         count.unsigned_abs() as usize
     };
     let mut removed = 0_i64;
+    let mut removed_bytes = 0_u64;
     if count >= 0 {
         let mut kept = VecDeque::with_capacity(list.len());
         while let Some(value) = list.pop_front() {
             if value == *element && remaining > 0 {
                 remaining -= 1;
                 removed += 1;
+                removed_bytes += value.len() as u64;
             } else {
                 kept.push_back(value);
             }
@@ -4976,13 +5177,14 @@ fn remove_list_elements(list: &mut VecDeque<Bytes>, count: i64, element: &Bytes)
             if value == *element && remaining > 0 {
                 remaining -= 1;
                 removed += 1;
+                removed_bytes += value.len() as u64;
             } else {
                 kept.push_front(value);
             }
         }
         *list = kept;
     }
-    removed
+    (removed, removed_bytes)
 }
 
 #[cfg(test)]
@@ -7358,6 +7560,77 @@ mod tests {
                 .1,
             Frame::Integer(0)
         );
+    }
+
+    /// The in-place bookkeeping invariant for the remaining types: list,
+    /// stream, sorted-set, bitmap and bloom writes must keep the
+    /// incremental counter equal to a full recount.
+    #[test]
+    fn other_types_in_place_bookkeeping_matches_recounts() {
+        let mut state = StateMachine::default();
+        let check = |state: &mut StateMachine| {
+            let mut recomputed = state.clone();
+            recomputed.recompute_memory();
+            assert_eq!(
+                state.memory_usage(),
+                recomputed.memory_usage(),
+                "incremental memory drifted"
+            );
+        };
+        let commands: [&[&[u8]]; 24] = [
+            &[b"LPUSH", b"l", b"one", b"two", b"three"],
+            &[b"RPUSH", b"l", b"four"],
+            &[b"LPUSH", b"l", b"zero"],
+            &[b"LPOP", b"l"],
+            &[b"RPOP", b"l", b"2"],
+            &[b"LREM", b"l", b"1", b"two"],
+            &[b"LSET", b"l", b"0", b"a-much-longer-element"],
+            &[b"LTRIM", b"l", b"0", b"0"],
+            &[b"RPUSH", b"l", b"tail"],
+            &[b"LTRIM", b"l", b"5", b"10"],
+            &[b"XADD", b"s", b"*", b"f", b"v"],
+            &[b"XADD", b"s", b"*", b"f", b"longer-value"],
+            &[b"XDEL", b"s", b"1-1"],
+            &[b"XTRIM", b"s", b"MAXLEN", b"0"],
+            &[
+                b"ZADD", b"z", b"1.5", b"alpha", b"-2", b"beta", b"1.5", b"gamma",
+            ],
+            &[b"ZINCRBY", b"z", b"10", b"beta"],
+            &[b"ZADD", b"z", b"99", b"delta"],
+            &[b"ZREM", b"z", b"alpha", b"missing"],
+            &[b"SETBIT", b"bm", b"100", b"1"],
+            &[b"SETBIT", b"bm", b"7", b"1"],
+            &[b"SETBIT", b"bm", b"100", b"0"],
+            &[b"SETBIT", b"bm", b"7", b"0"],
+            &[b"BF.RESERVE", b"bf", b"0.01", b"1000"],
+            &[b"BF.ADD", b"bf", b"item-one"],
+        ];
+        for parts in commands {
+            state.execute_request(command(parts)).unwrap();
+            check(&mut state);
+        }
+        // SETBIT cleared everything: the key must be gone with the counter
+        // exactly back (this is the old raw-remove leak).
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXISTS", b"bm"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        check(&mut state);
+        // ZREM everything: zset drained
+        state
+            .execute_request(command(&[b"ZREM", b"z", b"beta", b"gamma", b"delta"]))
+            .unwrap();
+        assert_eq!(
+            state
+                .execute_request(command(&[b"EXISTS", b"z"]))
+                .unwrap()
+                .1,
+            Frame::Integer(0)
+        );
+        check(&mut state);
     }
 
     /// The failure mode that motivated the array-backed layout: a node that
