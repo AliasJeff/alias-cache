@@ -1388,6 +1388,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_commands_commit_through_pipeline_and_single_paths() {
+        let cluster = spawn_three_node_cluster("stream-commit").await;
+        let leader = cluster.leader_index().await;
+        let mut conn = TcpStream::connect(cluster.client_addrs[leader])
+            .await
+            .unwrap();
+        let mut frames = FrameReader::new();
+
+        // Regression (found 2026-11-17): XADD/XDEL/XTRIM were missing from
+        // the WRITES table, so the pipeline staging routed them into the
+        // read run, which drops the returned operation — the client got an
+        // ID reply while nothing ever committed. Both the pipelined and the
+        // single-command path lost data.
+        let pipeline = [
+            encode_command(&[b"XADD", b"s", b"*", b"f", b"one"]),
+            encode_command(&[b"XLEN", b"s"]),
+            encode_command(&[b"XADD", b"s", b"*", b"f", b"two"]),
+            encode_command(&[b"XLEN", b"s"]),
+        ];
+        conn.write_all(&pipeline.concat()).await.unwrap();
+        let parse_id = |frame: Frame| match frame {
+            Frame::BulkString(id) => {
+                let text = String::from_utf8_lossy(&id);
+                let (ms, seq) = text.split_once('-').expect("stream id is ms-seq");
+                (
+                    ms.parse::<u64>().expect("ms numeric"),
+                    seq.parse::<u64>().expect("seq numeric"),
+                )
+            }
+            other => panic!("XADD must reply with an ID, got {other:?}"),
+        };
+        let first = parse_id(frames.next_frame(&mut conn).await);
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(1));
+        let second = parse_id(frames.next_frame(&mut conn).await);
+        assert!(second > first, "auto IDs must strictly increase");
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(2));
+
+        // The single-command path must commit too.
+        conn.write_all(&encode_command(&[b"XADD", b"s", b"*", b"f", b"three"]))
+            .await
+            .unwrap();
+        let third = parse_id(frames.next_frame(&mut conn).await);
+        assert!(third > second);
+        conn.write_all(&encode_command(&[b"XLEN", b"s"]))
+            .await
+            .unwrap();
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(3));
+
+        // XDEL removes a committed entry.
+        let first_text = format!("{}-{}", first.0, first.1);
+        conn.write_all(&encode_command(&[b"XDEL", b"s", first_text.as_bytes()]))
+            .await
+            .unwrap();
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(1));
+        conn.write_all(&encode_command(&[b"XLEN", b"s"]))
+            .await
+            .unwrap();
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(2));
+
+        // XTRIM keeps the newest MAXLEN entries.
+        conn.write_all(&encode_command(&[b"XTRIM", b"s", b"MAXLEN", b"1"]))
+            .await
+            .unwrap();
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(1));
+        conn.write_all(&encode_command(&[b"XLEN", b"s"]))
+            .await
+            .unwrap();
+        assert_eq!(frames.next_frame(&mut conn).await, Frame::Integer(1));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn follower_connection_serves_reads_through_leader_redirect() {
         let cluster = spawn_three_node_cluster("follower-read").await;
         let leader = cluster.leader_index().await;

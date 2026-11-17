@@ -116,6 +116,9 @@ const WRITES: &[&[u8]] = &[
     b"BITOP",
     b"BF.RESERVE",
     b"BF.ADD",
+    b"XADD",
+    b"XDEL",
+    b"XTRIM",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
