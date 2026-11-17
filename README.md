@@ -2,6 +2,8 @@
 
 A Redis-compatible key-value store where your data doesn't disappear. Every write goes through Raft majority replication before it's acknowledged — kill the leader mid-write, fail over, restart nodes, and nothing you got an `OK` for is ever lost. Linearizable reads at hundreds of thousands of ops per second, on the same storage engine TiKV uses for its own WAL.
 
+https://aliasjeff.github.io/alias-cache/
+
 ## Why
 
 Redis is fast, but its replication is asynchronous. When a failover happens, writes that were acknowledged to clients can simply vanish. alias-cache closes that hole: every write is committed by a Raft quorum before the client sees an `OK`. You get Redis-protocol compatibility, linearizable reads, and automatic leader failover — with durability that async replication fundamentally cannot offer.
